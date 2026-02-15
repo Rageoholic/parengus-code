@@ -1,0 +1,15 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+#![allow(
+    clippy::redundant_closure,
+    reason = "This error sucks and I hate it cause it just ends up making \
+              refactoring annoying"
+)]
+
+pub mod instance;
+pub mod log;
+pub mod surface;
+
+pub use ash;
+pub use libloading::Error as LoadingError;
+pub use raw_window_handle::HandleError as RWHHandleError;
