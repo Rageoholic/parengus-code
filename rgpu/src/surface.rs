@@ -3,7 +3,7 @@ use std::sync::Arc;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
 
-use crate::instance::{CreateRawSurfaceError, Instance};
+use crate::instance::{CreateRawSurfaceError, Instance, SurfaceSupportError};
 
 #[derive(Debug, Error)]
 pub enum CreateSurfaceError {
@@ -59,6 +59,29 @@ impl<T: HasWindowHandle + HasDisplayHandle> Surface<T> {
 
     pub fn get_parent(&self) -> &Arc<Instance> {
         &self.parent_instance
+    }
+
+    /// Check if a queue family on a physical device supports presenting to
+    /// this surface.
+    ///
+    /// # Safety
+    /// `physical_device` must be a valid handle derived from the same instance
+    /// as this surface.
+    pub unsafe fn supports_queue_family(
+        &self,
+        physical_device: ash::vk::PhysicalDevice,
+        queue_family_index: u32,
+    ) -> Result<bool, SurfaceSupportError> {
+        //SAFETY: physical_device was derived from the same instance as this
+        //surface (caller guarantees), self.handle is valid
+        unsafe {
+            self.parent_instance
+                .get_raw_physical_device_surface_support(
+                    physical_device,
+                    queue_family_index,
+                    self.handle,
+                )
+        }
     }
 }
 

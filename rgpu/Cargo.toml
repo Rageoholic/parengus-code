@@ -4,11 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ash = "0.38.0"
-ash-window = "0.13.0"
-libloading = "0.8.9"
-raw-window-handle = "0.6.2"
-strum = "0.27.2"
-strum_macros = "0.27.2"
-thiserror = "2.0.18"
-tracing = "0.1.44"
+ash = "0.38"
+ash-window = "0.13"
+raw-window-handle = { version = "0.6", features = ["std"] }
+thiserror = "2"
+tracing = "0.1"

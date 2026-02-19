@@ -66,10 +66,8 @@ impl Debug for Instance {
 
 #[derive(Debug, Error)]
 pub enum InstanceCreationError {
-    #[error("Could not load libvulkan: {0}")]
-    LibraryLoading(libloading::Error),
-    #[error("Could not load vkGetInstanceProcAddr from libvulkan")]
-    MissingEntryPoint,
+    #[error("Could not load Vulkan: {0}")]
+    Loading(ash::LoadingError),
     #[error("Couldn't get display handle from passed value: {0}")]
     InvalidDisplayHandle(raw_window_handle::HandleError),
     #[error("Missing mandatory instance extensions: {0:?}")]
@@ -165,10 +163,7 @@ impl Instance {
         //SAFETY: We pass on the burden of the safety from loading dlls to the
         //caller. As for Entry, we ensure all other vulkan objects are dropped
         //before Entry is dropped (handled in the Drop impl of Instance)
-        let entry = unsafe { ash::Entry::load() }.map_err(|e| match e {
-            ash::LoadingError::LibraryLoadFailure(error) => Error::LibraryLoading(error),
-            ash::LoadingError::MissingEntryPoint(_) => Error::MissingEntryPoint,
-        })?;
+        let entry = unsafe { ash::Entry::load() }.map_err(Error::Loading)?;
 
         //SAFETY: Basically always fine Relax
         let api_version = unsafe { entry.try_enumerate_instance_version() }
@@ -335,41 +330,6 @@ impl Instance {
         })
     }
 
-    ///Create a raw VkSurfaceKHR.
-    ///
-    /// # Safety
-    /// The returned surface must be destroyed before source is dropped, or when
-    /// the surface is invalidated due to something like a suspend event in
-    /// winit. There is a parent child relationship between both the instance
-    /// and source and the returned surface
-    pub unsafe fn create_raw_surface<T: HasDisplayHandle + HasWindowHandle>(
-        &self,
-        source: &T,
-    ) -> Result<vk::SurfaceKHR, CreateRawSurfaceError> {
-        use CreateRawSurfaceError as Error;
-        if self.surface_instance.is_some() {
-            //SAFETY:
-            unsafe {
-                ash_window::create_surface(
-                    &self.entry,
-                    &self.handle,
-                    source
-                        .display_handle()
-                        .map_err(|e| Error::DisplayHandle(e))?
-                        .as_raw(),
-                    source
-                        .window_handle()
-                        .map_err(|e| Error::WindowHandle(e))?
-                        .as_raw(),
-                    None,
-                )
-            }
-            .map_err(|e| Error::OnCreate(e))
-        } else {
-            Err(Error::ExtensionNotLoaded)
-        }
-    }
-
     /// Destroy the raw VkSurfaceKHR.
     ///
     /// # Safety
@@ -409,6 +369,62 @@ impl Instance {
         }
     }
 
+    /// Get the properties of a physical device.
+    ///
+    /// # Safety
+    /// `physical_device` must be a valid handle derived from this instance.
+    pub unsafe fn get_raw_physical_device_properties(
+        &self,
+        physical_device: vk::PhysicalDevice,
+    ) -> vk::PhysicalDeviceProperties {
+        //SAFETY: physical_device was derived from this instance
+        unsafe { self.handle.get_physical_device_properties(physical_device) }
+    }
+
+    /// Get the queue family properties of a physical device.
+    ///
+    /// # Safety
+    /// `physical_device` must be a valid handle derived from this instance.
+    pub unsafe fn get_raw_physical_device_queue_family_properties(
+        &self,
+        physical_device: vk::PhysicalDevice,
+    ) -> Vec<vk::QueueFamilyProperties> {
+        //SAFETY: physical_device was derived from this instance
+        unsafe {
+            self.handle
+                .get_physical_device_queue_family_properties(physical_device)
+        }
+    }
+
+    /// Create a logical device from a physical device.
+    ///
+    /// # Safety
+    /// `physical_device` must be a valid handle derived from this instance.
+    /// `create_info` must be a valid DeviceCreateInfo.
+    pub unsafe fn create_raw_device(
+        &self,
+        physical_device: vk::PhysicalDevice,
+        create_info: &vk::DeviceCreateInfo<'_>,
+    ) -> Result<ash::Device, vk::Result> {
+        //SAFETY: physical_device was derived from this instance, create_info is valid
+        unsafe { self.handle.create_device(physical_device, create_info, None) }
+    }
+
+    /// Enumerate device extension properties for a physical device.
+    ///
+    /// # Safety
+    /// `physical_device` must be a valid handle derived from this instance.
+    pub unsafe fn enumerate_raw_device_extension_properties(
+        &self,
+        physical_device: vk::PhysicalDevice,
+    ) -> Result<Vec<vk::ExtensionProperties>, vk::Result> {
+        //SAFETY: physical_device was derived from this instance
+        unsafe {
+            self.handle
+                .enumerate_device_extension_properties(physical_device)
+        }
+    }
+
     pub fn get_supported_ver(&self) -> VkVersion {
         self.ver
     }
@@ -438,4 +454,77 @@ pub enum CreateRawSurfaceError {
     WindowHandle(raw_window_handle::HandleError),
     #[error("Surface extension has not been loaded")]
     ExtensionNotLoaded,
+}
+
+#[derive(Debug, Error)]
+pub enum SurfaceSupportError {
+    #[error("Surface extension is not loaded")]
+    ExtensionNotLoaded,
+    #[error("Vulkan error checking surface support: {0}")]
+    Vulkan(vk::Result),
+}
+
+//Extensions related to surface functionality
+impl Instance {
+    /// Check if a queue family on a physical device supports presenting to
+    /// a surface.
+    ///
+    /// # Safety
+    /// `physical_device` must be a valid handle derived from this instance.
+    /// `surface` must be a valid handle derived from this instance.
+    pub(crate) unsafe fn get_raw_physical_device_surface_support(
+        &self,
+        physical_device: vk::PhysicalDevice,
+        queue_family_index: u32,
+        surface: vk::SurfaceKHR,
+    ) -> Result<bool, SurfaceSupportError> {
+        if let Some(ref surface_instance) = self.surface_instance {
+            //SAFETY: physical_device and surface were derived from this instance
+            unsafe {
+                surface_instance.get_physical_device_surface_support(
+                    physical_device,
+                    queue_family_index,
+                    surface,
+                )
+            }
+            .map_err(SurfaceSupportError::Vulkan)
+        } else {
+            Err(SurfaceSupportError::ExtensionNotLoaded)
+        }
+    }
+
+    ///Create a raw VkSurfaceKHR.
+    ///
+    /// # Safety
+    /// The returned surface must be destroyed before source is dropped, or when
+    /// the surface is invalidated due to something like a suspend event in
+    /// winit. There is a parent child relationship between both the instance
+    /// and source and the returned surface
+    pub unsafe fn create_raw_surface<T: HasDisplayHandle + HasWindowHandle>(
+        &self,
+        source: &T,
+    ) -> Result<vk::SurfaceKHR, CreateRawSurfaceError> {
+        use CreateRawSurfaceError as Error;
+        if self.surface_instance.is_some() {
+            //SAFETY:
+            unsafe {
+                ash_window::create_surface(
+                    &self.entry,
+                    &self.handle,
+                    source
+                        .display_handle()
+                        .map_err(|e| Error::DisplayHandle(e))?
+                        .as_raw(),
+                    source
+                        .window_handle()
+                        .map_err(|e| Error::WindowHandle(e))?
+                        .as_raw(),
+                    None,
+                )
+            }
+            .map_err(|e| Error::OnCreate(e))
+        } else {
+            Err(Error::ExtensionNotLoaded)
+        }
+    }
 }

@@ -8,10 +8,10 @@ use std::{
 
 use clap::Parser;
 use rgpu::{
+    device::{Device, DeviceConfig, QueueMode},
     instance::{Instance, InstanceExtensions},
     surface::Surface,
 };
-use strum_macros::EnumString;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use winit::{
     application::ApplicationHandler,
@@ -21,7 +21,7 @@ use winit::{
     window::{Window as WinitWindow, WindowAttributes},
 };
 
-#[derive(Debug, EnumString, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default, clap::ValueEnum)]
 enum TracingLogLevel {
     Off,
     Trace,
@@ -51,7 +51,56 @@ struct CliArgs {
     #[arg(short, long)]
     tracing_log_level: TracingLogLevel,
     #[arg(short, long)]
-    graphics_debug_level: Option<rgpu::log::VulkanLogLevel>,
+    graphics_debug_level: Option<CliVulkanLogLevel>,
+    #[arg(long, default_value_t = CliQueueMode::Auto)]
+    queue_mode: CliQueueMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum CliQueueMode {
+    #[default]
+    Auto,
+    Unified,
+    Single,
+}
+
+impl std::fmt::Display for CliQueueMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliQueueMode::Auto => write!(f, "auto"),
+            CliQueueMode::Unified => write!(f, "unified"),
+            CliQueueMode::Single => write!(f, "single"),
+        }
+    }
+}
+
+impl From<CliQueueMode> for QueueMode {
+    fn from(value: CliQueueMode) -> Self {
+        match value {
+            CliQueueMode::Auto => QueueMode::Auto,
+            CliQueueMode::Unified => QueueMode::Unified,
+            CliQueueMode::Single => QueueMode::Single,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CliVulkanLogLevel {
+    Verbose,
+    Info,
+    Warning,
+    Error,
+}
+
+impl From<CliVulkanLogLevel> for rgpu::log::VulkanLogLevel {
+    fn from(value: CliVulkanLogLevel) -> Self {
+        match value {
+            CliVulkanLogLevel::Verbose => rgpu::log::VulkanLogLevel::Verbose,
+            CliVulkanLogLevel::Info => rgpu::log::VulkanLogLevel::Info,
+            CliVulkanLogLevel::Warning => rgpu::log::VulkanLogLevel::Warning,
+            CliVulkanLogLevel::Error => rgpu::log::VulkanLogLevel::Error,
+        }
+    }
 }
 
 fn main() -> eyre::Result<()> {
@@ -98,13 +147,21 @@ fn main() -> eyre::Result<()> {
     let instance = Arc::new(unsafe {
         rgpu::instance::Instance::new(
             "samp-app",
-            cli_args.graphics_debug_level,
+            cli_args.graphics_debug_level.map(Into::into),
             Some(&event_loop),
             InstanceExtensions { surface: true },
         )
     }?);
 
-    let mut app = AppRunner(Some(App::Initializing(InitializingState { instance })));
+    let device_config = DeviceConfig {
+        swapchain: true,
+        queue_mode: cli_args.queue_mode.into(),
+    };
+
+    let mut app = AppRunner(Some(App::Initializing(InitializingState {
+        instance,
+        device_config,
+    })));
 
     tracing::trace!("Entering main event loop");
     Ok(event_loop.run_app(&mut app)?)
@@ -124,17 +181,20 @@ enum App {
 #[derive(Debug)]
 struct InitializingState {
     instance: Arc<Instance>,
+    device_config: DeviceConfig,
 }
 #[derive(Debug)]
 struct RunningState {
     instance: Arc<Instance>,
     win: Arc<WinitWindow>,
     _surface: Surface<WinitWindow>,
+    _device: Device,
 }
 #[derive(Debug)]
 struct SuspendedState {
     instance: Arc<Instance>,
     win: Arc<WinitWindow>,
+    device: Device,
 }
 #[derive(Debug)]
 struct ExitingState {}
@@ -173,11 +233,26 @@ impl ApplicationHandler for AppRunner {
                         return;
                     }
                 };
+            let device = match Device::create_compatible(
+                &initializing_state.instance,
+                &surface,
+                initializing_state.device_config,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!("Error while creating device: {}", e);
+                    tracing::debug!("State transition: Initializing -> Exiting");
+                    self.set_exiting(ExitingState {});
+                    event_loop.exit();
+                    return;
+                }
+            };
             tracing::debug!("State transition: Initializing -> Running");
             self.set_running(RunningState {
                 instance: initializing_state.instance,
                 win,
                 _surface: surface,
+                _device: device,
             });
         } else if let Some(suspended_state) = self.take_suspended() {
             event_loop.set_control_flow(ControlFlow::Poll);
@@ -199,6 +274,7 @@ impl ApplicationHandler for AppRunner {
                 instance: suspended_state.instance,
                 win: suspended_state.win,
                 _surface: surface,
+                _device: suspended_state.device,
             });
         } else if self.is_exiting() {
             tracing::warn!("resumed() called while in Exiting state");
@@ -212,6 +288,7 @@ impl ApplicationHandler for AppRunner {
             self.set_suspended(SuspendedState {
                 instance: running_state.instance,
                 win: running_state.win,
+                device: running_state._device,
             });
         }
     }

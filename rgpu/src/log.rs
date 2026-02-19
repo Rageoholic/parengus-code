@@ -1,6 +1,4 @@
-use strum_macros::EnumString;
-
-#[derive(Debug, EnumString, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum VulkanLogLevel {
     Verbose,
     Info,
