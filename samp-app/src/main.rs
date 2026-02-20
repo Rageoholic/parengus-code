@@ -11,6 +11,7 @@ use rgpu::{
     device::{Device, DeviceConfig, QueueMode},
     instance::{Instance, InstanceExtensions},
     surface::Surface,
+    swapchain::Swapchain,
 };
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use winit::{
@@ -48,11 +49,11 @@ impl From<TracingLogLevel> for tracing::Level {
 
 #[derive(clap::Parser, Debug)]
 struct CliArgs {
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "error")]
     tracing_log_level: TracingLogLevel,
     #[arg(short, long)]
     graphics_debug_level: Option<CliVulkanLogLevel>,
-    #[arg(long, default_value_t = CliQueueMode::Auto)]
+    #[arg(long, default_value = "auto")]
     queue_mode: CliQueueMode,
 }
 
@@ -62,16 +63,6 @@ enum CliQueueMode {
     Auto,
     Unified,
     Single,
-}
-
-impl std::fmt::Display for CliQueueMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CliQueueMode::Auto => write!(f, "auto"),
-            CliQueueMode::Unified => write!(f, "unified"),
-            CliQueueMode::Single => write!(f, "single"),
-        }
-    }
 }
 
 impl From<CliQueueMode> for QueueMode {
@@ -106,11 +97,14 @@ impl From<CliVulkanLogLevel> for rgpu::log::VulkanLogLevel {
 fn main() -> eyre::Result<()> {
     let app_dirs = directories::ProjectDirs::from("", "parengus", "samp-app");
 
-    let log_dir = app_dirs
+    let log_dir = match app_dirs
         .as_ref()
         .and_then(|x| x.runtime_dir().or_else(|| Some(x.data_dir())))
         .map(|p| p.to_owned())
-        .unwrap_or_else(|| std::env::current_dir().expect("failed to get current directory"));
+    {
+        Some(path) => path,
+        None => std::env::current_dir()?,
+    };
 
     let cli_args = CliArgs::parse();
 
@@ -187,14 +181,17 @@ struct InitializingState {
 struct RunningState {
     instance: Arc<Instance>,
     win: Arc<WinitWindow>,
-    _surface: Surface<WinitWindow>,
-    _device: Device,
+    device: Arc<Device>,
+    _surface: Arc<Surface<WinitWindow>>,
+    // `None` means the window/surface is currently zero-sized. We stay in
+    // Running and recreate on the next non-zero resize/scale event.
+    swapchain: Option<Swapchain<WinitWindow>>,
 }
 #[derive(Debug)]
 struct SuspendedState {
     instance: Arc<Instance>,
     win: Arc<WinitWindow>,
-    device: Device,
+    device: Arc<Device>,
 }
 #[derive(Debug)]
 struct ExitingState {}
@@ -214,67 +211,121 @@ impl ApplicationHandler for AppRunner {
                     Ok(w) => w,
                     Err(e) => {
                         tracing::error!("Error while creating window: {}", e);
-                        tracing::debug!("State transition: Initializing -> Exiting");
-                        self.set_exiting(ExitingState {});
-                        event_loop.exit();
+                        self.transition_to_exiting("Initializing", event_loop);
                         return;
                     }
                 },
             );
             //SAFETY: We will drop surface when we enter into `suspend`
-            let surface =
+            let surface = Arc::new(
                 match unsafe { Surface::new(&initializing_state.instance, Arc::clone(&win)) } {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::error!("Error while creating surface: {}", e);
-                        tracing::debug!("State transition: Initializing -> Exiting");
-                        self.set_exiting(ExitingState {});
-                        event_loop.exit();
+                        self.transition_to_exiting("Initializing", event_loop);
                         return;
                     }
-                };
+                },
+            );
+
             let device = match Device::create_compatible(
                 &initializing_state.instance,
                 &surface,
                 initializing_state.device_config,
             ) {
-                Ok(d) => d,
+                Ok(d) => Arc::new(d),
                 Err(e) => {
                     tracing::error!("Error while creating device: {}", e);
-                    tracing::debug!("State transition: Initializing -> Exiting");
-                    self.set_exiting(ExitingState {});
-                    event_loop.exit();
+                    self.transition_to_exiting("Initializing", event_loop);
                     return;
                 }
+            };
+            let win_size = win.inner_size();
+            let swapchain = if win_size.width == 0 || win_size.height == 0 {
+                tracing::trace!(
+                    "Skipping initial swapchain create because window extent is zero: {}x{}",
+                    win_size.width,
+                    win_size.height
+                );
+                None
+            } else {
+                let requested_extent = rgpu::ash::vk::Extent2D {
+                    width: win_size.width,
+                    height: win_size.height,
+                };
+                let swapchain_create_span = tracing::trace_span!(
+                    "initial_swapchain_create",
+                    requested_width = requested_extent.width,
+                    requested_height = requested_extent.height
+                )
+                .entered();
+                let swapchain = match Swapchain::new(&device, &surface, requested_extent) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Error while creating swapchain: {}", e);
+                        self.transition_to_exiting("Initializing", event_loop);
+                        return;
+                    }
+                };
+                drop(swapchain_create_span);
+                Some(swapchain)
             };
             tracing::debug!("State transition: Initializing -> Running");
             self.set_running(RunningState {
                 instance: initializing_state.instance,
                 win,
+                device,
                 _surface: surface,
-                _device: device,
+                swapchain,
             });
         } else if let Some(suspended_state) = self.take_suspended() {
             event_loop.set_control_flow(ControlFlow::Poll);
             //SAFETY: We will drop surface when we enter into `suspend`
-            let surface = match unsafe {
-                Surface::new(&suspended_state.instance, Arc::clone(&suspended_state.win))
-            } {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Error while creating surface: {}", e);
-                    tracing::debug!("State transition: Suspended -> Exiting");
-                    self.set_exiting(ExitingState {});
-                    event_loop.exit();
-                    return;
+            let surface = Arc::new(
+                match unsafe {
+                    Surface::new(&suspended_state.instance, Arc::clone(&suspended_state.win))
+                } {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Error while creating surface: {}", e);
+                        self.transition_to_exiting("Suspended", event_loop);
+                        return;
+                    }
+                },
+            );
+
+            let win_size = suspended_state.win.inner_size();
+            let swapchain = if win_size.width == 0 || win_size.height == 0 {
+                tracing::trace!(
+                    "Skipping swapchain create on resume because window extent is zero: {}x{}",
+                    win_size.width,
+                    win_size.height
+                );
+                None
+            } else {
+                match Swapchain::new(
+                    &suspended_state.device,
+                    &surface,
+                    rgpu::ash::vk::Extent2D {
+                        width: win_size.width,
+                        height: win_size.height,
+                    },
+                ) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::error!("Error while creating swapchain: {}", e);
+                        self.transition_to_exiting("Suspended", event_loop);
+                        return;
+                    }
                 }
             };
             tracing::debug!("State transition: Suspended -> Running");
             self.set_running(RunningState {
                 instance: suspended_state.instance,
                 win: suspended_state.win,
+                device: suspended_state.device,
                 _surface: surface,
-                _device: suspended_state.device,
+                swapchain,
             });
         } else if self.is_exiting() {
             tracing::warn!("resumed() called while in Exiting state");
@@ -284,11 +335,25 @@ impl ApplicationHandler for AppRunner {
         assert!(self.0.is_some());
         if let Some(running_state) = self.take_running() {
             event_loop.set_control_flow(ControlFlow::Wait);
+            let RunningState {
+                instance,
+                win,
+                device,
+                _surface: _,
+                swapchain: _,
+            } = running_state;
+
+            if let Err(e) = device.wait_idle() {
+                tracing::error!("Error while waiting for device idle during suspend: {}", e);
+                self.transition_to_exiting("Running", event_loop);
+                return;
+            }
+
             tracing::debug!("State transition: Running -> Suspended");
             self.set_suspended(SuspendedState {
-                instance: running_state.instance,
-                win: running_state.win,
-                device: running_state._device,
+                instance,
+                win,
+                device,
             });
         }
     }
@@ -300,26 +365,155 @@ impl ApplicationHandler for AppRunner {
         window_event: winit::event::WindowEvent,
     ) {
         assert!(self.0.is_some());
-        if let Some(running_state) = self.as_running() {
-            match window_event {
-                WindowEvent::CloseRequested if window_id == running_state.win.id() => {
-                    tracing::trace!("Close window request received for window");
-                    let _running_state = self.take_running().expect(
-                        "Switching from a temporary borrow to a permanent \
-                         take of the same type should always be good",
-                    );
-                    tracing::debug!("State transition: Running -> Exiting");
-                    self.set_exiting(ExitingState {});
-                    event_loop.exit();
+        if !self.is_running_window(window_id) {
+            return;
+        }
+
+        if matches!(&window_event, WindowEvent::CloseRequested) {
+            tracing::trace!("Close window request received for window");
+            self.exit_from_running(event_loop);
+            return;
+        }
+
+        match &window_event {
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                let desired_extent = {
+                    if let Some(running_state) = self.as_running()
+                        && let Some(extent) =
+                            Self::desired_extent_for_event(running_state, &window_event)
+                    {
+                        extent
+                    } else {
+                        return;
+                    }
+                };
+
+                let should_keep_running = {
+                    let running_state = match self.as_running_mut() {
+                        Some(running_state) => running_state,
+                        None => return,
+                    };
+
+                    Self::recreate_swapchain_if_needed(running_state, desired_extent)
+                };
+
+                if !should_keep_running {
+                    self.exit_from_running(event_loop);
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
 }
 
 #[allow(dead_code, reason = "these functions exist for API completeness")]
 impl AppRunner {
+    fn transition_to_exiting(
+        &mut self,
+        from_state: &'static str,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) {
+        tracing::debug!("State transition: {} -> Exiting", from_state);
+        self.set_exiting(ExitingState {});
+        event_loop.exit();
+    }
+
+    fn exit_from_running(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if self.take_running().is_some() {
+            self.transition_to_exiting("Running", event_loop);
+        } else {
+            tracing::warn!("Requested Running -> Exiting transition while not in Running state");
+            event_loop.exit();
+        }
+    }
+
+    fn desired_extent_for_event(
+        running_state: &RunningState,
+        window_event: &WindowEvent,
+    ) -> Option<rgpu::ash::vk::Extent2D> {
+        match window_event {
+            WindowEvent::Resized(size) => Some(rgpu::ash::vk::Extent2D {
+                width: size.width,
+                height: size.height,
+            }),
+            WindowEvent::ScaleFactorChanged { .. } => {
+                let size = running_state.win.inner_size();
+                Some(rgpu::ash::vk::Extent2D {
+                    width: size.width,
+                    height: size.height,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn is_running_window(&self, window_id: winit::window::WindowId) -> bool {
+        if let Some(running_state) = self.as_running()
+            && window_id == running_state.win.id()
+        {
+            true
+        } else {
+            false
+        }
+    }
+
+    fn recreate_swapchain_if_needed(
+        running_state: &mut RunningState,
+        desired_extent: rgpu::ash::vk::Extent2D,
+    ) -> bool {
+        if desired_extent.width == 0 || desired_extent.height == 0 {
+            tracing::trace!(
+                "Received zero extent ({}x{}); tearing down swapchain and waiting for idle",
+                desired_extent.width,
+                desired_extent.height
+            );
+            if let Err(e) = running_state.device.wait_idle() {
+                tracing::error!("Error while waiting for device idle on zero extent: {}", e);
+                return false;
+            }
+            running_state.swapchain = None;
+            return true;
+        }
+
+        if let Some(existing_swapchain) = running_state.swapchain.as_ref()
+            && existing_swapchain.extent() == desired_extent
+        {
+            tracing::trace!(
+                "Skipping swapchain recreate because extent is unchanged: {}x{}",
+                desired_extent.width,
+                desired_extent.height
+            );
+            return true;
+        }
+
+        tracing::trace!(
+            "Recreating swapchain for new extent: {}x{}",
+            desired_extent.width,
+            desired_extent.height
+        );
+
+        match Swapchain::new_with_old(
+            &running_state.device,
+            &running_state._surface,
+            desired_extent,
+            running_state.swapchain.as_ref(),
+        ) {
+            Ok(swapchain) => {
+                tracing::trace!(
+                    "Swapchain recreation succeeded for extent: {}x{}",
+                    desired_extent.width,
+                    desired_extent.height
+                );
+                running_state.swapchain = Some(swapchain);
+                true
+            }
+            Err(e) => {
+                tracing::error!("Error while recreating swapchain: {}", e);
+                false
+            }
+        }
+    }
+
     fn is_initializing(&self) -> bool {
         assert!(self.0.is_some());
         matches!(self.0, Some(App::Initializing(_)))

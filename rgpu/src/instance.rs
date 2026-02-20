@@ -3,6 +3,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
 
 use crate::log::VulkanLogLevel;
+use crate::surface::{CreateSurfaceError, SurfaceQueryError, SurfaceSupportError};
 use std::{
     ffi::{CStr, CString},
     fmt::Debug,
@@ -168,7 +169,7 @@ impl Instance {
         //SAFETY: Basically always fine Relax
         let api_version = unsafe { entry.try_enumerate_instance_version() }
             .unwrap_or(Some(ash::vk::API_VERSION_1_0))
-            .expect("I dunno how we got here");
+            .unwrap_or(ash::vk::API_VERSION_1_0);
         let mut mandatory_exts = Vec::with_capacity(256);
 
         if let Some(display_handle_source) = display_handle_source
@@ -230,18 +231,16 @@ impl Instance {
             })
             .unwrap_or(false);
 
-        let enable_debug_utils =
-            max_log_level.is_some() && debug_utils_available && validation_layer_available;
-
         let mut enabled_exts: Vec<_> = mandatory_exts.iter().map(|ext| ext.as_ptr()).collect();
         let mut enabled_layers: Vec<*const i8> = Vec::new();
 
-        let mut debug_messenger_create_info = if enable_debug_utils {
+        let mut debug_messenger_create_info = if let Some(log_level) = max_log_level
+            && debug_utils_available
+            && validation_layer_available
+        {
             enabled_exts.push(debug_utils_ext_name.as_ptr());
             enabled_layers.push(validation_layer_name.as_ptr());
 
-            let log_level =
-                max_log_level.expect("enable_debug_utils is true so max_log_level must be Some");
             let message_severity = match log_level {
                 VulkanLogLevel::Verbose => {
                     ash::vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
@@ -334,6 +333,7 @@ impl Instance {
     ///
     /// # Safety
     /// All objects derived from surf must be destroyed first.
+    /// No in-flight GPU work may still reference `surf`.
     ///
     /// You can't use surf after this function is called (for obvious reasons)
     ///
@@ -401,13 +401,18 @@ impl Instance {
     /// # Safety
     /// `physical_device` must be a valid handle derived from this instance.
     /// `create_info` must be a valid DeviceCreateInfo.
-    pub unsafe fn create_raw_device(
+    /// Any handles referenced by `create_info` must also be derived from this
+    /// instance and remain valid for the duration of the call.
+    pub unsafe fn create_ash_device(
         &self,
         physical_device: vk::PhysicalDevice,
         create_info: &vk::DeviceCreateInfo<'_>,
     ) -> Result<ash::Device, vk::Result> {
         //SAFETY: physical_device was derived from this instance, create_info is valid
-        unsafe { self.handle.create_device(physical_device, create_info, None) }
+        unsafe {
+            self.handle
+                .create_device(physical_device, create_info, None)
+        }
     }
 
     /// Enumerate device extension properties for a physical device.
@@ -428,6 +433,36 @@ impl Instance {
     pub fn get_supported_ver(&self) -> VkVersion {
         self.ver
     }
+
+    pub fn raw_handle(&self) -> vk::Instance {
+        self.handle.handle()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vk_version_tuple_roundtrip() {
+        let version = VkVersion::new(1, 2, 3, 4);
+        let tuple = version.to_tuple();
+        let rebuilt = VkVersion::from_tuple(tuple);
+
+        assert_eq!(version.to_raw(), rebuilt.to_raw());
+    }
+
+    #[test]
+    fn vk_version_raw_roundtrip() {
+        let raw = vk::make_api_version(0, 1, 3, 275);
+        let version = VkVersion::from_raw(raw);
+
+        assert_eq!(version.to_raw(), raw);
+        assert_eq!(version.variant(), 0);
+        assert_eq!(version.major(), 1);
+        assert_eq!(version.minor(), 3);
+        assert_eq!(version.patch(), 275);
+    }
 }
 
 #[derive(Debug, Error)]
@@ -444,26 +479,6 @@ pub enum DestroyRawSurfaceError {
     ExtensionNotLoaded,
 }
 
-#[derive(Debug, Error)]
-pub enum CreateRawSurfaceError {
-    #[error("Error creating surface: {0}")]
-    OnCreate(vk::Result),
-    #[error("Unable to get display handle: {0}")]
-    DisplayHandle(raw_window_handle::HandleError),
-    #[error("Unable to get window handle: {0}")]
-    WindowHandle(raw_window_handle::HandleError),
-    #[error("Surface extension has not been loaded")]
-    ExtensionNotLoaded,
-}
-
-#[derive(Debug, Error)]
-pub enum SurfaceSupportError {
-    #[error("Surface extension is not loaded")]
-    ExtensionNotLoaded,
-    #[error("Vulkan error checking surface support: {0}")]
-    Vulkan(vk::Result),
-}
-
 //Extensions related to surface functionality
 impl Instance {
     /// Check if a queue family on a physical device supports presenting to
@@ -472,7 +487,7 @@ impl Instance {
     /// # Safety
     /// `physical_device` must be a valid handle derived from this instance.
     /// `surface` must be a valid handle derived from this instance.
-    pub(crate) unsafe fn get_raw_physical_device_surface_support(
+    pub unsafe fn get_raw_physical_device_surface_support(
         &self,
         physical_device: vk::PhysicalDevice,
         queue_family_index: u32,
@@ -493,18 +508,83 @@ impl Instance {
         }
     }
 
+    /// Query the surface capabilities for a physical device + surface pair.
+    ///
+    /// # Safety
+    /// `physical_device` and `surface` must both be derived from this
+    /// instance.
+    pub unsafe fn get_surface_capabilities(
+        &self,
+        physical_device: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+    ) -> Result<vk::SurfaceCapabilitiesKHR, SurfaceQueryError> {
+        if let Some(ref surface_instance) = self.surface_instance {
+            // SAFETY: Caller guarantees physical_device and surface provenance.
+            unsafe {
+                surface_instance.get_physical_device_surface_capabilities(physical_device, surface)
+            }
+            .map_err(SurfaceQueryError::Vulkan)
+        } else {
+            Err(SurfaceQueryError::ExtensionNotLoaded)
+        }
+    }
+
+    /// Query supported surface formats for a physical device + surface pair.
+    ///
+    /// # Safety
+    /// `physical_device` and `surface` must both be derived from this
+    /// instance.
+    pub unsafe fn get_surface_formats(
+        &self,
+        physical_device: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+    ) -> Result<Vec<vk::SurfaceFormatKHR>, SurfaceQueryError> {
+        if let Some(ref surface_instance) = self.surface_instance {
+            // SAFETY: Caller guarantees physical_device and surface provenance.
+            unsafe {
+                surface_instance.get_physical_device_surface_formats(physical_device, surface)
+            }
+            .map_err(SurfaceQueryError::Vulkan)
+        } else {
+            Err(SurfaceQueryError::ExtensionNotLoaded)
+        }
+    }
+
+    /// Query supported present modes for a physical device + surface pair.
+    ///
+    /// # Safety
+    /// `physical_device` and `surface` must both be derived from this
+    /// instance.
+    pub unsafe fn get_surface_present_modes(
+        &self,
+        physical_device: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+    ) -> Result<Vec<vk::PresentModeKHR>, SurfaceQueryError> {
+        if let Some(ref surface_instance) = self.surface_instance {
+            // SAFETY: Caller guarantees physical_device and surface provenance.
+            unsafe {
+                surface_instance.get_physical_device_surface_present_modes(physical_device, surface)
+            }
+            .map_err(SurfaceQueryError::Vulkan)
+        } else {
+            Err(SurfaceQueryError::ExtensionNotLoaded)
+        }
+    }
+
     ///Create a raw VkSurfaceKHR.
     ///
     /// # Safety
     /// The returned surface must be destroyed before source is dropped, or when
     /// the surface is invalidated due to something like a suspend event in
     /// winit. There is a parent child relationship between both the instance
-    /// and source and the returned surface
+    /// and source and the returned surface.
+    ///
+    /// The returned surface must only be used with this instance.
     pub unsafe fn create_raw_surface<T: HasDisplayHandle + HasWindowHandle>(
         &self,
         source: &T,
-    ) -> Result<vk::SurfaceKHR, CreateRawSurfaceError> {
-        use CreateRawSurfaceError as Error;
+    ) -> Result<vk::SurfaceKHR, CreateSurfaceError> {
+        use CreateSurfaceError as Error;
         if self.surface_instance.is_some() {
             //SAFETY:
             unsafe {
@@ -513,18 +593,36 @@ impl Instance {
                     &self.handle,
                     source
                         .display_handle()
-                        .map_err(|e| Error::DisplayHandle(e))?
+                        .map_err(|e| Error::InvalidDisplayHandle(e))?
                         .as_raw(),
                     source
                         .window_handle()
-                        .map_err(|e| Error::WindowHandle(e))?
+                        .map_err(|e| Error::InvalidWindowHandle(e))?
                         .as_raw(),
                     None,
                 )
             }
-            .map_err(|e| Error::OnCreate(e))
+            .map_err(|e| Error::VulkanError(e))
         } else {
-            Err(Error::ExtensionNotLoaded)
+            Err(Error::MissingExtension)
+        }
+    }
+}
+
+//Device extension loader creation functionality
+impl Instance {
+    pub fn create_swapchain_loader(&self, device: &ash::Device) -> ash::khr::swapchain::Device {
+        ash::khr::swapchain::Device::new(&self.handle, device)
+    }
+
+    pub fn create_debug_utils_device_loader(
+        &self,
+        device: &ash::Device,
+    ) -> Option<ash::ext::debug_utils::Device> {
+        if self.debug_messenger.is_some() {
+            Some(ash::ext::debug_utils::Device::new(&self.handle, device))
+        } else {
+            None
         }
     }
 }
