@@ -13,12 +13,20 @@ use crate::{
     swapchain::CreateSwapchainError,
 };
 
+enum DynamicRenderingLoader {
+    /// Vulkan 1.3+: dynamic rendering is core; dispatch through `ash::Device`.
+    Core,
+    /// Vulkan < 1.3: loaded via `VK_KHR_dynamic_rendering`.
+    Extension(ash::khr::dynamic_rendering::Device),
+}
+
 #[allow(dead_code)]
 pub struct Device {
     parent: Arc<Instance>,
     handle: ash::Device,
     swapchain_device: Option<ash::khr::swapchain::Device>,
     debug_utils_device: Option<ash::ext::debug_utils::Device>,
+    dynamic_rendering: Option<DynamicRenderingLoader>,
     swapchain_name_counter: AtomicU64,
     physical_device: vk::PhysicalDevice,
     graphics_present_queue: (vk::Queue, u32),
@@ -68,6 +76,18 @@ pub enum CreateCompatibleError {
 
     #[error("Error checking surface support: {0}")]
     SurfaceSupport(#[from] SurfaceSupportError),
+
+    #[error(
+        "Dynamic rendering was requested but VK_KHR_dynamic_rendering is not \
+         supported by the selected physical device"
+    )]
+    DynamicRenderingNotAvailable,
+}
+
+#[derive(Debug, Error)]
+pub enum DynamicRenderingError {
+    #[error("Dynamic rendering is not enabled on this device")]
+    NotEnabled,
 }
 
 #[derive(Debug, Error)]
@@ -96,6 +116,7 @@ pub enum QueueMode {
 #[derive(Debug, Default)]
 pub struct DeviceConfig {
     pub swapchain: bool,
+    pub dynamic_rendering: bool,
     pub queue_mode: QueueMode,
 }
 
@@ -277,35 +298,60 @@ impl Device {
             })
             .collect();
 
-        // Check for VK_KHR_shader_non_semantic_info
         let ver = instance.get_supported_ver();
-        let non_semantic_info_needed = ver.major() < 1 || (ver.major() == 1 && ver.minor() < 3);
+        let is_pre_1_3 = ver.major() < 1 || (ver.major() == 1 && ver.minor() < 3);
 
-        if non_semantic_info_needed {
+        // Enumerate device extensions once for all pre-1.3 optional checks.
+        let device_exts: Vec<vk::ExtensionProperties> = if is_pre_1_3 {
             //SAFETY: physical_device was derived from instance
-            let device_exts =
-                unsafe { instance.enumerate_raw_device_extension_properties(physical_device) }
-                    .unwrap_or_default();
+            unsafe { instance.enumerate_raw_device_extension_properties(physical_device) }
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
+        // VK_KHR_shader_non_semantic_info: promoted to core in 1.3.
+        if is_pre_1_3 {
             let has_non_semantic = device_exts.iter().any(|ext| {
                 ext.extension_name_as_c_str() == Ok(ash::khr::shader_non_semantic_info::NAME)
             });
-
             if has_non_semantic {
                 mandatory_exts.push(ash::khr::shader_non_semantic_info::NAME);
             }
         }
+
+        // VK_KHR_dynamic_rendering: core in 1.3, extension on older drivers.
+        // `use_dr_ext` is true only when the extension loader must be used.
+        let use_dr_ext = if config.dynamic_rendering && is_pre_1_3 {
+            let has_dr = device_exts
+                .iter()
+                .any(|ext| ext.extension_name_as_c_str() == Ok(ash::khr::dynamic_rendering::NAME));
+            if has_dr {
+                mandatory_exts.push(ash::khr::dynamic_rendering::NAME);
+                true
+            } else {
+                return Err(CreateCompatibleError::DynamicRenderingNotAvailable);
+            }
+        } else {
+            false
+        };
 
         let ext_ptrs: Vec<*const i8> = mandatory_exts.iter().map(|e| e.as_ptr()).collect();
 
         // Enable synchronization2
         let mut sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        // Enable dynamic rendering if requested (core 1.3 or via extension).
+        let mut dr_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
 
-        let device_create_info = vk::DeviceCreateInfo::default()
+        let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&ext_ptrs)
             .push_next(&mut sync2_features);
+        if config.dynamic_rendering {
+            device_create_info = device_create_info.push_next(&mut dr_features);
+        }
 
         //SAFETY: physical_device was derived from instance, device_create_info
         //is valid
@@ -337,6 +383,17 @@ impl Device {
                 None
             },
             debug_utils_device: instance.create_debug_utils_device_loader(&device),
+            dynamic_rendering: if config.dynamic_rendering {
+                if use_dr_ext {
+                    Some(DynamicRenderingLoader::Extension(
+                        instance.create_dynamic_rendering_loader(&device),
+                    ))
+                } else {
+                    Some(DynamicRenderingLoader::Core)
+                }
+            } else {
+                None
+            },
             swapchain_name_counter: AtomicU64::new(0),
             handle: device,
             physical_device,
@@ -364,6 +421,7 @@ impl Device {
     /// coarse-grained transitions (shutdown, suspend, swapchain teardown)
     /// rather than hot per-frame paths.
     pub fn wait_idle(&self) -> Result<(), vk::Result> {
+        let _span = tracing::debug_span!("device_wait_idle").entered();
         // SAFETY: `self.handle` is a valid logical device for the lifetime of
         // `self`, and this call has no additional pointer preconditions.
         unsafe { self.handle.device_wait_idle() }
@@ -545,6 +603,164 @@ impl Device {
 
         // SAFETY: This method shares the same safety contract as set_object_name.
         unsafe { self.set_object_name(object, name.as_deref()) }
+    }
+}
+
+// Shader module functionality
+impl Device {
+    /// # Safety
+    /// `create_info` must contain valid SPIR-V code. All referenced pointers
+    /// must remain valid for the duration of the call.
+    pub unsafe fn create_raw_shader_module(
+        &self,
+        create_info: &vk::ShaderModuleCreateInfo<'_>,
+    ) -> Result<vk::ShaderModule, vk::Result> {
+        // SAFETY: Caller guarantees create_info validity.
+        unsafe { self.handle.create_shader_module(create_info, None) }
+    }
+
+    /// # Safety
+    /// `shader_module` must be a valid handle created from this device and
+    /// not yet destroyed. All objects derived from it must be destroyed first.
+    pub unsafe fn destroy_raw_shader_module(&self, shader_module: vk::ShaderModule) {
+        // SAFETY: Caller guarantees shader_module provenance and drop ordering.
+        unsafe { self.handle.destroy_shader_module(shader_module, None) };
+    }
+}
+
+// Pipeline functionality
+impl Device {
+    /// # Safety
+    /// `create_info` must be a valid pipeline layout create info. All
+    /// referenced descriptor set layouts must be valid handles created from
+    /// this device.
+    pub unsafe fn create_raw_pipeline_layout(
+        &self,
+        create_info: &vk::PipelineLayoutCreateInfo<'_>,
+    ) -> Result<vk::PipelineLayout, vk::Result> {
+        // SAFETY: Caller guarantees create_info validity.
+        unsafe { self.handle.create_pipeline_layout(create_info, None) }
+    }
+
+    /// # Safety
+    /// `layout` must be a valid handle created from this device and not yet
+    /// destroyed. No pipeline still using this layout may be in use.
+    pub unsafe fn destroy_raw_pipeline_layout(&self, layout: vk::PipelineLayout) {
+        // SAFETY: Caller guarantees layout provenance and drop ordering.
+        unsafe { self.handle.destroy_pipeline_layout(layout, None) };
+    }
+
+    /// Create a single graphics pipeline.
+    ///
+    /// On partial batch failure ash returns any successfully-created pipeline
+    /// handles alongside the error; this wrapper destroys them so callers
+    /// never receive a mix of valid and invalid handles.
+    ///
+    /// # Safety
+    /// `create_info` must reference valid shader stages, a valid pipeline
+    /// layout, and any pNext structures, all derived from this device. All
+    /// referenced pointers must remain valid for the duration of the call.
+    pub unsafe fn create_raw_graphics_pipeline(
+        &self,
+        create_info: &vk::GraphicsPipelineCreateInfo<'_>,
+    ) -> Result<vk::Pipeline, vk::Result> {
+        // SAFETY: Caller guarantees create_info validity.
+        unsafe {
+            self.handle.create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                std::slice::from_ref(create_info),
+                None,
+            )
+        }
+        .map_err(|(partial, result)| {
+            // Destroy any handles that were successfully created before the
+            // failure so the caller receives nothing on error.
+            for p in partial {
+                if p != vk::Pipeline::null() {
+                    // SAFETY: p was just created by this device.
+                    unsafe { self.handle.destroy_pipeline(p, None) };
+                }
+            }
+            result
+        })
+        .map(|mut pipelines| {
+            debug_assert_eq!(pipelines.len(), 1);
+            pipelines.remove(0)
+        })
+    }
+
+    /// # Safety
+    /// `pipeline` must be a valid handle created from this device and not yet
+    /// destroyed. No in-flight GPU work may still reference the pipeline.
+    pub unsafe fn destroy_raw_pipeline(&self, pipeline: vk::Pipeline) {
+        // SAFETY: Caller guarantees pipeline provenance and drop ordering.
+        unsafe { self.handle.destroy_pipeline(pipeline, None) };
+    }
+}
+
+// Dynamic rendering functionality
+impl Device {
+    pub fn has_dynamic_rendering(&self) -> bool {
+        self.dynamic_rendering.is_some()
+    }
+
+    /// Begin a dynamic render pass on `command_buffer`.
+    ///
+    /// Dispatches to the Vulkan 1.3 core entry point or the
+    /// `VK_KHR_dynamic_rendering` extension entry point depending on which was
+    /// available at device creation.
+    ///
+    /// # Safety
+    /// - `command_buffer` must be a valid handle in the recording state,
+    ///   derived from this device.
+    /// - `rendering_info` and all objects it references (image views, resolve
+    ///   attachments, etc.) must be valid for the duration of the call and
+    ///   the render pass.
+    /// - All referenced images must be in the layout specified in
+    ///   `rendering_info`.
+    pub unsafe fn cmd_begin_raw_rendering(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        rendering_info: &vk::RenderingInfo<'_>,
+    ) -> Result<(), DynamicRenderingError> {
+        match &self.dynamic_rendering {
+            None => Err(DynamicRenderingError::NotEnabled),
+            Some(DynamicRenderingLoader::Core) => {
+                // SAFETY: Caller guarantees command_buffer and rendering_info validity.
+                unsafe { self.handle.cmd_begin_rendering(command_buffer, rendering_info) };
+                Ok(())
+            }
+            Some(DynamicRenderingLoader::Extension(loader)) => {
+                // SAFETY: Caller guarantees command_buffer and rendering_info validity.
+                unsafe { loader.cmd_begin_rendering(command_buffer, rendering_info) };
+                Ok(())
+            }
+        }
+    }
+
+    /// End the current dynamic render pass on `command_buffer`.
+    ///
+    /// # Safety
+    /// - `command_buffer` must be a valid handle in the recording state,
+    ///   derived from this device, and currently inside a render pass begun
+    ///   with [`cmd_begin_raw_rendering`](Self::cmd_begin_raw_rendering).
+    pub unsafe fn cmd_end_raw_rendering(
+        &self,
+        command_buffer: vk::CommandBuffer,
+    ) -> Result<(), DynamicRenderingError> {
+        match &self.dynamic_rendering {
+            None => Err(DynamicRenderingError::NotEnabled),
+            Some(DynamicRenderingLoader::Core) => {
+                // SAFETY: Caller guarantees command_buffer validity and render pass state.
+                unsafe { self.handle.cmd_end_rendering(command_buffer) };
+                Ok(())
+            }
+            Some(DynamicRenderingLoader::Extension(loader)) => {
+                // SAFETY: Caller guarantees command_buffer validity and render pass state.
+                unsafe { loader.cmd_end_rendering(command_buffer) };
+                Ok(())
+            }
+        }
     }
 }
 

@@ -615,6 +615,13 @@ impl Instance {
         ash::khr::swapchain::Device::new(&self.handle, device)
     }
 
+    pub fn create_dynamic_rendering_loader(
+        &self,
+        device: &ash::Device,
+    ) -> ash::khr::dynamic_rendering::Device {
+        ash::khr::dynamic_rendering::Device::new(&self.handle, device)
+    }
+
     pub fn create_debug_utils_device_loader(
         &self,
         device: &ash::Device,
