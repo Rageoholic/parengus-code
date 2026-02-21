@@ -57,7 +57,10 @@ fn choose_present_mode(present_modes: &[vk::PresentModeKHR]) -> vk::PresentModeK
         .unwrap_or(vk::PresentModeKHR::FIFO)
 }
 
-fn choose_extent(capabilities: &vk::SurfaceCapabilitiesKHR, desired_extent: vk::Extent2D) -> vk::Extent2D {
+fn choose_extent(
+    capabilities: &vk::SurfaceCapabilitiesKHR,
+    desired_extent: vk::Extent2D,
+) -> vk::Extent2D {
     if capabilities.current_extent.width != u32::MAX {
         capabilities.current_extent
     } else {
@@ -157,7 +160,7 @@ pub struct Swapchain<T: HasDisplayHandle + HasWindowHandle> {
     format: vk::Format,
     extent: vk::Extent2D,
     images: Vec<vk::Image>,
-    image_views: Vec<vk::ImageView>,
+    image_views: Option<Vec<vk::ImageView>>,
 }
 
 struct SwapchainDebugWithSource<'a, T: HasDisplayHandle + HasWindowHandle + std::fmt::Debug>(
@@ -173,8 +176,14 @@ impl<T: HasDisplayHandle + HasWindowHandle + std::fmt::Debug> std::fmt::Debug
             .field("format", &self.0.format)
             .field("extent", &self.0.extent)
             .field("image_count", &self.0.images.len())
-            .field("image_view_count", &self.0.image_views.len())
-            .field("parent_surface", &self.0._parent_surface.debug_with_source())
+            .field(
+                "image_view_count",
+                &self.0.image_views.as_ref().map(|v| v.len()),
+            )
+            .field(
+                "parent_surface",
+                &self.0._parent_surface.debug_with_source(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -186,7 +195,10 @@ impl<T: HasDisplayHandle + HasWindowHandle> std::fmt::Debug for Swapchain<T> {
             .field("format", &self.format)
             .field("extent", &self.extent)
             .field("image_count", &self.images.len())
-            .field("image_view_count", &self.image_views.len())
+            .field(
+                "image_view_count",
+                &self.image_views.as_ref().map(|v| v.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -200,8 +212,15 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         parent_device: &Arc<Device>,
         parent_surface: &Arc<Surface<T>>,
         desired_extent: vk::Extent2D,
+        create_image_views: bool,
     ) -> Result<Self, CreateSwapchainError> {
-        Self::new_with_old(parent_device, parent_surface, desired_extent, None)
+        Self::new_with_old(
+            parent_device,
+            parent_surface,
+            desired_extent,
+            None,
+            create_image_views,
+        )
     }
 
     /// Returns a richer debug view that includes parent surface source
@@ -229,6 +248,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         parent_surface: &Arc<Surface<T>>,
         desired_extent: vk::Extent2D,
         old_swapchain: Option<&Self>,
+        create_image_views: bool,
     ) -> Result<Self, CreateSwapchainError> {
         if !parent_device.has_swapchain_support() {
             return Err(CreateSwapchainError::SwapchainNotEnabled);
@@ -318,44 +338,50 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
                 unsafe { parent_device.destroy_raw_swapchain(handle) };
             })?;
 
-        let image_views = create_default_swapchain_image_views(
-            &images,
-            surface_format.format,
-            swapchain_debug_index,
-            |create_info| {
-                // SAFETY: create_info references a valid swapchain image from
-                // this device, and uses a standard 2D color subresource range.
-                unsafe { parent_device.create_raw_image_view(create_info) }
-            },
-            |image_view| {
-                // SAFETY: image_view was created by parent_device and must be
-                // destroyed on early exit.
-                unsafe { parent_device.destroy_raw_image_view(image_view) };
-            },
-            |index, image_view| {
-                // SAFETY: image_view is valid and created from parent_device.
-                match unsafe {
-                    parent_device.set_object_name_with(image_view, || {
-                        std::ffi::CString::new(format!(
-                            "Swapchain {swapchain_debug_index} ImageView {}",
-                            index + 1,
-                        ))
-                        .ok()
-                    })
-                } {
-                    Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-                    Err(e) => tracing::warn!(
-                        "Failed to name swapchain image view {:?}: {e}",
-                        image_view
-                    ),
-                }
-            },
-        )
-        .inspect_err(|_| {
-            // SAFETY: handle was created above and must be destroyed on
-            // early exit.
-            unsafe { parent_device.destroy_raw_swapchain(handle) };
-        })?;
+        let image_views = if create_image_views {
+            Some(
+                create_default_swapchain_image_views(
+                    &images,
+                    surface_format.format,
+                    swapchain_debug_index,
+                    |create_info| {
+                        // SAFETY: create_info references a valid swapchain image from
+                        // this device, and uses a standard 2D color subresource range.
+                        unsafe { parent_device.create_raw_image_view(create_info) }
+                    },
+                    |image_view| {
+                        // SAFETY: image_view was created by parent_device and must be
+                        // destroyed on early exit.
+                        unsafe { parent_device.destroy_raw_image_view(image_view) };
+                    },
+                    |index, image_view| {
+                        // SAFETY: image_view is valid and created from parent_device.
+                        match unsafe {
+                            parent_device.set_object_name_with(image_view, || {
+                                std::ffi::CString::new(format!(
+                                    "Swapchain {swapchain_debug_index} ImageView {}",
+                                    index + 1,
+                                ))
+                                .ok()
+                            })
+                        } {
+                            Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
+                            Err(e) => tracing::warn!(
+                                "Failed to name swapchain image view {:?}: {e}",
+                                image_view
+                            ),
+                        }
+                    },
+                )
+                .inspect_err(|_| {
+                    // SAFETY: handle was created above and must be destroyed on
+                    // early exit.
+                    unsafe { parent_device.destroy_raw_swapchain(handle) };
+                })?,
+            )
+        } else {
+            None
+        };
 
         // SAFETY: `handle` and `images` are created from `parent_device`, and
         // `parent_surface` is derived from the same parent instance.
@@ -373,13 +399,13 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
     }
 
     /// # Safety
-    /// `handle`, `images`, and `image_views` must all be valid resources
+    /// `handle`, `images`, and any `image_views` must all be valid resources
     /// created from `parent_device`.
     ///
     /// `parent_surface` must be derived from the same parent instance as
     /// `parent_device`.
     ///
-    /// `image_views` should correspond to images in `images` (same image,
+    /// `image_views`, when `Some`, should correspond to images in `images` (same image,
     /// format compatibility, and subresource range expectations).
     ///
     /// All resources passed here must follow Vulkan destruction ordering
@@ -391,7 +417,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         format: vk::Format,
         extent: vk::Extent2D,
         images: Vec<vk::Image>,
-        image_views: Vec<vk::ImageView>,
+        image_views: Option<Vec<vk::ImageView>>,
     ) -> Self {
         Self {
             parent_device,
@@ -420,8 +446,8 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         &self.images
     }
 
-    pub fn image_views(&self) -> &[vk::ImageView] {
-        &self.image_views
+    pub fn image_views(&self) -> Option<&[vk::ImageView]> {
+        self.image_views.as_deref()
     }
 }
 
@@ -431,7 +457,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Drop for Swapchain<T> {
         // NOTE: Callers must ensure GPU synchronization before drop (for
         // example, waiting on fences/device idle) so no in-flight work still
         // references these views or the swapchain.
-        for image_view in self.image_views.drain(..) {
+        for image_view in self.image_views.iter_mut().flat_map(|v| v.drain(..)) {
             // SAFETY: image_view was created by parent_device and is being
             // destroyed during swapchain teardown.
             unsafe { self.parent_device.destroy_raw_image_view(image_view) };
@@ -555,7 +581,11 @@ mod tests {
 
     #[test]
     fn image_view_helper_cleans_up_on_partial_failure() {
-        let images = [vk::Image::from_raw(1), vk::Image::from_raw(2), vk::Image::from_raw(3)];
+        let images = [
+            vk::Image::from_raw(1),
+            vk::Image::from_raw(2),
+            vk::Image::from_raw(3),
+        ];
         let created_views = [vk::ImageView::from_raw(10), vk::ImageView::from_raw(11)];
         let create_calls = RefCell::new(0usize);
         let destroyed = RefCell::new(Vec::<vk::ImageView>::new());
