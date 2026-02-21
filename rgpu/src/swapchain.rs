@@ -38,7 +38,16 @@ pub enum CreateSwapchainError {
     VulkanCreateImageView(vk::Result),
 }
 
-fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
+fn choose_surface_format(
+    formats: &[vk::SurfaceFormatKHR],
+    preferred_format: Option<vk::Format>,
+) -> vk::SurfaceFormatKHR {
+    // Try the caller's preferred format first (any color space).
+    if let Some(preferred) = preferred_format
+    && let Some(found) = formats.iter().copied().find(|f| f.format == preferred) {
+            return found;
+        }
+
     formats
         .iter()
         .copied()
@@ -208,11 +217,17 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
     ///
     /// For resize/recreation paths, prefer `new_with_old` so drivers can
     /// optimize resource reuse.
+    ///
+    /// `preferred_format` is a hint for surface format selection. When the
+    /// surface supports it, the swapchain will use that format. Falls back to
+    /// the default selection (B8G8R8A8_UNORM + SRGB_NONLINEAR) if not
+    /// available.
     pub fn new(
         parent_device: &Arc<Device>,
         parent_surface: &Arc<Surface<T>>,
         desired_extent: vk::Extent2D,
         create_image_views: bool,
+        preferred_format: Option<vk::Format>,
     ) -> Result<Self, CreateSwapchainError> {
         Self::new_with_old(
             parent_device,
@@ -220,6 +235,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
             desired_extent,
             None,
             create_image_views,
+            preferred_format,
         )
     }
 
@@ -243,12 +259,15 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
     ///
     /// The caller is responsible for synchronizing GPU usage so replacing the
     /// old swapchain is safe for the application's frame lifecycle.
+    ///
+    /// See [`new`](Self::new) for the semantics of `preferred_format`.
     pub fn new_with_old(
         parent_device: &Arc<Device>,
         parent_surface: &Arc<Surface<T>>,
         desired_extent: vk::Extent2D,
         old_swapchain: Option<&Self>,
         create_image_views: bool,
+        preferred_format: Option<vk::Format>,
     ) -> Result<Self, CreateSwapchainError> {
         if !parent_device.has_swapchain_support() {
             return Err(CreateSwapchainError::SwapchainNotEnabled);
@@ -290,7 +309,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
             return Err(CreateSwapchainError::NoPresentModes);
         }
 
-        let surface_format = choose_surface_format(&formats);
+        let surface_format = choose_surface_format(&formats, preferred_format);
         let present_mode = choose_present_mode(&present_modes);
         let extent = choose_extent(&capabilities, desired_extent);
         let image_count = choose_image_count(&capabilities);
@@ -501,7 +520,7 @@ mod tests {
             color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
         };
 
-        let chosen = choose_surface_format(&[fallback, preferred]);
+        let chosen = choose_surface_format(&[fallback, preferred], None);
         assert_eq!(chosen.format, preferred.format);
         assert_eq!(chosen.color_space, preferred.color_space);
     }

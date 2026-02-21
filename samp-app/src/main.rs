@@ -8,8 +8,11 @@ use std::{
 
 use clap::Parser;
 use rgpu::{
+    ash::vk,
     device::{Device, DeviceConfig, QueueMode},
     instance::{Instance, InstanceExtensions},
+    pipeline::{DynamicPipeline, DynamicPipelineDesc},
+    shader::{ShaderModule, ShaderStage},
     surface::Surface,
     swapchain::Swapchain,
 };
@@ -95,16 +98,20 @@ impl From<CliVulkanLogLevel> for rgpu::log::VulkanLogLevel {
 }
 
 fn main() -> eyre::Result<()> {
-    let app_dirs = directories::ProjectDirs::from("", "parengus", "samp-app");
+    let app_dirs = directories::ProjectDirs::from("", "parengus", "samp-app")
+        .ok_or_else(|| eyre::eyre!("Failed to determine application directories"))?;
 
-    let log_dir = match app_dirs
-        .as_ref()
-        .and_then(|x| x.runtime_dir().or_else(|| Some(x.data_dir())))
-        .map(|p| p.to_owned())
-    {
-        Some(path) => path,
-        None => std::env::current_dir()?,
-    };
+    let self_dir = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| {
+            eyre::eyre!("Failed to take the parent directory of the current executable")
+        })?
+        .to_owned();
+
+    let log_dir = app_dirs
+        .runtime_dir()
+        .unwrap_or_else(|| app_dirs.data_dir())
+        .to_owned();
 
     let cli_args = CliArgs::parse();
 
@@ -149,12 +156,14 @@ fn main() -> eyre::Result<()> {
 
     let device_config = DeviceConfig {
         swapchain: true,
+        dynamic_rendering: true,
         queue_mode: cli_args.queue_mode.into(),
     };
 
     let mut app = AppRunner(Some(App::Initializing(InitializingState {
         instance,
         device_config,
+        self_dir: self_dir.to_owned(),
     })));
 
     tracing::trace!("Entering main event loop");
@@ -176,6 +185,7 @@ enum App {
 struct InitializingState {
     instance: Arc<Instance>,
     device_config: DeviceConfig,
+    self_dir: std::path::PathBuf,
 }
 #[derive(Debug)]
 struct RunningState {
@@ -186,12 +196,18 @@ struct RunningState {
     // `None` means the window/surface is currently zero-sized. We stay in
     // Running and recreate on the next non-zero resize/scale event.
     swapchain: Option<Swapchain<WinitWindow>>,
+    shader: ShaderModule,
+    pipeline: DynamicPipeline,
+    pipeline_color_format: vk::Format,
 }
 #[derive(Debug)]
 struct SuspendedState {
     instance: Arc<Instance>,
     win: Arc<WinitWindow>,
     device: Arc<Device>,
+    shader: ShaderModule,
+    pipeline: DynamicPipeline,
+    pipeline_color_format: vk::Format,
 }
 #[derive(Debug)]
 struct ExitingState {}
@@ -200,134 +216,33 @@ impl ApplicationHandler for AppRunner {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         assert!(self.0.is_some());
         if let Some(initializing_state) = self.take_initializing() {
+            let _span =
+                tracing::debug_span!("state_transition", from = "Initializing", to = "Running")
+                    .entered();
             event_loop.set_control_flow(ControlFlow::Poll);
-            let win = Arc::new(
-                match event_loop.create_window(WindowAttributes::default().with_inner_size(
-                    LogicalSize {
-                        width: 1600,
-                        height: 900,
-                    },
-                )) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::error!("Error while creating window: {}", e);
-                        self.transition_to_exiting("Initializing", event_loop);
-                        return;
-                    }
-                },
-            );
-            //SAFETY: We will drop surface when we enter into `suspend`
-            let surface = Arc::new(
-                match unsafe { Surface::new(&initializing_state.instance, Arc::clone(&win)) } {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Error while creating surface: {}", e);
-                        self.transition_to_exiting("Initializing", event_loop);
-                        return;
-                    }
-                },
-            );
-
-            let device = match Device::create_compatible(
-                &initializing_state.instance,
-                &surface,
-                initializing_state.device_config,
-            ) {
-                Ok(d) => Arc::new(d),
+            match Self::initializing_to_running(initializing_state, event_loop) {
+                Ok(running_state) => {
+                    self.set_running(running_state);
+                }
                 Err(e) => {
-                    tracing::error!("Error while creating device: {}", e);
+                    tracing::error!("Error during initialization: {:#}", e);
                     self.transition_to_exiting("Initializing", event_loop);
-                    return;
                 }
-            };
-            let win_size = win.inner_size();
-            let swapchain = if win_size.width == 0 || win_size.height == 0 {
-                tracing::trace!(
-                    "Skipping initial swapchain create because window extent is zero: {}x{}",
-                    win_size.width,
-                    win_size.height
-                );
-                None
-            } else {
-                let requested_extent = rgpu::ash::vk::Extent2D {
-                    width: win_size.width,
-                    height: win_size.height,
-                };
-                let swapchain_create_span = tracing::trace_span!(
-                    "initial_swapchain_create",
-                    requested_width = requested_extent.width,
-                    requested_height = requested_extent.height
-                )
-                .entered();
-                let swapchain = match Swapchain::new(&device, &surface, requested_extent, true) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Error while creating swapchain: {}", e);
-                        self.transition_to_exiting("Initializing", event_loop);
-                        return;
-                    }
-                };
-                drop(swapchain_create_span);
-                Some(swapchain)
-            };
-            tracing::debug!("State transition: Initializing -> Running");
-            self.set_running(RunningState {
-                instance: initializing_state.instance,
-                win,
-                device,
-                _surface: surface,
-                swapchain,
-            });
+            }
         } else if let Some(suspended_state) = self.take_suspended() {
+            let _span =
+                tracing::debug_span!("state_transition", from = "Suspended", to = "Running")
+                    .entered();
             event_loop.set_control_flow(ControlFlow::Poll);
-            //SAFETY: We will drop surface when we enter into `suspend`
-            let surface = Arc::new(
-                match unsafe {
-                    Surface::new(&suspended_state.instance, Arc::clone(&suspended_state.win))
-                } {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Error while creating surface: {}", e);
-                        self.transition_to_exiting("Suspended", event_loop);
-                        return;
-                    }
-                },
-            );
-
-            let win_size = suspended_state.win.inner_size();
-            let swapchain = if win_size.width == 0 || win_size.height == 0 {
-                tracing::trace!(
-                    "Skipping swapchain create on resume because window extent is zero: {}x{}",
-                    win_size.width,
-                    win_size.height
-                );
-                None
-            } else {
-                match Swapchain::new(
-                    &suspended_state.device,
-                    &surface,
-                    rgpu::ash::vk::Extent2D {
-                        width: win_size.width,
-                        height: win_size.height,
-                    },
-                    true,
-                ) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        tracing::error!("Error while creating swapchain: {}", e);
-                        self.transition_to_exiting("Suspended", event_loop);
-                        return;
-                    }
+            match Self::suspended_to_running(suspended_state) {
+                Ok(running_state) => {
+                    self.set_running(running_state);
                 }
-            };
-            tracing::debug!("State transition: Suspended -> Running");
-            self.set_running(RunningState {
-                instance: suspended_state.instance,
-                win: suspended_state.win,
-                device: suspended_state.device,
-                _surface: surface,
-                swapchain,
-            });
+                Err(e) => {
+                    tracing::error!("Error during resume: {:#}", e);
+                    self.transition_to_exiting("Suspended", event_loop);
+                }
+            }
         } else if self.is_exiting() {
             tracing::warn!("resumed() called while in Exiting state");
         }
@@ -335,6 +250,9 @@ impl ApplicationHandler for AppRunner {
     fn suspended(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         assert!(self.0.is_some());
         if let Some(running_state) = self.take_running() {
+            let _span =
+                tracing::debug_span!("state_transition", from = "Running", to = "Suspended")
+                    .entered();
             event_loop.set_control_flow(ControlFlow::Wait);
             let RunningState {
                 instance,
@@ -342,6 +260,9 @@ impl ApplicationHandler for AppRunner {
                 device,
                 _surface: _,
                 swapchain: _,
+                shader,
+                pipeline,
+                pipeline_color_format,
             } = running_state;
 
             if let Err(e) = device.wait_idle() {
@@ -350,11 +271,13 @@ impl ApplicationHandler for AppRunner {
                 return;
             }
 
-            tracing::debug!("State transition: Running -> Suspended");
             self.set_suspended(SuspendedState {
                 instance,
                 win,
                 device,
+                shader,
+                pipeline,
+                pipeline_color_format,
             });
         }
     }
@@ -407,6 +330,178 @@ impl ApplicationHandler for AppRunner {
     }
 }
 
+fn build_pipeline(
+    device: &Arc<Device>,
+    shader: &ShaderModule,
+    color_format: vk::Format,
+    name: Option<&str>,
+) -> eyre::Result<DynamicPipeline> {
+    let vert = shader.entry_point("vert_main", ShaderStage::Vertex)?;
+    let frag = shader.entry_point("frag_main", ShaderStage::Fragment)?;
+    Ok(DynamicPipeline::new(
+        device,
+        &DynamicPipelineDesc {
+            stages: &[vert, frag],
+            color_attachment_formats: &[color_format],
+            ..Default::default()
+        },
+        name,
+    )?)
+}
+
+impl AppRunner {
+    fn initializing_to_running(
+        state: InitializingState,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> eyre::Result<RunningState> {
+        let win = Arc::new(event_loop.create_window(
+            WindowAttributes::default().with_inner_size(LogicalSize {
+                width: 1600,
+                height: 900,
+            }),
+        )?);
+
+        //SAFETY: We will drop surface when we enter into `suspend`
+        let surface = Arc::new(unsafe { Surface::new(&state.instance, Arc::clone(&win)) }?);
+
+        let device = Arc::new(Device::create_compatible(
+            &state.instance,
+            &surface,
+            state.device_config,
+        )?);
+
+        let win_size = win.inner_size();
+        let swapchain = if win_size.width == 0 || win_size.height == 0 {
+            tracing::trace!(
+                "Skipping initial swapchain create because window extent is zero: {}x{}",
+                win_size.width,
+                win_size.height
+            );
+            None
+        } else {
+            let requested_extent = vk::Extent2D {
+                width: win_size.width,
+                height: win_size.height,
+            };
+            let swapchain_create_span = tracing::trace_span!(
+                "initial_swapchain_create",
+                requested_width = requested_extent.width,
+                requested_height = requested_extent.height
+            )
+            .entered();
+            let swapchain = Swapchain::new(&device, &surface, requested_extent, true, None)?;
+            drop(swapchain_create_span);
+            Some(swapchain)
+        };
+
+        let shader_dir = state.self_dir.join("shaders");
+        let shader = {
+            let _span = tracing::trace_span!("shader_load", path = ?shader_dir.join("shader.spv"))
+                .entered();
+            let shader_bytes = std::fs::read(shader_dir.join("shader.spv"))
+                .map_err(|e| eyre::eyre!("Error loading shader.spv: {e}"))?;
+            ShaderModule::new(&device, &shader_bytes, Some("shader"))?
+        };
+
+        let pipeline_color_format = swapchain
+            .as_ref()
+            .map(|sc| sc.format())
+            .unwrap_or(vk::Format::B8G8R8A8_UNORM);
+        let pipeline = {
+            let _span = tracing::trace_span!(
+                "pipeline_create",
+                color_format = ?pipeline_color_format,
+            )
+            .entered();
+            build_pipeline(
+                &device,
+                &shader,
+                pipeline_color_format,
+                Some("main pipeline"),
+            )?
+        };
+
+        Ok(RunningState {
+            instance: state.instance,
+            win,
+            device,
+            _surface: surface,
+            swapchain,
+            shader,
+            pipeline,
+            pipeline_color_format,
+        })
+    }
+
+    fn suspended_to_running(state: SuspendedState) -> eyre::Result<RunningState> {
+        //SAFETY: We will drop surface when we enter into `suspend`
+        let surface = Arc::new(unsafe { Surface::new(&state.instance, Arc::clone(&state.win)) }?);
+
+        let win_size = state.win.inner_size();
+        let swapchain = if win_size.width == 0 || win_size.height == 0 {
+            tracing::trace!(
+                "Skipping swapchain create on resume because window extent is zero: {}x{}",
+                win_size.width,
+                win_size.height
+            );
+            None
+        } else {
+            Some(Swapchain::new(
+                &state.device,
+                &surface,
+                vk::Extent2D {
+                    width: win_size.width,
+                    height: win_size.height,
+                },
+                true,
+                Some(state.pipeline_color_format),
+            )?)
+        };
+
+        // Reuse the existing pipeline when the swapchain honored the preferred
+        // format. Recreate it only if the surface forced a different format.
+        let swapchain_format = swapchain.as_ref().map(|sc| sc.format());
+        let (pipeline, pipeline_color_format) = if let Some(new_format) = swapchain_format {
+            if new_format == state.pipeline_color_format {
+                (state.pipeline, state.pipeline_color_format)
+            } else {
+                tracing::debug!(
+                    "Swapchain format changed on resume ({:?} -> {:?}); recreating pipeline",
+                    state.pipeline_color_format,
+                    new_format,
+                );
+                let pipeline = {
+                    let _span = tracing::trace_span!(
+                        "pipeline_create",
+                        color_format = ?new_format,
+                    )
+                    .entered();
+                    build_pipeline(
+                        &state.device,
+                        &state.shader,
+                        new_format,
+                        Some("main pipeline"),
+                    )?
+                };
+                (pipeline, new_format)
+            }
+        } else {
+            (state.pipeline, state.pipeline_color_format)
+        };
+
+        Ok(RunningState {
+            instance: state.instance,
+            win: state.win,
+            device: state.device,
+            _surface: surface,
+            swapchain,
+            shader: state.shader,
+            pipeline,
+            pipeline_color_format,
+        })
+    }
+}
+
 #[allow(dead_code, reason = "these functions exist for API completeness")]
 impl AppRunner {
     fn transition_to_exiting(
@@ -414,7 +509,8 @@ impl AppRunner {
         from_state: &'static str,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) {
-        tracing::debug!("State transition: {} -> Exiting", from_state);
+        let _span =
+            tracing::debug_span!("state_transition", from = from_state, to = "Exiting").entered();
         self.set_exiting(ExitingState {});
         event_loop.exit();
     }
@@ -463,11 +559,12 @@ impl AppRunner {
         desired_extent: rgpu::ash::vk::Extent2D,
     ) -> bool {
         if desired_extent.width == 0 || desired_extent.height == 0 {
-            tracing::trace!(
-                "Received zero extent ({}x{}); tearing down swapchain and waiting for idle",
-                desired_extent.width,
-                desired_extent.height
-            );
+            let _span = tracing::trace_span!(
+                "swapchain_teardown",
+                width = desired_extent.width,
+                height = desired_extent.height,
+            )
+            .entered();
             if let Err(e) = running_state.device.wait_idle() {
                 tracing::error!("Error while waiting for device idle on zero extent: {}", e);
                 return false;
@@ -487,11 +584,12 @@ impl AppRunner {
             return true;
         }
 
-        tracing::trace!(
-            "Recreating swapchain for new extent: {}x{}",
-            desired_extent.width,
-            desired_extent.height
-        );
+        let _span = tracing::trace_span!(
+            "swapchain_recreate",
+            width = desired_extent.width,
+            height = desired_extent.height,
+        )
+        .entered();
 
         match Swapchain::new_with_old(
             &running_state.device,
@@ -499,6 +597,7 @@ impl AppRunner {
             desired_extent,
             running_state.swapchain.as_ref(),
             true,
+            Some(running_state.pipeline_color_format),
         ) {
             Ok(swapchain) => {
                 tracing::trace!(
@@ -506,7 +605,37 @@ impl AppRunner {
                     desired_extent.width,
                     desired_extent.height
                 );
+                let new_format = swapchain.format();
                 running_state.swapchain = Some(swapchain);
+
+                if new_format != running_state.pipeline_color_format {
+                    tracing::debug!(
+                        "Swapchain format changed on resize ({:?} -> {:?}); recreating pipeline",
+                        running_state.pipeline_color_format,
+                        new_format,
+                    );
+                    let _span = tracing::trace_span!(
+                        "pipeline_create",
+                        color_format = ?new_format,
+                    )
+                    .entered();
+                    match build_pipeline(
+                        &running_state.device,
+                        &running_state.shader,
+                        new_format,
+                        Some("main pipeline"),
+                    ) {
+                        Ok(pipeline) => {
+                            running_state.pipeline = pipeline;
+                            running_state.pipeline_color_format = new_format;
+                        }
+                        Err(e) => {
+                            tracing::error!("Error recreating pipeline after format change: {}", e);
+                            return false;
+                        }
+                    }
+                }
+
                 true
             }
             Err(e) => {
