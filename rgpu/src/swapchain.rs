@@ -338,6 +338,22 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
                 unsafe { parent_device.destroy_raw_swapchain(handle) };
             })?;
 
+        for (index, image) in images.iter().copied().enumerate() {
+            // SAFETY: image is a valid swapchain image owned by parent_device.
+            match unsafe {
+                parent_device.set_object_name_with(image, || {
+                    std::ffi::CString::new(format!(
+                        "Swapchain {swapchain_debug_index} Image {}",
+                        index + 1,
+                    ))
+                    .ok()
+                })
+            } {
+                Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
+                Err(e) => tracing::warn!("Failed to name swapchain image {:?}: {e}", image),
+            }
+        }
+
         let image_views = if create_image_views {
             Some(
                 create_default_swapchain_image_views(
