@@ -259,7 +259,7 @@ impl ApplicationHandler for AppRunner {
                     requested_height = requested_extent.height
                 )
                 .entered();
-                let swapchain = match Swapchain::new(&device, &surface, requested_extent) {
+                let swapchain = match Swapchain::new(&device, &surface, requested_extent, true) {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::error!("Error while creating swapchain: {}", e);
@@ -310,6 +310,7 @@ impl ApplicationHandler for AppRunner {
                         width: win_size.width,
                         height: win_size.height,
                     },
+                    true,
                 ) {
                     Ok(s) => Some(s),
                     Err(e) => {
@@ -497,6 +498,7 @@ impl AppRunner {
             &running_state._surface,
             desired_extent,
             running_state.swapchain.as_ref(),
+            true,
         ) {
             Ok(swapchain) => {
                 tracing::trace!(
