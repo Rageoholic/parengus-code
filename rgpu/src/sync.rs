@@ -93,15 +93,17 @@ impl Fence {
     /// Pass `u64::MAX` to wait indefinitely.
     pub fn wait(&self, timeout_ns: u64) -> Result<(), WaitFenceError> {
         // SAFETY: handle is a valid fence created from parent.
-        unsafe { self.parent.wait_for_raw_fences(&[self.handle], true, timeout_ns) }.map_err(
-            |e| {
-                if e == vk::Result::TIMEOUT {
-                    WaitFenceError::Timeout
-                } else {
-                    WaitFenceError::Vulkan(e)
-                }
-            },
-        )
+        unsafe {
+            self.parent
+                .wait_for_raw_fences(&[self.handle], true, timeout_ns)
+        }
+        .map_err(|e| {
+            if e == vk::Result::TIMEOUT {
+                WaitFenceError::Timeout
+            } else {
+                WaitFenceError::Vulkan(e)
+            }
+        })
     }
 
     /// Reset the fence to the unsignaled state.
@@ -125,7 +127,10 @@ impl Fence {
     /// returning and the reset completing. The `&mut` receiver prevents
     /// same-thread re-submission via `raw_handle`, but cross-thread raw handle
     /// usage is still the caller's responsibility.
-    pub unsafe fn wait_and_reset(&mut self, timeout_ns: u64) -> Result<(), WaitFenceError> {
+    pub unsafe fn wait_and_reset(
+        &mut self,
+        timeout_ns: u64,
+    ) -> Result<(), WaitFenceError> {
         self.wait(timeout_ns)?;
         // SAFETY: wait() succeeded so the fence is signaled and not pending.
         // &mut self prevents any same-thread re-submission of raw_handle()
@@ -185,7 +190,10 @@ impl Semaphore {
     /// `name` is an optional debug label applied via `VK_EXT_debug_utils` when
     /// the extension is available. Naming failures are logged as warnings and
     /// do not cause the call to fail.
-    pub fn new(device: &Arc<Device>, name: Option<&str>) -> Result<Self, CreateSemaphoreError> {
+    pub fn new(
+        device: &Arc<Device>,
+        name: Option<&str>,
+    ) -> Result<Self, CreateSemaphoreError> {
         let create_info = vk::SemaphoreCreateInfo::default();
 
         // SAFETY: create_info is fully initialised with no borrowed pointers.
@@ -195,7 +203,9 @@ impl Semaphore {
         // SAFETY: handle is a valid semaphore created from device.
         match unsafe { device.set_object_name_str(handle, name) } {
             Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-            Err(e) => tracing::warn!("Failed to name semaphore {:?}: {e}", handle),
+            Err(e) => {
+                tracing::warn!("Failed to name semaphore {:?}: {e}", handle)
+            }
         }
 
         Ok(Self {

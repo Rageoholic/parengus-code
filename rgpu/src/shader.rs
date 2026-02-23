@@ -39,8 +39,12 @@ impl From<ShaderStage> for vk::ShaderStageFlags {
             ShaderStage::Vertex => vk::ShaderStageFlags::VERTEX,
             ShaderStage::Fragment => vk::ShaderStageFlags::FRAGMENT,
             ShaderStage::Compute => vk::ShaderStageFlags::COMPUTE,
-            ShaderStage::TessellationControl => vk::ShaderStageFlags::TESSELLATION_CONTROL,
-            ShaderStage::TessellationEvaluation => vk::ShaderStageFlags::TESSELLATION_EVALUATION,
+            ShaderStage::TessellationControl => {
+                vk::ShaderStageFlags::TESSELLATION_CONTROL
+            }
+            ShaderStage::TessellationEvaluation => {
+                vk::ShaderStageFlags::TESSELLATION_EVALUATION
+            }
             ShaderStage::Geometry => vk::ShaderStageFlags::GEOMETRY,
             ShaderStage::Task => vk::ShaderStageFlags::TASK_EXT,
             ShaderStage::Mesh => vk::ShaderStageFlags::MESH_EXT,
@@ -76,7 +80,9 @@ impl ShaderModule {
         name: Option<&str>,
     ) -> Result<Self, CreateShaderModuleError> {
         if !spirv_bytes.len().is_multiple_of(4) {
-            return Err(CreateShaderModuleError::InvalidLength(spirv_bytes.len()));
+            return Err(CreateShaderModuleError::InvalidLength(
+                spirv_bytes.len(),
+            ));
         }
 
         // Reinterpret bytes as u32 words. If the slice is already u32-aligned
@@ -84,7 +90,8 @@ impl ShaderModule {
         //
         // SAFETY: u32 has no invalid bit patterns and we verified the length
         // is a multiple of 4, so the reinterpretation is sound.
-        let (prefix, aligned_words, _suffix) = unsafe { spirv_bytes.align_to::<u32>() };
+        let (prefix, aligned_words, _suffix) =
+            unsafe { spirv_bytes.align_to::<u32>() };
         let owned;
         let code: &[u32] = if prefix.is_empty() {
             aligned_words
@@ -105,7 +112,9 @@ impl ShaderModule {
         // SAFETY: handle is a valid shader module created from device.
         match unsafe { device.set_object_name_str(handle, name) } {
             Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-            Err(e) => tracing::warn!("Failed to name shader module {:?}: {e}", handle),
+            Err(e) => {
+                tracing::warn!("Failed to name shader module {:?}: {e}", handle)
+            }
         }
 
         Ok(Self {
@@ -167,7 +176,9 @@ impl<'a> EntryPoint<'a> {
     ///
     /// The returned struct borrows from `self`, so it must not outlive this
     /// `EntryPoint`.
-    pub fn as_pipeline_stage_create_info(&self) -> vk::PipelineShaderStageCreateInfo<'_> {
+    pub fn as_pipeline_stage_create_info(
+        &self,
+    ) -> vk::PipelineShaderStageCreateInfo<'_> {
         vk::PipelineShaderStageCreateInfo::default()
             .stage(self.stage.into())
             .module(self.module.raw_handle())

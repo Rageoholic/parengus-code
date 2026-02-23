@@ -3,7 +3,9 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
 
 use crate::log::VulkanLogLevel;
-use crate::surface::{CreateSurfaceError, SurfaceQueryError, SurfaceSupportError};
+use crate::surface::{
+    CreateSurfaceError, SurfaceQueryError, SurfaceSupportError,
+};
 use std::{
     ffi::{CStr, CString},
     fmt::Debug,
@@ -52,7 +54,8 @@ impl VkVersion {
 pub struct Instance {
     entry: ash::Entry,
     handle: ash::Instance,
-    debug_messenger: Option<(vk::DebugUtilsMessengerEXT, ash::ext::debug_utils::Instance)>,
+    debug_messenger:
+        Option<(vk::DebugUtilsMessengerEXT, ash::ext::debug_utils::Instance)>,
     surface_instance: Option<ash::khr::surface::Instance>,
     ver: VkVersion,
 }
@@ -74,7 +77,7 @@ pub enum InstanceCreationError {
     #[error("Missing mandatory instance extensions: {0:?}")]
     MissingExtensions(Vec<String>),
     #[error("Unknown Vulkan Error {0}")]
-    UnknownVulkan(ash::vk::Result),
+    UnknownVulkan(vk::Result),
     #[error("Invalid app name was passed to Instance::new")]
     InvalidAppName,
 }
@@ -82,11 +85,16 @@ pub enum InstanceCreationError {
 impl Drop for Instance {
     fn drop(&mut self) {
         tracing::debug!("Dropping instance {:?}", self.handle.handle());
-        if let Some((debug_messenger, debug_utils_instance)) = self.debug_messenger.take() {
+        if let Some((debug_messenger, debug_utils_instance)) =
+            self.debug_messenger.take()
+        {
             //SAFETY: last use of this debug messenger. We made this debug
             //messenger from this instance. debug_utils_instance is derived from
             //this instance
-            unsafe { debug_utils_instance.destroy_debug_utils_messenger(debug_messenger, None) };
+            unsafe {
+                debug_utils_instance
+                    .destroy_debug_utils_messenger(debug_messenger, None)
+            };
         }
         //SAFETY: We are in drop so this is the last use of instance. Any given
         //derived object should be gone
@@ -94,47 +102,73 @@ impl Drop for Instance {
     }
 }
 
-impl From<ash::vk::Result> for InstanceCreationError {
-    fn from(value: ash::vk::Result) -> Self {
+impl From<vk::Result> for InstanceCreationError {
+    fn from(value: vk::Result) -> Self {
         InstanceCreationError::UnknownVulkan(value)
     }
 }
 
 unsafe extern "system" fn vulkan_debug_callback(
-    message_severity: ash::vk::DebugUtilsMessageSeverityFlagsEXT,
-    message_type: ash::vk::DebugUtilsMessageTypeFlagsEXT,
-    p_callback_data: *const ash::vk::DebugUtilsMessengerCallbackDataEXT<'_>,
+    message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    message_type: vk::DebugUtilsMessageTypeFlagsEXT,
+    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
     _p_user_data: *mut std::ffi::c_void,
-) -> ash::vk::Bool32 {
+) -> vk::Bool32 {
     //SAFETY: Vulkan guarantees p_callback_data is valid
-    let message = unsafe { CStr::from_ptr((*p_callback_data).p_message) }.to_string_lossy();
+    let message = unsafe { CStr::from_ptr((*p_callback_data).p_message) }
+        .to_string_lossy();
 
     let type_str = match message_type {
-        ash::vk::DebugUtilsMessageTypeFlagsEXT::GENERAL => "GENERAL",
-        ash::vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION => "VALIDATION",
-        ash::vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE => "PERFORMANCE",
+        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL => "GENERAL",
+        vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION => "VALIDATION",
+        vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE => "PERFORMANCE",
         _ => "UNKNOWN",
     };
 
     match message_severity {
-        ash::vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => {
-            tracing::trace!(target: "rvk-debug-messenger", "[{}] {}", type_str, message);
+        vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => {
+            tracing::trace!(
+                target: "rvk-debug-messenger",
+                "[{}] {}",
+                type_str,
+                message
+            );
         }
-        ash::vk::DebugUtilsMessageSeverityFlagsEXT::INFO => {
-            tracing::info!(target: "rvk-debug-messenger", "[{}] {}", type_str, message);
+        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => {
+            tracing::info!(
+                target: "rvk-debug-messenger",
+                "[{}] {}",
+                type_str,
+                message
+            );
         }
-        ash::vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
-            tracing::warn!(target: "rvk-debug-messenger", "[{}] {}", type_str, message);
+        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
+            tracing::warn!(
+                target: "rvk-debug-messenger",
+                "[{}] {}",
+                type_str,
+                message
+            );
         }
-        ash::vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => {
-            tracing::error!(target: "rvk-debug-messenger", "[{}] {}", type_str, message);
+        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => {
+            tracing::error!(
+                target: "rvk-debug-messenger",
+                "[{}] {}",
+                type_str,
+                message
+            );
         }
         _ => {
-            tracing::debug!(target: "rvk-debug-messenger", "[{}] {}", type_str, message);
+            tracing::debug!(
+                target: "rvk-debug-messenger",
+                "[{}] {}",
+                type_str,
+                message
+            );
         }
     }
 
-    ash::vk::FALSE
+    vk::FALSE
 }
 
 #[derive(Debug, Default)]
@@ -147,8 +181,9 @@ impl Instance {
     /// version
     ///
     /// # Safety
-    /// This loads vulkan using libloading, meaning that there can be arbitrary code
-    /// executed. This is not great but it's *probably* fine?
+    /// This loads vulkan using libloading, meaning that there can be
+    /// arbitrary code executed. This is not great but it's *probably*
+    /// fine?
     pub unsafe fn new(
         app_name: impl AsRef<str>,
         max_log_level: Option<VulkanLogLevel>,
@@ -168,16 +203,17 @@ impl Instance {
 
         //SAFETY: Basically always fine Relax
         let api_version = unsafe { entry.try_enumerate_instance_version() }
-            .unwrap_or(Some(ash::vk::API_VERSION_1_0))
-            .unwrap_or(ash::vk::API_VERSION_1_0);
+            .unwrap_or(Some(vk::API_VERSION_1_0))
+            .unwrap_or(vk::API_VERSION_1_0);
         let mut mandatory_exts = Vec::with_capacity(256);
 
         if let Some(display_handle_source) = display_handle_source
             && enabled_exts.surface
         {
-            // ash_window will be necessary to get a surface later, but surfaces are
-            // an extension. This gets those extensions to start as a base to the
-            // set of mandatory extensions we will almost always need.
+            // ash_window will be necessary to get a surface later,
+            // but surfaces are an extension. This gets those extensions
+            // to start as a base to the set of mandatory extensions we
+            // will almost always need.
             let ash_window_exts = ash_window::enumerate_required_extensions(
                 display_handle_source
                     .display_handle()
@@ -188,24 +224,29 @@ impl Instance {
             mandatory_exts.extend(
                 ash_window_exts
                     .iter()
-                    //SAFETY: ash_window promises to hand us null terminated C strings
-                    //in its API. This isn't enforced anywhere through any safety means
+                    //SAFETY: ash_window promises to hand us null
+                    //terminated C strings in its API. This isn't
+                    //enforced anywhere through any safety means
                     //but it is documented
-                    .map(|ext_cstr_ptr| unsafe { CStr::from_ptr(*ext_cstr_ptr) }),
+                    .map(|ext_cstr_ptr| unsafe {
+                        CStr::from_ptr(*ext_cstr_ptr)
+                    }),
             );
         }
 
         //SAFETY: Pretty much always okay
-        let instance_exts_avail = unsafe { entry.enumerate_instance_extension_properties(None) }?;
+        let instance_exts_avail =
+            unsafe { entry.enumerate_instance_extension_properties(None) }?;
         //SAFETY: Pretty much always okay
-        let instance_layers_avail = unsafe { entry.enumerate_instance_layer_properties() };
+        let instance_layers_avail =
+            unsafe { entry.enumerate_instance_layer_properties() };
 
         let missing_exts: Vec<_> = mandatory_exts
             .iter()
             .filter(|mandatory_ext| {
-                !instance_exts_avail
-                    .iter()
-                    .any(|avail| avail.extension_name_as_c_str() == Ok(**mandatory_ext))
+                !instance_exts_avail.iter().any(|avail| {
+                    avail.extension_name_as_c_str() == Ok(**mandatory_ext)
+                })
             })
             .map(|ext| ext.to_string_lossy().into_owned())
             .collect();
@@ -218,23 +259,25 @@ impl Instance {
         let debug_utils_ext_name = ash::ext::debug_utils::NAME;
         let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
 
-        let debug_utils_available = instance_exts_avail
-            .iter()
-            .any(|ext| ext.extension_name_as_c_str() == Ok(debug_utils_ext_name));
+        let debug_utils_available = instance_exts_avail.iter().any(|ext| {
+            ext.extension_name_as_c_str() == Ok(debug_utils_ext_name)
+        });
 
         let validation_layer_available = instance_layers_avail
             .as_ref()
             .map(|layers| {
-                layers
-                    .iter()
-                    .any(|layer| layer.layer_name_as_c_str() == Ok(validation_layer_name))
+                layers.iter().any(|layer| {
+                    layer.layer_name_as_c_str() == Ok(validation_layer_name)
+                })
             })
             .unwrap_or(false);
 
-        let mut enabled_exts: Vec<_> = mandatory_exts.iter().map(|ext| ext.as_ptr()).collect();
+        let mut enabled_exts: Vec<_> =
+            mandatory_exts.iter().map(|ext| ext.as_ptr()).collect();
         let mut enabled_layers: Vec<*const i8> = Vec::new();
 
-        let mut debug_messenger_create_info = if let Some(log_level) = max_log_level
+        let mut debug_messenger_create_info = if let Some(log_level) =
+            max_log_level
             && debug_utils_available
             && validation_layer_available
         {
@@ -243,30 +286,32 @@ impl Instance {
 
             let message_severity = match log_level {
                 VulkanLogLevel::Verbose => {
-                    ash::vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
-                        | ash::vk::DebugUtilsMessageSeverityFlagsEXT::INFO
-                        | ash::vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                        | ash::vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                    vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
                 }
                 VulkanLogLevel::Info => {
-                    ash::vk::DebugUtilsMessageSeverityFlagsEXT::INFO
-                        | ash::vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                        | ash::vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                    vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
                 }
                 VulkanLogLevel::Warning => {
-                    ash::vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                        | ash::vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                    vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
                 }
-                VulkanLogLevel::Error => ash::vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+                VulkanLogLevel::Error => {
+                    vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                }
             };
 
             Some(
-                ash::vk::DebugUtilsMessengerCreateInfoEXT::default()
+                vk::DebugUtilsMessengerCreateInfoEXT::default()
                     .message_severity(message_severity)
                     .message_type(
-                        ash::vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                            | ash::vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                            | ash::vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                            | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                            | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
                     )
                     .pfn_user_callback(Some(vulkan_debug_callback)),
             )
@@ -276,14 +321,14 @@ impl Instance {
 
         let engine_name = c"rvk";
 
-        let app_info = ash::vk::ApplicationInfo::default()
+        let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name_cstring)
-            .application_version(ash::vk::make_api_version(0, 0, 1, 0))
+            .application_version(vk::make_api_version(0, 0, 1, 0))
             .engine_name(engine_name)
-            .engine_version(ash::vk::make_api_version(0, 0, 1, 0))
+            .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(api_version);
 
-        let mut instance_create_info = ash::vk::InstanceCreateInfo::default()
+        let mut instance_create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&enabled_exts)
             .enabled_layer_names(&enabled_layers);
@@ -293,32 +338,42 @@ impl Instance {
         }
 
         //SAFETY: We made a valid instance_create_info
-        let instance = unsafe { entry.create_instance(&instance_create_info, None) }?;
+        let instance =
+            unsafe { entry.create_instance(&instance_create_info, None) }?;
 
-        let debug_messenger =
-            if let Some(mut debug_messenger_create_info) = debug_messenger_create_info {
-                //Defensive coding stuff
-                debug_messenger_create_info.p_next = std::ptr::null();
-                let debug_utils_instance = ash::ext::debug_utils::Instance::new(&entry, &instance);
-                //SAFETY: Valid CI
-                match unsafe {
-                    debug_utils_instance
-                        .create_debug_utils_messenger(&debug_messenger_create_info, None)
-                } {
-                    Ok(debug_messenger) => Some((debug_messenger, debug_utils_instance)),
-                    Err(e) => {
-                        tracing::error!(
-                            "Despite us having a valid debug_messenger_create_info \
-                            We can't seem to make a debug messenger? WTF? Continuing \
-                            without one but here be dragons. Actual error: {e}"
-                        );
-                        None
-                    }
+        let debug_messenger = if let Some(mut debug_messenger_create_info) =
+            debug_messenger_create_info
+        {
+            //Defensive coding stuff
+            debug_messenger_create_info.p_next = std::ptr::null();
+            let debug_utils_instance =
+                ash::ext::debug_utils::Instance::new(&entry, &instance);
+            //SAFETY: Valid CI
+            match unsafe {
+                debug_utils_instance.create_debug_utils_messenger(
+                    &debug_messenger_create_info,
+                    None,
+                )
+            } {
+                Ok(debug_messenger) => {
+                    Some((debug_messenger, debug_utils_instance))
                 }
-            } else {
-                None
-            };
-        let surface_instance = Some(ash::khr::surface::Instance::new(&entry, &instance));
+                Err(e) => {
+                    tracing::error!(
+                        "Despite us having a valid \
+                         debug_messenger_create_info \
+                         We can't seem to make a debug messenger? \
+                         WTF? Continuing without one but here be \
+                         dragons. Actual error: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let surface_instance =
+            Some(ash::khr::surface::Instance::new(&entry, &instance));
 
         Ok(Instance {
             entry,
@@ -408,7 +463,8 @@ impl Instance {
         physical_device: vk::PhysicalDevice,
         create_info: &vk::DeviceCreateInfo<'_>,
     ) -> Result<ash::Device, vk::Result> {
-        //SAFETY: physical_device was derived from this instance, create_info is valid
+        //SAFETY: physical_device was derived from this instance,
+        //create_info is valid
         unsafe {
             self.handle
                 .create_device(physical_device, create_info, None)
@@ -494,7 +550,8 @@ impl Instance {
         surface: vk::SurfaceKHR,
     ) -> Result<bool, SurfaceSupportError> {
         if let Some(ref surface_instance) = self.surface_instance {
-            //SAFETY: physical_device and surface were derived from this instance
+            //SAFETY: physical_device and surface were derived from
+            //this instance
             unsafe {
                 surface_instance.get_physical_device_surface_support(
                     physical_device,
@@ -521,7 +578,10 @@ impl Instance {
         if let Some(ref surface_instance) = self.surface_instance {
             // SAFETY: Caller guarantees physical_device and surface provenance.
             unsafe {
-                surface_instance.get_physical_device_surface_capabilities(physical_device, surface)
+                surface_instance.get_physical_device_surface_capabilities(
+                    physical_device,
+                    surface,
+                )
             }
             .map_err(SurfaceQueryError::Vulkan)
         } else {
@@ -542,7 +602,10 @@ impl Instance {
         if let Some(ref surface_instance) = self.surface_instance {
             // SAFETY: Caller guarantees physical_device and surface provenance.
             unsafe {
-                surface_instance.get_physical_device_surface_formats(physical_device, surface)
+                surface_instance.get_physical_device_surface_formats(
+                    physical_device,
+                    surface,
+                )
             }
             .map_err(SurfaceQueryError::Vulkan)
         } else {
@@ -563,7 +626,10 @@ impl Instance {
         if let Some(ref surface_instance) = self.surface_instance {
             // SAFETY: Caller guarantees physical_device and surface provenance.
             unsafe {
-                surface_instance.get_physical_device_surface_present_modes(physical_device, surface)
+                surface_instance.get_physical_device_surface_present_modes(
+                    physical_device,
+                    surface,
+                )
             }
             .map_err(SurfaceQueryError::Vulkan)
         } else {
@@ -611,7 +677,10 @@ impl Instance {
 
 //Device extension loader creation functionality
 impl Instance {
-    pub fn create_swapchain_loader(&self, device: &ash::Device) -> ash::khr::swapchain::Device {
+    pub fn create_swapchain_loader(
+        &self,
+        device: &ash::Device,
+    ) -> ash::khr::swapchain::Device {
         ash::khr::swapchain::Device::new(&self.handle, device)
     }
 

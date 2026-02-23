@@ -1,6 +1,6 @@
 use std::{
     marker::PhantomData,
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
 };
 
 use ash::vk;
@@ -54,10 +54,12 @@ impl Drop for CommandPoolShared {
 // ResettableCommandPool
 // ---------------------------------------------------------------------------
 
-/// An owned command pool that allocates individually-resettable command buffers.
+/// An owned command pool that allocates individually-resettable
+/// command buffers.
 ///
 /// The pool is created with `RESET_COMMAND_BUFFER`, allowing each allocated
-/// command buffer to be reset individually via [`ResettableCommandBuffer::reset`].
+/// command buffer to be reset individually via
+/// [`ResettableCommandBuffer::reset`].
 ///
 /// `ResettableCommandPool` is `!Sync`: it cannot be shared across threads.
 /// The Vulkan spec requires external synchronization for pool-level operations
@@ -112,7 +114,9 @@ impl ResettableCommandPool {
         // SAFETY: pool is a valid command pool created from device.
         match unsafe { device.set_object_name_str(pool, name) } {
             Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-            Err(e) => tracing::warn!("Failed to name command pool {:?}: {e}", pool),
+            Err(e) => {
+                tracing::warn!("Failed to name command pool {:?}: {e}", pool)
+            }
         }
 
         let (sender, receiver) = mpsc::channel();
@@ -175,12 +179,16 @@ impl ResettableCommandPool {
             // SAFETY: allocate_info references a valid pool created from
             // parent. ResettableCommandPool is !Sync so no concurrent pool
             // access is possible.
-            unsafe { self.shared.parent.allocate_raw_command_buffers(&allocate_info) }
-                .map(|mut bufs| {
-                    debug_assert_eq!(bufs.len(), 1);
-                    bufs.remove(0)
-                })
-                .map_err(AllocateCommandBufferError::Vulkan)?
+            unsafe {
+                self.shared
+                    .parent
+                    .allocate_raw_command_buffers(&allocate_info)
+            }
+            .map(|mut bufs| {
+                debug_assert_eq!(bufs.len(), 1);
+                bufs.remove(0)
+            })
+            .map_err(AllocateCommandBufferError::Vulkan)?
         };
 
         Ok(ResettableCommandBuffer {
@@ -225,7 +233,8 @@ impl Drop for ResettableCommandBuffer {
     fn drop(&mut self) {
         // Send the handle back for recycling. If the receiver (pool) has been
         // dropped the error is intentionally ignored — the handle will be freed
-        // implicitly when CommandPoolShared (and its vkDestroyCommandPool) runs.
+        // implicitly when CommandPoolShared (and its
+        // vkDestroyCommandPool) runs.
         let _ = self.return_sender.send(self.handle);
     }
 }
@@ -246,8 +255,10 @@ impl ResettableCommandBuffer {
     pub unsafe fn reset(&mut self) -> Result<(), vk::Result> {
         // SAFETY: Caller guarantees the buffer is not pending.
         unsafe {
-            self.parent
-                .reset_raw_command_buffer(self.handle, vk::CommandBufferResetFlags::empty())
+            self.parent.reset_raw_command_buffer(
+                self.handle,
+                vk::CommandBufferResetFlags::empty(),
+            )
         }
     }
 
@@ -258,7 +269,10 @@ impl ResettableCommandBuffer {
     pub unsafe fn begin(&mut self) -> Result<(), vk::Result> {
         let begin_info = vk::CommandBufferBeginInfo::default();
         // SAFETY: Caller guarantees the buffer is in the initial state.
-        unsafe { self.parent.begin_raw_command_buffer(self.handle, &begin_info) }
+        unsafe {
+            self.parent
+                .begin_raw_command_buffer(self.handle, &begin_info)
+        }
     }
 
     /// End recording.
@@ -275,9 +289,16 @@ impl ResettableCommandBuffer {
     /// # Safety
     /// The buffer must be in the recording state. All handles in
     /// `dependency_info` must be valid and consistent with current state.
-    pub unsafe fn pipeline_barrier2(&mut self, dependency_info: &vk::DependencyInfo<'_>) {
-        // SAFETY: Caller guarantees recording state and dependency_info validity.
-        unsafe { self.parent.cmd_pipeline_barrier2(self.handle, dependency_info) }
+    pub unsafe fn pipeline_barrier2(
+        &mut self,
+        dependency_info: &vk::DependencyInfo<'_>,
+    ) {
+        // SAFETY: Caller guarantees recording state and
+        // dependency_info validity.
+        unsafe {
+            self.parent
+                .cmd_pipeline_barrier2(self.handle, dependency_info)
+        }
     }
 
     /// Begin a dynamic render pass.
@@ -290,8 +311,12 @@ impl ResettableCommandBuffer {
         &mut self,
         rendering_info: &vk::RenderingInfo<'_>,
     ) -> Result<(), DynamicRenderingError> {
-        // SAFETY: Caller guarantees recording state and rendering_info validity.
-        unsafe { self.parent.cmd_begin_raw_rendering(self.handle, rendering_info) }
+        // SAFETY: Caller guarantees recording state and
+        // rendering_info validity.
+        unsafe {
+            self.parent
+                .cmd_begin_raw_rendering(self.handle, rendering_info)
+        }
     }
 
     /// End the current dynamic render pass.
@@ -299,7 +324,9 @@ impl ResettableCommandBuffer {
     /// # Safety
     /// The buffer must be inside a render pass begun with
     /// [`begin_rendering`](Self::begin_rendering).
-    pub unsafe fn end_rendering(&mut self) -> Result<(), DynamicRenderingError> {
+    pub unsafe fn end_rendering(
+        &mut self,
+    ) -> Result<(), DynamicRenderingError> {
         // SAFETY: Caller guarantees active render pass state.
         unsafe { self.parent.cmd_end_raw_rendering(self.handle) }
     }
@@ -311,7 +338,10 @@ impl ResettableCommandBuffer {
     /// graphics pipeline created from the same device as this buffer.
     pub unsafe fn bind_graphics_pipeline(&mut self, pipeline: vk::Pipeline) {
         // SAFETY: Caller guarantees recording state and pipeline validity.
-        unsafe { self.parent.cmd_bind_graphics_pipeline(self.handle, pipeline) }
+        unsafe {
+            self.parent
+                .cmd_bind_graphics_pipeline(self.handle, pipeline)
+        }
     }
 
     /// Set the viewport dynamically.
@@ -320,7 +350,8 @@ impl ResettableCommandBuffer {
     /// The buffer must be in the recording state with a pipeline bound that
     /// declares `VK_DYNAMIC_STATE_VIEWPORT`.
     pub unsafe fn set_viewport(&mut self, viewports: &[vk::Viewport]) {
-        // SAFETY: Caller guarantees recording state and dynamic viewport pipeline.
+        // SAFETY: Caller guarantees recording state and dynamic
+        // viewport pipeline.
         unsafe { self.parent.cmd_set_viewport(self.handle, viewports) }
     }
 
@@ -330,7 +361,8 @@ impl ResettableCommandBuffer {
     /// The buffer must be in the recording state with a pipeline bound that
     /// declares `VK_DYNAMIC_STATE_SCISSOR`.
     pub unsafe fn set_scissor(&mut self, scissors: &[vk::Rect2D]) {
-        // SAFETY: Caller guarantees recording state and dynamic scissor pipeline.
+        // SAFETY: Caller guarantees recording state and dynamic
+        // scissor pipeline.
         unsafe { self.parent.cmd_set_scissor(self.handle, scissors) }
     }
 
@@ -349,8 +381,13 @@ impl ResettableCommandBuffer {
     ) {
         // SAFETY: Caller guarantees render pass and pipeline state validity.
         unsafe {
-            self.parent
-                .cmd_draw(self.handle, vertex_count, instance_count, first_vertex, first_instance)
+            self.parent.cmd_draw(
+                self.handle,
+                vertex_count,
+                instance_count,
+                first_vertex,
+                first_instance,
+            )
         }
     }
 

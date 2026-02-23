@@ -18,7 +18,9 @@ use rgpu::{
     swapchain::Swapchain,
     sync::{Fence, Semaphore},
 };
-use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    Layer, layer::SubscriberExt, util::SubscriberInitExt,
+};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -27,7 +29,8 @@ use winit::{
     window::{Window as WinitWindow, WindowAttributes},
 };
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default, clap::ValueEnum)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
+#[derive(clap::ValueEnum)]
 enum TracingLogLevel {
     Off,
     Trace,
@@ -41,7 +44,8 @@ enum TracingLogLevel {
 impl From<TracingLogLevel> for tracing::Level {
     fn from(value: TracingLogLevel) -> Self {
         match value {
-            //We clamp this to the lowest possible level but this shouldn't happen
+            //We clamp this to the lowest possible level but this
+            //shouldn't happen
             TracingLogLevel::Off => tracing::Level::TRACE,
             TracingLogLevel::Trace => tracing::Level::TRACE,
             TracingLogLevel::Info => tracing::Level::INFO,
@@ -101,12 +105,16 @@ impl From<CliVulkanLogLevel> for rgpu::log::VulkanLogLevel {
 
 fn main() -> eyre::Result<()> {
     let app_dirs = directories::ProjectDirs::from("", "parengus", "samp-app")
-        .ok_or_else(|| eyre::eyre!("Failed to determine application directories"))?;
+        .ok_or_else(|| {
+        eyre::eyre!("Failed to determine application directories")
+    })?;
 
     let self_dir = std::env::current_exe()?
         .parent()
         .ok_or_else(|| {
-            eyre::eyre!("Failed to take the parent directory of the current executable")
+            eyre::eyre!(
+                "Failed to take the parent directory of the current executable"
+            )
         })?
         .to_owned();
 
@@ -133,9 +141,11 @@ fn main() -> eyre::Result<()> {
         tracing_subscriber::registry()
             .with(
                 stdout_log
-                    .with_filter(tracing_subscriber::filter::LevelFilter::from_level(
-                        cli_args.tracing_log_level.into(),
-                    ))
+                    .with_filter(
+                        tracing_subscriber::filter::LevelFilter::from_level(
+                            cli_args.tracing_log_level.into(),
+                        ),
+                    )
                     .and_then(file_log),
             )
             .init();
@@ -190,8 +200,9 @@ const MAX_FRAMES_IN_FLIGHT: usize = 2;
 struct FrameSync {
     image_available: Semaphore,
     /// Signaled by the queue submit when rendering of this frame is complete.
-    /// Waited on by `vkQueuePresentKHR`. Lives here (not keyed by swapchain image)
-    /// so it is not destroyed when the swapchain is recreated mid-flight.
+    /// Waited on by `vkQueuePresentKHR`. Lives here (not keyed by
+    /// swapchain image) so it is not destroyed when the swapchain is
+    /// recreated mid-flight.
     render_finished: Semaphore,
     in_flight_fence: Fence,
     command_buffer: ResettableCommandBuffer,
@@ -265,7 +276,9 @@ impl RunningStateTransitionGuard {
 impl Drop for RunningStateTransitionGuard {
     fn drop(&mut self) {
         if let Err(e) = self.device.wait_idle() {
-            tracing::error!("Error waiting for device idle on RunningState drop: {e}");
+            tracing::error!(
+                "Error waiting for device idle on RunningState drop: {e}"
+            );
         }
     }
 }
@@ -278,7 +291,8 @@ struct InitializingState {
 }
 #[derive(Debug)]
 struct RunningState {
-    /// First field: drops first, calling `wait_idle` before all other resources.
+    /// First field: drops first, calling `wait_idle` before all other
+    /// resources.
     _idle_guard: RunningStateTransitionGuard,
     win: Arc<WinitWindow>,
     device: Arc<Device>,
@@ -310,11 +324,15 @@ impl ApplicationHandler for AppRunner {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         assert!(self.0.is_some());
         if let Some(initializing_state) = self.take_initializing() {
-            let _span =
-                tracing::debug_span!("state_transition", from = "Initializing", to = "Running")
-                    .entered();
+            let _span = tracing::debug_span!(
+                "state_transition",
+                from = "Initializing",
+                to = "Running"
+            )
+            .entered();
             event_loop.set_control_flow(ControlFlow::Poll);
-            match Self::initializing_to_running(initializing_state, event_loop) {
+            match Self::initializing_to_running(initializing_state, event_loop)
+            {
                 Ok(running_state) => {
                     self.set_running(running_state);
                 }
@@ -324,9 +342,12 @@ impl ApplicationHandler for AppRunner {
                 }
             }
         } else if let Some(suspended_state) = self.take_suspended() {
-            let _span =
-                tracing::debug_span!("state_transition", from = "Suspended", to = "Running")
-                    .entered();
+            let _span = tracing::debug_span!(
+                "state_transition",
+                from = "Suspended",
+                to = "Running"
+            )
+            .entered();
             event_loop.set_control_flow(ControlFlow::Poll);
             match Self::suspended_to_running(suspended_state) {
                 Ok(running_state) => {
@@ -344,9 +365,12 @@ impl ApplicationHandler for AppRunner {
     fn suspended(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         assert!(self.0.is_some());
         if let Some(running_state) = self.take_running() {
-            let _span =
-                tracing::debug_span!("state_transition", from = "Running", to = "Suspended")
-                    .entered();
+            let _span = tracing::debug_span!(
+                "state_transition",
+                from = "Running",
+                to = "Suspended"
+            )
+            .entered();
             event_loop.set_control_flow(ControlFlow::Wait);
             let RunningState {
                 _idle_guard,
@@ -363,7 +387,10 @@ impl ApplicationHandler for AppRunner {
             } = running_state;
 
             if let Err(e) = device.wait_idle() {
-                tracing::error!("Error while waiting for device idle during suspend: {}", e);
+                tracing::error!(
+                    "Error while waiting for device idle during suspend: {}",
+                    e
+                );
                 self.transition_to_exiting("Running", event_loop);
                 return;
             }
@@ -371,7 +398,8 @@ impl ApplicationHandler for AppRunner {
             // GPU is idle; eagerly release all retained references so resources
             // dropped via field destructuring above are destroyed now.
             for frame in &mut frames {
-                // SAFETY: wait_idle() succeeded above; no GPU work is in flight.
+                // SAFETY: wait_idle() succeeded above; no GPU work is in
+                // flight.
                 unsafe { frame.release_retained() };
             }
 
@@ -405,11 +433,14 @@ impl ApplicationHandler for AppRunner {
         }
 
         match &window_event {
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::Resized(_)
+            | WindowEvent::ScaleFactorChanged { .. } => {
                 let desired_extent = {
                     if let Some(running_state) = self.as_running()
-                        && let Some(extent) =
-                            Self::desired_extent_for_event(&running_state.win, &window_event)
+                        && let Some(extent) = Self::desired_extent_for_event(
+                            &running_state.win,
+                            &window_event,
+                        )
                     {
                         extent
                     } else {
@@ -423,7 +454,10 @@ impl ApplicationHandler for AppRunner {
                         None => return,
                     };
 
-                    Self::recreate_swapchain_if_needed(running_state, desired_extent)
+                    Self::recreate_swapchain_if_needed(
+                        running_state,
+                        desired_extent,
+                    )
                 };
 
                 if !should_keep_running {
@@ -434,7 +468,10 @@ impl ApplicationHandler for AppRunner {
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+    fn about_to_wait(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) {
         let outcome = match self.as_running_mut() {
             Some(state) => Self::draw_frame(state),
             None => return,
@@ -449,7 +486,10 @@ impl ApplicationHandler for AppRunner {
                         width: size.width,
                         height: size.height,
                     };
-                    if !Self::recreate_swapchain_if_needed(running_state, extent) {
+                    if !Self::recreate_swapchain_if_needed(
+                        running_state,
+                        extent,
+                    ) {
                         self.exit_from_running(event_loop);
                     }
                 }
@@ -477,23 +517,27 @@ impl AppRunner {
 
         let frame_idx = state.current_frame;
 
-        // Wait until this frame slot's previous GPU work is done, then reset the
-        // fence for reuse. This also guarantees image_available is unsignaled and
-        // the command buffer is no longer in use.
+        // Wait until this frame slot's previous GPU work is done, then
+        // reset the fence for reuse. This also guarantees image_available
+        // is unsignaled and the command buffer is no longer in use.
         //
-        // SAFETY: fence was submitted with GPU work for this frame slot; the wait
-        // ensures all that work has completed.
+        // SAFETY: fence was submitted with GPU work for this frame slot;
+        // the wait ensures all that work has completed.
         if let Err(e) = unsafe {
             state.frames[frame_idx]
                 .in_flight_fence
                 .wait_and_reset(u64::MAX)
         } {
-            return DrawFrameOutcome::Fatal(format!("Fence wait/reset failed: {e}"));
+            return DrawFrameOutcome::Fatal(format!(
+                "Fence wait/reset failed: {e}"
+            ));
         }
 
         // GPU work for this slot is done; release retained references.
-        // This allows retired resources to be destroyed once all slots have cleared.
-        // SAFETY: wait_and_reset() succeeded above; this slot's GPU work is complete.
+        // This allows retired resources to be destroyed once all slots
+        // have cleared.
+        // SAFETY: wait_and_reset() succeeded above; this slot's GPU work
+        // is complete.
         unsafe { state.frames[frame_idx].release_retained() };
 
         // SAFETY: is_none() is checked at the top of this function.
@@ -502,19 +546,25 @@ impl AppRunner {
             .as_ref()
             .expect("swapchain present: checked above");
         let swapchain_raw = sc.raw_handle();
-        let image_available = state.frames[frame_idx].image_available.raw_handle();
+        let image_available =
+            state.frames[frame_idx].image_available.raw_handle();
 
         // Acquire the next presentable image.
         //
         // SAFETY: image_available is unsignaled (fence wait above ensures the
         // previous acquire+submit cycle for this slot has completed).
-        let acquire_result =
-            unsafe { sc.acquire_next_image(u64::MAX, image_available, vk::Fence::null()) };
+        let acquire_result = unsafe {
+            sc.acquire_next_image(u64::MAX, image_available, vk::Fence::null())
+        };
 
         let (image_index, suboptimal) = match acquire_result {
             Ok(result) => result,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return DrawFrameOutcome::SwapchainOutOfDate,
-            Err(e) => return DrawFrameOutcome::Fatal(format!("Acquire failed: {e}")),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                return DrawFrameOutcome::SwapchainOutOfDate;
+            }
+            Err(e) => {
+                return DrawFrameOutcome::Fatal(format!("Acquire failed: {e}"));
+            }
         };
 
         let i = image_index as usize;
@@ -523,9 +573,11 @@ impl AppRunner {
         let image_view = sc
             .image_views()
             .expect("image views were created with the swapchain")[i];
-        // Clone the retained reference now while sc is borrowed; sc's borrow ends here.
+        // Clone the retained reference now while sc is borrowed; sc's
+        // borrow ends here.
         let retained = Arc::clone(sc);
-        let render_finished = state.frames[frame_idx].render_finished.raw_handle();
+        let render_finished =
+            state.frames[frame_idx].render_finished.raw_handle();
 
         let fence = state.frames[frame_idx].in_flight_fence.raw_handle();
         let pipeline_handle = state.pipeline.raw_handle();
@@ -533,13 +585,18 @@ impl AppRunner {
 
         // Reset and re-record the command buffer for this frame slot.
         //
-        // SAFETY: fence wait above guarantees the buffer is not pending on the GPU.
+        // SAFETY: fence wait above guarantees the buffer is not
+        // pending on the GPU.
         if let Err(e) = unsafe { frame_cmd.reset() } {
-            return DrawFrameOutcome::Fatal(format!("Command buffer reset failed: {e}"));
+            return DrawFrameOutcome::Fatal(format!(
+                "Command buffer reset failed: {e}"
+            ));
         }
         // SAFETY: buffer was just reset to the initial state.
         if let Err(e) = unsafe { frame_cmd.begin() } {
-            return DrawFrameOutcome::Fatal(format!("Command buffer begin failed: {e}"));
+            return DrawFrameOutcome::Fatal(format!(
+                "Command buffer begin failed: {e}"
+            ));
         }
 
         let subresource_range = vk::ImageSubresourceRange::default()
@@ -559,8 +616,8 @@ impl AppRunner {
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(image)
             .subresource_range(subresource_range);
-        let dep_info =
-            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_color));
+        let dep_info = vk::DependencyInfo::default()
+            .image_memory_barriers(std::slice::from_ref(&to_color));
         // SAFETY: recording state; image is a valid swapchain image.
         unsafe { frame_cmd.pipeline_barrier2(&dep_info) };
 
@@ -583,13 +640,17 @@ impl AppRunner {
             })
             .layer_count(1)
             .color_attachments(std::slice::from_ref(&color_attachment));
-        // SAFETY: recording; image in COLOR_ATTACHMENT_OPTIMAL; image_view valid.
+        // SAFETY: recording; image in COLOR_ATTACHMENT_OPTIMAL;
+        // image_view valid.
         if let Err(e) = unsafe { frame_cmd.begin_rendering(&rendering_info) } {
-            return DrawFrameOutcome::Fatal(format!("begin_rendering failed: {e}"));
+            return DrawFrameOutcome::Fatal(format!(
+                "begin_rendering failed: {e}"
+            ));
         }
 
         // Bind pipeline, set dynamic viewport/scissor, draw.
-        // SAFETY: inside a dynamic render pass with a compatible color attachment.
+        // SAFETY: inside a dynamic render pass with a compatible
+        // color attachment.
         unsafe { frame_cmd.bind_graphics_pipeline(pipeline_handle) };
 
         let viewport = vk::Viewport {
@@ -611,12 +672,15 @@ impl AppRunner {
         unsafe { frame_cmd.set_scissor(std::slice::from_ref(&scissor)) };
 
         // 3 vertices hard-coded in the shader; 1 instance.
-        // SAFETY: all required dynamic state has been set; render pass is active.
+        // SAFETY: all required dynamic state has been set;
+        // render pass is active.
         unsafe { frame_cmd.draw(3, 1, 0, 0) };
 
         // SAFETY: inside a dynamic render pass.
         if let Err(e) = unsafe { frame_cmd.end_rendering() } {
-            return DrawFrameOutcome::Fatal(format!("end_rendering failed: {e}"));
+            return DrawFrameOutcome::Fatal(format!(
+                "end_rendering failed: {e}"
+            ));
         }
 
         // Transition: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
@@ -629,59 +693,73 @@ impl AppRunner {
             .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
             .image(image)
             .subresource_range(subresource_range);
-        let dep_info_present =
-            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_present));
+        let dep_info_present = vk::DependencyInfo::default()
+            .image_memory_barriers(std::slice::from_ref(&to_present));
         // SAFETY: recording; image is in COLOR_ATTACHMENT_OPTIMAL.
         unsafe { frame_cmd.pipeline_barrier2(&dep_info_present) };
 
         // SAFETY: recording state.
         if let Err(e) = unsafe { frame_cmd.end() } {
-            return DrawFrameOutcome::Fatal(format!("Command buffer end failed: {e}"));
+            return DrawFrameOutcome::Fatal(format!(
+                "Command buffer end failed: {e}"
+            ));
         }
 
         let cmd_handle = frame_cmd.raw_handle();
-        // frame_cmd borrow ends here; subsequent accesses are on different fields.
+        // frame_cmd borrow ends here; subsequent accesses are on
+        // different fields.
 
-        // Submit — wait on image_available, signal render_finished, signal fence when done.
+        // Submit — wait on image_available, signal render_finished,
+        // signal fence when done.
         let wait_info = vk::SemaphoreSubmitInfo::default()
             .semaphore(image_available)
             .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
         let signal_info = vk::SemaphoreSubmitInfo::default()
             .semaphore(render_finished)
             .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
-        let cmd_submit_info = vk::CommandBufferSubmitInfo::default().command_buffer(cmd_handle);
+        let cmd_submit_info =
+            vk::CommandBufferSubmitInfo::default().command_buffer(cmd_handle);
         let submit = vk::SubmitInfo2::default()
             .wait_semaphore_infos(std::slice::from_ref(&wait_info))
             .command_buffer_infos(std::slice::from_ref(&cmd_submit_info))
             .signal_semaphore_infos(std::slice::from_ref(&signal_info));
-        // SAFETY: image_available is signaled by acquire; render_finished is unsignaled;
-        // fence is unsignaled (just reset above); cmd is in the executable state.
+        // SAFETY: image_available is signaled by acquire;
+        // render_finished is unsignaled; fence is unsignaled
+        // (just reset above); cmd is in the executable state.
         if let Err(e) = unsafe {
-            state
-                .device
-                .graphics_present_queue_submit2(std::slice::from_ref(&submit), fence)
+            state.device.graphics_present_queue_submit2(
+                std::slice::from_ref(&submit),
+                fence,
+            )
         } {
-            return DrawFrameOutcome::Fatal(format!("Queue submit failed: {e}"));
+            return DrawFrameOutcome::Fatal(format!(
+                "Queue submit failed: {e}"
+            ));
         }
 
         // Retain references until this slot's fence signals, preventing the
         // presentation engine / GPU from accessing destroyed resources.
         state.frames[frame_idx].retained_swapchain = Some(retained);
-        state.frames[frame_idx].retained_pipeline = Some(Arc::clone(&state.pipeline));
+        state.frames[frame_idx].retained_pipeline =
+            Some(Arc::clone(&state.pipeline));
 
         // Present — wait on render_finished.
         let present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(std::slice::from_ref(&render_finished))
             .swapchains(std::slice::from_ref(&swapchain_raw))
             .image_indices(std::slice::from_ref(&image_index));
-        // SAFETY: render_finished is signaled by submit; image is in PRESENT_SRC_KHR.
-        let present_result = unsafe { state.device.queue_present(&present_info) };
+        // SAFETY: render_finished is signaled by submit; image is in
+        // PRESENT_SRC_KHR.
+        let present_result =
+            unsafe { state.device.queue_present(&present_info) };
 
         state.current_frame = (state.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
         match present_result {
             Ok(false) if !suboptimal => DrawFrameOutcome::Success,
-            Ok(_) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => DrawFrameOutcome::SwapchainOutOfDate,
+            Ok(_) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                DrawFrameOutcome::SwapchainOutOfDate
+            }
             Err(e) => DrawFrameOutcome::Fatal(format!("Present failed: {e}")),
         }
     }
@@ -719,7 +797,9 @@ impl AppRunner {
         )?);
 
         //SAFETY: We will drop surface when we enter into `suspend`
-        let surface = Arc::new(unsafe { Surface::new(&state.instance, Arc::clone(&win)) }?);
+        let surface = Arc::new(unsafe {
+            Surface::new(&state.instance, Arc::clone(&win))
+        }?);
 
         let device = Arc::new(Device::create_compatible(
             &state.instance,
@@ -730,7 +810,8 @@ impl AppRunner {
         let win_size = win.inner_size();
         let swapchain = if win_size.width == 0 || win_size.height == 0 {
             tracing::trace!(
-                "Skipping initial swapchain create because window extent is zero: {}x{}",
+                "Skipping initial swapchain create because window \
+                 extent is zero: {}x{}",
                 win_size.width,
                 win_size.height
             );
@@ -746,15 +827,24 @@ impl AppRunner {
                 requested_height = requested_extent.height
             )
             .entered();
-            let swapchain = Swapchain::new(&device, &surface, requested_extent, true, None)?;
+            let swapchain = Swapchain::new(
+                &device,
+                &surface,
+                requested_extent,
+                true,
+                None,
+            )?;
             drop(swapchain_create_span);
             Some(Arc::new(swapchain))
         };
 
         let shader_dir = state.self_dir.join("shaders");
         let shader = {
-            let _span = tracing::trace_span!("shader_load", path = ?shader_dir.join("shader.spv"))
-                .entered();
+            let _span = tracing::trace_span!(
+                "shader_load",
+                path = ?shader_dir.join("shader.spv")
+            )
+            .entered();
             let shader_bytes = std::fs::read(shader_dir.join("shader.spv"))
                 .map_err(|e| eyre::eyre!("Error loading shader.spv: {e}"))?;
             ShaderModule::new(&device, &shader_bytes, Some("shader"))?
@@ -784,9 +874,10 @@ impl AppRunner {
             Some("graphics command pool"),
         )?;
 
-        // Start each fence signaled so the first frame's wait_and_reset returns immediately.
-        // Each frame slot owns its command buffer so the CPU can encode frame N while the
-        // GPU executes frame N-1 without contention.
+        // Start each fence signaled so the first frame's
+        // wait_and_reset returns immediately.
+        // Each frame slot owns its command buffer so the CPU can encode
+        // frame N while the GPU executes frame N-1 without contention.
         let frames = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|i| -> eyre::Result<FrameSync> {
                 Ok(FrameSync {
@@ -798,7 +889,11 @@ impl AppRunner {
                         &device,
                         Some(&format!("render finished [{i}]")),
                     )?,
-                    in_flight_fence: Fence::new(&device, true, Some(&format!("in flight [{i}]")))?,
+                    in_flight_fence: Fence::new(
+                        &device,
+                        true,
+                        Some(&format!("in flight [{i}]")),
+                    )?,
                     command_buffer: command_pool.allocate_command_buffer()?,
                     retained_swapchain: None,
                     retained_pipeline: None,
@@ -807,7 +902,8 @@ impl AppRunner {
             .collect::<eyre::Result<Vec<_>>>()?;
 
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
-        let idle_guard = unsafe { RunningStateTransitionGuard::new(Arc::clone(&device)) };
+        let idle_guard =
+            unsafe { RunningStateTransitionGuard::new(Arc::clone(&device)) };
         Ok(RunningState {
             _idle_guard: idle_guard,
             win,
@@ -823,15 +919,19 @@ impl AppRunner {
         })
     }
 
-    fn suspended_to_running(state: SuspendedState) -> eyre::Result<RunningState> {
+    fn suspended_to_running(
+        state: SuspendedState,
+    ) -> eyre::Result<RunningState> {
         //SAFETY: We will drop surface when we enter into `suspend`
-        let surface =
-            Arc::new(unsafe { Surface::new(state.device.get_parent(), Arc::clone(&state.win)) }?);
+        let surface = Arc::new(unsafe {
+            Surface::new(state.device.get_parent(), Arc::clone(&state.win))
+        }?);
 
         let win_size = state.win.inner_size();
         let swapchain = if win_size.width == 0 || win_size.height == 0 {
             tracing::trace!(
-                "Skipping swapchain create on resume because window extent is zero: {}x{}",
+                "Skipping swapchain create on resume because window \
+                 extent is zero: {}x{}",
                 win_size.width,
                 win_size.height
             );
@@ -852,36 +952,40 @@ impl AppRunner {
         // Reuse the existing pipeline when the swapchain honored the preferred
         // format. Recreate it only if the surface forced a different format.
         let swapchain_format = swapchain.as_ref().map(|sc| sc.format());
-        let (pipeline, pipeline_color_format) = if let Some(new_format) = swapchain_format {
-            if new_format == state.pipeline_color_format {
-                (state.pipeline, state.pipeline_color_format)
-            } else {
-                tracing::debug!(
-                    "Swapchain format changed on resume ({:?} -> {:?}); recreating pipeline",
-                    state.pipeline_color_format,
-                    new_format,
-                );
-                let pipeline = {
-                    let _span = tracing::trace_span!(
-                        "pipeline_create",
-                        color_format = ?new_format,
-                    )
-                    .entered();
-                    Arc::new(build_pipeline(
-                        &state.device,
-                        &state.shader,
+        let (pipeline, pipeline_color_format) =
+            if let Some(new_format) = swapchain_format {
+                if new_format == state.pipeline_color_format {
+                    (state.pipeline, state.pipeline_color_format)
+                } else {
+                    tracing::debug!(
+                        "Swapchain format changed on resume \
+                     ({:?} -> {:?}); recreating pipeline",
+                        state.pipeline_color_format,
                         new_format,
-                        Some("main pipeline"),
-                    )?)
-                };
-                (pipeline, new_format)
-            }
-        } else {
-            (state.pipeline, state.pipeline_color_format)
-        };
+                    );
+                    let pipeline = {
+                        let _span = tracing::trace_span!(
+                            "pipeline_create",
+                            color_format = ?new_format,
+                        )
+                        .entered();
+                        Arc::new(build_pipeline(
+                            &state.device,
+                            &state.shader,
+                            new_format,
+                            Some("main pipeline"),
+                        )?)
+                    };
+                    (pipeline, new_format)
+                }
+            } else {
+                (state.pipeline, state.pipeline_color_format)
+            };
 
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
-        let idle_guard = unsafe { RunningStateTransitionGuard::new(Arc::clone(&state.device)) };
+        let idle_guard = unsafe {
+            RunningStateTransitionGuard::new(Arc::clone(&state.device))
+        };
         Ok(RunningState {
             _idle_guard: idle_guard,
             win: state.win,
@@ -909,11 +1013,15 @@ impl AppRunner {
             )
             .entered();
             if let Err(e) = running_state.device.wait_idle() {
-                tracing::error!("Error while waiting for device idle on zero extent: {}", e);
+                tracing::error!(
+                    "Error while waiting for device idle on zero extent: {}",
+                    e
+                );
                 return false;
             }
             for frame in &mut running_state.frames {
-                // SAFETY: wait_idle() succeeded above; no GPU work is in flight.
+                // SAFETY: wait_idle() succeeded above; no GPU work is in
+                // flight.
                 unsafe { frame.release_retained() };
             }
             running_state.swapchain = None;
@@ -924,7 +1032,8 @@ impl AppRunner {
             && existing_swapchain.extent() == desired_extent
         {
             tracing::trace!(
-                "Skipping swapchain recreate because extent is unchanged: {}x{}",
+                "Skipping swapchain recreate because extent is \
+                 unchanged: {}x{}",
                 desired_extent.width,
                 desired_extent.height
             );
@@ -957,7 +1066,8 @@ impl AppRunner {
 
                 if new_format != running_state.pipeline_color_format {
                     tracing::debug!(
-                        "Swapchain format changed on resize ({:?} -> {:?}); recreating pipeline",
+                        "Swapchain format changed on resize \
+                         ({:?} -> {:?}); recreating pipeline",
                         running_state.pipeline_color_format,
                         new_format,
                     );
@@ -973,13 +1083,18 @@ impl AppRunner {
                         Some("main pipeline"),
                     ) {
                         Ok(pipeline) => {
-                            // Arc::clone in draw_frame's retained_pipeline keeps the
-                            // old pipeline alive until each in-flight slot's fence signals.
+                            // Arc::clone in draw_frame's retained_pipeline
+                            // keeps the old pipeline alive until each
+                            // in-flight slot's fence signals.
                             running_state.pipeline = Arc::new(pipeline);
                             running_state.pipeline_color_format = new_format;
                         }
                         Err(e) => {
-                            tracing::error!("Error recreating pipeline after format change: {}", e);
+                            tracing::error!(
+                                "Error recreating pipeline after \
+                                 format change: {}",
+                                e
+                            );
                             return false;
                         }
                     }
@@ -1022,20 +1137,30 @@ impl AppRunner {
         from_state: &'static str,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) {
-        let _span =
-            tracing::debug_span!("state_transition", from = from_state, to = "Exiting").entered();
+        let _span = tracing::debug_span!(
+            "state_transition",
+            from = from_state,
+            to = "Exiting"
+        )
+        .entered();
         self.set_exiting(ExitingState {});
         event_loop.exit();
     }
 
-    fn exit_from_running(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+    fn exit_from_running(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) {
         if let Some(running_state) = self.take_running() {
             // _idle_guard drops first (first field), calling wait_idle before
             // the swapchain, frames, semaphores, and fences are freed.
             drop(running_state);
             self.transition_to_exiting("Running", event_loop);
         } else {
-            tracing::warn!("Requested Running -> Exiting transition while not in Running state");
+            tracing::warn!(
+                "Requested Running -> Exiting transition \
+                 while not in Running state"
+            );
             event_loop.exit();
         }
     }

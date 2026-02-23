@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -94,8 +94,8 @@ pub enum CreateCompatibleError {
     DynamicRenderingNotAvailable,
 
     #[error(
-        "VK_KHR_synchronization2 is not supported by the selected physical device \
-         (required on Vulkan < 1.3)"
+        "VK_KHR_synchronization2 is not supported by the \
+         selected physical device (required on Vulkan < 1.3)"
     )]
     Synchronization2NotAvailable,
 }
@@ -178,10 +178,13 @@ impl Device {
             .iter()
             .map(|&dev| {
                 //SAFETY: dev was derived from instance
-                let props = unsafe { instance.get_raw_physical_device_properties(dev) };
+                let props =
+                    unsafe { instance.get_raw_physical_device_properties(dev) };
                 //SAFETY: dev was derived from instance
-                let queue_families =
-                    unsafe { instance.get_raw_physical_device_queue_family_properties(dev) };
+                let queue_families = unsafe {
+                    instance
+                        .get_raw_physical_device_queue_family_properties(dev)
+                };
 
                 let has_dedicated_transfer = queue_families.iter().any(|qf| {
                     qf.queue_flags.contains(vk::QueueFlags::TRANSFER)
@@ -192,8 +195,10 @@ impl Device {
                         && !qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
                 });
 
-                let dedicated_count = has_dedicated_transfer as u32 + has_dedicated_compute as u32;
-                let score = (dedicated_count, device_type_priority(props.device_type));
+                let dedicated_count = has_dedicated_transfer as u32
+                    + has_dedicated_compute as u32;
+                let score =
+                    (dedicated_count, device_type_priority(props.device_type));
 
                 DeviceInfo {
                     handle: dev,
@@ -228,8 +233,9 @@ impl Device {
                 }
                 //SAFETY: physical_device was derived from instance, surface
                 //was derived from the same instance
-                let supports_present =
-                    unsafe { surf.supports_queue_family(physical_device, idx as u32) };
+                let supports_present = unsafe {
+                    surf.supports_queue_family(physical_device, idx as u32)
+                };
                 match supports_present {
                     Ok(true) => Some(idx as u32),
                     _ => None,
@@ -238,40 +244,42 @@ impl Device {
             .ok_or(CreateCompatibleError::NoGraphicsPresentQueue)?;
 
         // Find dedicated transfer and compute queue families
-        let (transfer_family, compute_family) =
-            if matches!(config.queue_mode, QueueMode::Unified | QueueMode::Single) {
-                (graphics_present_family, graphics_present_family)
-            } else {
-                let dedicated_transfer = queue_families
-                    .iter()
-                    .enumerate()
-                    .find_map(|(idx, props)| {
-                        if props.queue_flags.contains(vk::QueueFlags::TRANSFER)
-                            && !props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                        {
-                            Some(idx as u32)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(graphics_present_family);
+        let (transfer_family, compute_family) = if matches!(
+            config.queue_mode,
+            QueueMode::Unified | QueueMode::Single
+        ) {
+            (graphics_present_family, graphics_present_family)
+        } else {
+            let dedicated_transfer = queue_families
+                .iter()
+                .enumerate()
+                .find_map(|(idx, props)| {
+                    if props.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                        && !props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                    {
+                        Some(idx as u32)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(graphics_present_family);
 
-                let dedicated_compute = queue_families
-                    .iter()
-                    .enumerate()
-                    .find_map(|(idx, props)| {
-                        if props.queue_flags.contains(vk::QueueFlags::COMPUTE)
-                            && !props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                        {
-                            Some(idx as u32)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(graphics_present_family);
+            let dedicated_compute = queue_families
+                .iter()
+                .enumerate()
+                .find_map(|(idx, props)| {
+                    if props.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                        && !props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                    {
+                        Some(idx as u32)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(graphics_present_family);
 
-                (dedicated_transfer, dedicated_compute)
-            };
+            (dedicated_transfer, dedicated_compute)
+        };
 
         tracing::info!(
             "Queue families — graphics+present: {}, transfer: {}, compute: {}",
@@ -283,7 +291,8 @@ impl Device {
         // Build deduplicated queue create infos
         // Count how many queues we need from each family
         let mut family_queue_counts: HashMap<u32, u32> = HashMap::new();
-        for family in [graphics_present_family, transfer_family, compute_family] {
+        for family in [graphics_present_family, transfer_family, compute_family]
+        {
             *family_queue_counts.entry(family).or_insert(0) += 1;
         }
 
@@ -304,24 +313,29 @@ impl Device {
             .map(|(_, &count)| vec![1.0; count as usize])
             .collect();
 
-        let queue_create_infos: Vec<vk::DeviceQueueCreateInfo<'_>> = family_queue_counts
-            .iter()
-            .zip(queue_priorities_storage.iter())
-            .map(|((&family, _), priorities)| {
-                vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(family)
-                    .queue_priorities(priorities)
-            })
-            .collect();
+        let queue_create_infos: Vec<vk::DeviceQueueCreateInfo<'_>> =
+            family_queue_counts
+                .iter()
+                .zip(queue_priorities_storage.iter())
+                .map(|((&family, _), priorities)| {
+                    vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(family)
+                        .queue_priorities(priorities)
+                })
+                .collect();
 
         let ver = instance.get_supported_ver();
-        let is_pre_1_3 = ver.major() < 1 || (ver.major() == 1 && ver.minor() < 3);
+        let is_pre_1_3 =
+            ver.major() < 1 || (ver.major() == 1 && ver.minor() < 3);
 
         // Enumerate device extensions once for all pre-1.3 optional checks.
         let device_exts: Vec<vk::ExtensionProperties> = if is_pre_1_3 {
             //SAFETY: physical_device was derived from instance
-            unsafe { instance.enumerate_raw_device_extension_properties(physical_device) }
-                .unwrap_or_default()
+            unsafe {
+                instance
+                    .enumerate_raw_device_extension_properties(physical_device)
+            }
+            .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -329,7 +343,8 @@ impl Device {
         // VK_KHR_shader_non_semantic_info: promoted to core in 1.3.
         if is_pre_1_3 {
             let has_non_semantic = device_exts.iter().any(|ext| {
-                ext.extension_name_as_c_str() == Ok(ash::khr::shader_non_semantic_info::NAME)
+                ext.extension_name_as_c_str()
+                    == Ok(ash::khr::shader_non_semantic_info::NAME)
             });
             if has_non_semantic {
                 mandatory_exts.push(ash::khr::shader_non_semantic_info::NAME);
@@ -339,14 +354,17 @@ impl Device {
         // VK_KHR_synchronization2: core in 1.3, extension on older drivers.
         // `use_sync2_ext` is true only when the extension loader must be used.
         let use_sync2_ext = if is_pre_1_3 {
-            let has_sync2 = device_exts
-                .iter()
-                .any(|ext| ext.extension_name_as_c_str() == Ok(ash::khr::synchronization2::NAME));
+            let has_sync2 = device_exts.iter().any(|ext| {
+                ext.extension_name_as_c_str()
+                    == Ok(ash::khr::synchronization2::NAME)
+            });
             if has_sync2 {
                 mandatory_exts.push(ash::khr::synchronization2::NAME);
                 true
             } else {
-                return Err(CreateCompatibleError::Synchronization2NotAvailable);
+                return Err(
+                    CreateCompatibleError::Synchronization2NotAvailable,
+                );
             }
         } else {
             false
@@ -355,27 +373,33 @@ impl Device {
         // VK_KHR_dynamic_rendering: core in 1.3, extension on older drivers.
         // `use_dr_ext` is true only when the extension loader must be used.
         let use_dr_ext = if config.dynamic_rendering && is_pre_1_3 {
-            let has_dr = device_exts
-                .iter()
-                .any(|ext| ext.extension_name_as_c_str() == Ok(ash::khr::dynamic_rendering::NAME));
+            let has_dr = device_exts.iter().any(|ext| {
+                ext.extension_name_as_c_str()
+                    == Ok(ash::khr::dynamic_rendering::NAME)
+            });
             if has_dr {
                 mandatory_exts.push(ash::khr::dynamic_rendering::NAME);
                 true
             } else {
-                return Err(CreateCompatibleError::DynamicRenderingNotAvailable);
+                return Err(
+                    CreateCompatibleError::DynamicRenderingNotAvailable,
+                );
             }
         } else {
             false
         };
 
-        let ext_ptrs: Vec<*const i8> = mandatory_exts.iter().map(|e| e.as_ptr()).collect();
+        let ext_ptrs: Vec<*const i8> =
+            mandatory_exts.iter().map(|e| e.as_ptr()).collect();
 
         // Enable synchronization2 (core 1.3 or via VK_KHR_synchronization2).
         let mut sync2_features =
-            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+            vk::PhysicalDeviceSynchronization2Features::default()
+                .synchronization2(true);
         // Enable dynamic rendering if requested (core 1.3 or via extension).
         let mut dr_features =
-            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+            vk::PhysicalDeviceDynamicRenderingFeatures::default()
+                .dynamic_rendering(true);
 
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
@@ -387,8 +411,10 @@ impl Device {
 
         //SAFETY: physical_device was derived from instance, device_create_info
         //is valid
-        let device = unsafe { instance.create_ash_device(physical_device, &device_create_info) }
-            .map_err(CreateCompatibleError::DeviceCreationFailed)?;
+        let device = unsafe {
+            instance.create_ash_device(physical_device, &device_create_info)
+        }
+        .map_err(CreateCompatibleError::DeviceCreationFailed)?;
 
         // Get queues. For families with multiple queues, assign incrementing
         // indices. For families where we requested more queues than available,
@@ -403,25 +429,28 @@ impl Device {
             unsafe { device.get_device_queue(family, queue_idx) }
         };
 
-        let graphics_present_queue_handle = get_next_queue(graphics_present_family);
+        let graphics_present_queue_handle =
+            get_next_queue(graphics_present_family);
         let transfer_queue_handle = get_next_queue(transfer_family);
         let compute_queue_handle = get_next_queue(compute_family);
 
         // Aliased queues (same underlying VkQueue handle) must share a single
         // Mutex so that locking any role serializes on the same resource.
         let gfx_queue_arc = Arc::new(Mutex::new(graphics_present_queue_handle));
-        let transfer_queue_arc = if transfer_queue_handle == graphics_present_queue_handle {
-            Arc::clone(&gfx_queue_arc)
-        } else {
-            Arc::new(Mutex::new(transfer_queue_handle))
-        };
-        let compute_queue_arc = if compute_queue_handle == graphics_present_queue_handle {
-            Arc::clone(&gfx_queue_arc)
-        } else if compute_queue_handle == transfer_queue_handle {
-            Arc::clone(&transfer_queue_arc)
-        } else {
-            Arc::new(Mutex::new(compute_queue_handle))
-        };
+        let transfer_queue_arc =
+            if transfer_queue_handle == graphics_present_queue_handle {
+                Arc::clone(&gfx_queue_arc)
+            } else {
+                Arc::new(Mutex::new(transfer_queue_handle))
+            };
+        let compute_queue_arc =
+            if compute_queue_handle == graphics_present_queue_handle {
+                Arc::clone(&gfx_queue_arc)
+            } else if compute_queue_handle == transfer_queue_handle {
+                Arc::clone(&transfer_queue_arc)
+            } else {
+                Arc::new(Mutex::new(compute_queue_handle))
+            };
 
         Ok(Self {
             parent: instance.clone(),
@@ -430,7 +459,8 @@ impl Device {
             } else {
                 None
             },
-            debug_utils_device: instance.create_debug_utils_device_loader(&device),
+            debug_utils_device: instance
+                .create_debug_utils_device_loader(&device),
             dynamic_rendering: if config.dynamic_rendering {
                 if use_dr_ext {
                     Some(DynamicRenderingLoader::Extension(
@@ -443,7 +473,9 @@ impl Device {
                 None
             },
             synchronization2: if use_sync2_ext {
-                Synchronization2Loader::Extension(instance.create_synchronization2_loader(&device))
+                Synchronization2Loader::Extension(
+                    instance.create_synchronization2_loader(&device),
+                )
             } else {
                 Synchronization2Loader::Core
             },
@@ -587,7 +619,10 @@ impl Device {
             .as_ref()
             .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: Caller guarantees swapchain, semaphore, and fence validity.
-        unsafe { swapchain_device.acquire_next_image(swapchain, timeout_ns, semaphore, fence) }
+        unsafe {
+            swapchain_device
+                .acquire_next_image(swapchain, timeout_ns, semaphore, fence)
+        }
     }
 
     /// Present a rendered swapchain image to the surface via the
@@ -617,7 +652,8 @@ impl Device {
             .0
             .lock()
             .expect("graphics/present queue lock poisoned");
-        // SAFETY: Caller guarantees all handles and synchronization requirements.
+        // SAFETY: Caller guarantees all handles and synchronization
+        // requirements.
         unsafe { swapchain_device.queue_present(*queue, present_info) }
     }
 
@@ -689,7 +725,8 @@ impl Device {
         }
 
         let name = name_provider();
-        // SAFETY: This method shares the same safety contract as set_object_name.
+        // SAFETY: This method shares the same safety contract as
+        // set_object_name.
         unsafe { self.set_object_name(object, name.as_deref()) }
     }
 
@@ -710,11 +747,14 @@ impl Device {
         H: vk::Handle,
     {
         let name = match name {
-            Some(name) => Some(CString::new(name).map_err(NameObjectError::InvalidName)?),
+            Some(name) => {
+                Some(CString::new(name).map_err(NameObjectError::InvalidName)?)
+            }
             None => None,
         };
 
-        // SAFETY: This method shares the same safety contract as set_object_name.
+        // SAFETY: This method shares the same safety contract as
+        // set_object_name.
         unsafe { self.set_object_name(object, name.as_deref()) }
     }
 }
@@ -735,7 +775,10 @@ impl Device {
     /// # Safety
     /// `shader_module` must be a valid handle created from this device and
     /// not yet destroyed. All objects derived from it must be destroyed first.
-    pub unsafe fn destroy_raw_shader_module(&self, shader_module: vk::ShaderModule) {
+    pub unsafe fn destroy_raw_shader_module(
+        &self,
+        shader_module: vk::ShaderModule,
+    ) {
         // SAFETY: Caller guarantees shader_module provenance and drop ordering.
         unsafe { self.handle.destroy_shader_module(shader_module, None) };
     }
@@ -758,7 +801,10 @@ impl Device {
     /// # Safety
     /// `layout` must be a valid handle created from this device and not yet
     /// destroyed. No pipeline still using this layout may be in use.
-    pub unsafe fn destroy_raw_pipeline_layout(&self, layout: vk::PipelineLayout) {
+    pub unsafe fn destroy_raw_pipeline_layout(
+        &self,
+        layout: vk::PipelineLayout,
+    ) {
         // SAFETY: Caller guarantees layout provenance and drop ordering.
         unsafe { self.handle.destroy_pipeline_layout(layout, None) };
     }
@@ -839,7 +885,8 @@ impl Device {
         match &self.dynamic_rendering {
             None => Err(DynamicRenderingError::NotEnabled),
             Some(DynamicRenderingLoader::Core) => {
-                // SAFETY: Caller guarantees command_buffer and rendering_info validity.
+                // SAFETY: Caller guarantees command_buffer and
+                // rendering_info validity.
                 unsafe {
                     self.handle
                         .cmd_begin_rendering(command_buffer, rendering_info)
@@ -847,8 +894,11 @@ impl Device {
                 Ok(())
             }
             Some(DynamicRenderingLoader::Extension(loader)) => {
-                // SAFETY: Caller guarantees command_buffer and rendering_info validity.
-                unsafe { loader.cmd_begin_rendering(command_buffer, rendering_info) };
+                // SAFETY: Caller guarantees command_buffer and
+                // rendering_info validity.
+                unsafe {
+                    loader.cmd_begin_rendering(command_buffer, rendering_info)
+                };
                 Ok(())
             }
         }
@@ -867,12 +917,14 @@ impl Device {
         match &self.dynamic_rendering {
             None => Err(DynamicRenderingError::NotEnabled),
             Some(DynamicRenderingLoader::Core) => {
-                // SAFETY: Caller guarantees command_buffer validity and render pass state.
+                // SAFETY: Caller guarantees command_buffer validity
+                // and render pass state.
                 unsafe { self.handle.cmd_end_rendering(command_buffer) };
                 Ok(())
             }
             Some(DynamicRenderingLoader::Extension(loader)) => {
-                // SAFETY: Caller guarantees command_buffer validity and render pass state.
+                // SAFETY: Caller guarantees command_buffer validity
+                // and render pass state.
                 unsafe { loader.cmd_end_rendering(command_buffer) };
                 Ok(())
             }
@@ -882,7 +934,8 @@ impl Device {
 
 // Queue submit functionality
 impl Device {
-    /// Submit work to the graphics/present queue using the synchronization2 API.
+    /// Submit work to the graphics/present queue using the
+    /// synchronization2 API.
     ///
     /// # Safety
     /// All handles in `submits` must be valid and derived from this device.
@@ -900,11 +953,13 @@ impl Device {
             .lock()
             .expect("graphics/present queue lock poisoned");
         match &self.synchronization2 {
-            // SAFETY: Caller guarantees all handle validity and synchronization state.
+            // SAFETY: Caller guarantees all handle validity and
+            // synchronization state.
             Synchronization2Loader::Core => unsafe {
                 self.handle.queue_submit2(*queue, submits, fence)
             },
-            // SAFETY: Caller guarantees all handle validity and synchronization state.
+            // SAFETY: Caller guarantees all handle validity and
+            // synchronization state.
             Synchronization2Loader::Extension(loader) => unsafe {
                 loader.queue_submit2(*queue, submits, fence)
             },
@@ -925,14 +980,17 @@ impl Device {
         command_buffer: vk::CommandBuffer,
         dependency_info: &vk::DependencyInfo<'_>,
     ) {
-        // SAFETY: Caller guarantees command_buffer and dependency_info validity.
+        // SAFETY: Caller guarantees command_buffer and
+        // dependency_info validity.
         match &self.synchronization2 {
-            // SAFETY: Caller guarantees command_buffer and dependency_info validity.
+            // SAFETY: Caller guarantees command_buffer and
+            // dependency_info validity.
             Synchronization2Loader::Core => unsafe {
                 self.handle
                     .cmd_pipeline_barrier2(command_buffer, dependency_info)
             },
-            // SAFETY: Caller guarantees command_buffer and dependency_info validity.
+            // SAFETY: Caller guarantees command_buffer and
+            // dependency_info validity.
             Synchronization2Loader::Extension(loader) => unsafe {
                 loader.cmd_pipeline_barrier2(command_buffer, dependency_info)
             },
@@ -951,8 +1009,11 @@ impl Device {
     ) {
         // SAFETY: Caller guarantees command_buffer state and pipeline validity.
         unsafe {
-            self.handle
-                .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline)
+            self.handle.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline,
+            )
         }
     }
 
@@ -966,7 +1027,8 @@ impl Device {
         command_buffer: vk::CommandBuffer,
         viewports: &[vk::Viewport],
     ) {
-        // SAFETY: Caller guarantees command_buffer state and pipeline dynamic state.
+        // SAFETY: Caller guarantees command_buffer state and pipeline
+        // dynamic state.
         unsafe { self.handle.cmd_set_viewport(command_buffer, 0, viewports) }
     }
 
@@ -980,7 +1042,8 @@ impl Device {
         command_buffer: vk::CommandBuffer,
         scissors: &[vk::Rect2D],
     ) {
-        // SAFETY: Caller guarantees command_buffer state and pipeline dynamic state.
+        // SAFETY: Caller guarantees command_buffer state and pipeline
+        // dynamic state.
         unsafe { self.handle.cmd_set_scissor(command_buffer, 0, scissors) }
     }
 
@@ -1020,7 +1083,8 @@ impl Device {
         &self,
         create_info: &vk::CommandPoolCreateInfo<'_>,
     ) -> Result<vk::CommandPool, vk::Result> {
-        // SAFETY: Caller guarantees create_info validity and queue family provenance.
+        // SAFETY: Caller guarantees create_info validity and queue
+        // family provenance.
         unsafe { self.handle.create_command_pool(create_info, None) }
     }
 
@@ -1041,7 +1105,8 @@ impl Device {
         pool: vk::CommandPool,
         flags: vk::CommandPoolResetFlags,
     ) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees pool provenance and command buffer idle state.
+        // SAFETY: Caller guarantees pool provenance and command
+        // buffer idle state.
         unsafe { self.handle.reset_command_pool(pool, flags) }
     }
 
@@ -1065,7 +1130,8 @@ impl Device {
         command_buffer: vk::CommandBuffer,
         begin_info: &vk::CommandBufferBeginInfo<'_>,
     ) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees command_buffer state and begin_info validity.
+        // SAFETY: Caller guarantees command_buffer state and
+        // begin_info validity.
         unsafe { self.handle.begin_command_buffer(command_buffer, begin_info) }
     }
 
@@ -1088,7 +1154,8 @@ impl Device {
         command_buffer: vk::CommandBuffer,
         flags: vk::CommandBufferResetFlags,
     ) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees command_buffer is not pending and pool flag is set.
+        // SAFETY: Caller guarantees command_buffer is not pending
+        // and pool flag is set.
         unsafe { self.handle.reset_command_buffer(command_buffer, flags) }
     }
 
@@ -1153,8 +1220,12 @@ impl Device {
     /// # Safety
     /// All handles in `fences` must be valid fences created from this device
     /// and must not be currently pending on any queue submission.
-    pub unsafe fn reset_raw_fences(&self, fences: &[vk::Fence]) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees fence handle validity and non-pending state.
+    pub unsafe fn reset_raw_fences(
+        &self,
+        fences: &[vk::Fence],
+    ) -> Result<(), vk::Result> {
+        // SAFETY: Caller guarantees fence handle validity and
+        // non-pending state.
         unsafe { self.handle.reset_fences(fences) }
     }
 
@@ -1165,7 +1236,10 @@ impl Device {
     /// # Safety
     /// `fence` must be a valid handle created from this device and not yet
     /// destroyed.
-    pub unsafe fn get_raw_fence_status(&self, fence: vk::Fence) -> Result<bool, vk::Result> {
+    pub unsafe fn get_raw_fence_status(
+        &self,
+        fence: vk::Fence,
+    ) -> Result<bool, vk::Result> {
         // SAFETY: Caller guarantees fence provenance and validity.
         unsafe { self.handle.get_fence_status(fence) }
     }
@@ -1193,8 +1267,12 @@ impl Device {
 impl From<FetchPhysicalDeviceError> for CreateCompatibleError {
     fn from(value: FetchPhysicalDeviceError) -> Self {
         match value {
-            FetchPhysicalDeviceError::MemoryExhaustion => Self::MemoryExhaustion,
-            FetchPhysicalDeviceError::UnknownVulkan(e) => Self::UnknownVulkan(e),
+            FetchPhysicalDeviceError::MemoryExhaustion => {
+                Self::MemoryExhaustion
+            }
+            FetchPhysicalDeviceError::UnknownVulkan(e) => {
+                Self::UnknownVulkan(e)
+            }
         }
     }
 }

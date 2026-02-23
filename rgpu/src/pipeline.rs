@@ -34,7 +34,8 @@ impl PipelineLayout {
         let create_info = vk::PipelineLayoutCreateInfo::default();
         // SAFETY: create_info is default-initialised; it imposes no additional
         // validity requirements on the device.
-        let handle = unsafe { device.create_raw_pipeline_layout(&create_info) }?;
+        let handle =
+            unsafe { device.create_raw_pipeline_layout(&create_info) }?;
         Ok(Self {
             parent: Arc::clone(device),
             handle,
@@ -193,12 +194,17 @@ impl DynamicPipeline {
         };
 
         let stage_create_infos: Vec<vk::PipelineShaderStageCreateInfo<'_>> =
-            desc.stages.iter().map(|ep| ep.as_pipeline_stage_create_info()).collect();
+            desc.stages
+                .iter()
+                .map(|ep| ep.as_pipeline_stage_create_info())
+                .collect();
 
-        let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default();
+        let vertex_input_state =
+            vk::PipelineVertexInputStateCreateInfo::default();
 
-        let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let input_assembly_state =
+            vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
         // Viewport and scissor counts must be declared even though their
         // values are supplied dynamically.
@@ -206,18 +212,23 @@ impl DynamicPipeline {
             .viewport_count(1)
             .scissor_count(1);
 
-        let rasterization_state = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(desc.polygon_mode)
-            .cull_mode(desc.cull_mode)
-            .front_face(desc.front_face)
-            .line_width(1.0);
+        let rasterization_state =
+            vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(desc.polygon_mode)
+                .cull_mode(desc.cull_mode)
+                .front_face(desc.front_face)
+                .line_width(1.0);
 
-        let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let multisample_state =
+            vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
-        let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default();
+        let depth_stencil_state =
+            vk::PipelineDepthStencilStateCreateInfo::default();
 
-        let color_blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = desc
+        let color_blend_attachments: Vec<
+            vk::PipelineColorBlendAttachmentState,
+        > = desc
             .color_attachment_formats
             .iter()
             .map(|_| {
@@ -226,18 +237,22 @@ impl DynamicPipeline {
             })
             .collect();
 
-        let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(&color_blend_attachments);
+        let color_blend_state =
+            vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(&color_blend_attachments);
 
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic_state =
-            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let dynamic_states =
+            [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
 
-        let mut rendering_create_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(desc.color_attachment_formats)
-            .depth_attachment_format(
-                desc.depth_attachment_format.unwrap_or(vk::Format::UNDEFINED),
-            );
+        let mut rendering_create_info =
+            vk::PipelineRenderingCreateInfo::default()
+                .color_attachment_formats(desc.color_attachment_formats)
+                .depth_attachment_format(
+                    desc.depth_attachment_format
+                        .unwrap_or(vk::Format::UNDEFINED),
+                );
 
         let create_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stage_create_infos)
@@ -255,13 +270,16 @@ impl DynamicPipeline {
         // SAFETY: create_info references valid shader stages, a valid pipeline
         // layout, and a valid VkPipelineRenderingCreateInfo; all derived from
         // device and valid for the duration of this call.
-        let handle = unsafe { device.create_raw_graphics_pipeline(&create_info) }
-            .map_err(CreateDynamicPipelineError::PipelineCreation)?;
+        let handle =
+            unsafe { device.create_raw_graphics_pipeline(&create_info) }
+                .map_err(CreateDynamicPipelineError::PipelineCreation)?;
 
         // SAFETY: handle is a valid pipeline created from device.
         match unsafe { device.set_object_name_str(handle, name) } {
             Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-            Err(e) => tracing::warn!("Failed to name pipeline {:?}: {e}", handle),
+            Err(e) => {
+                tracing::warn!("Failed to name pipeline {:?}: {e}", handle)
+            }
         }
 
         Ok(Self {

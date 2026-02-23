@@ -9,7 +9,9 @@ use crate::surface::{Surface, SurfaceQueryError};
 #[derive(Debug, Error)]
 pub enum CreateSwapchainError {
     #[error(
-        "Mismatched parameters to Swapchain::new/new_with_old. Device, surface, and optional old swapchain must be derived from the same instance"
+        "Mismatched parameters to Swapchain::new/new_with_old. \
+         Device, surface, and optional old swapchain must be \
+         derived from the same instance"
     )]
     MismatchedParams,
 
@@ -44,9 +46,11 @@ fn choose_surface_format(
 ) -> vk::SurfaceFormatKHR {
     // Try the caller's preferred format first (any color space).
     if let Some(preferred) = preferred_format
-    && let Some(found) = formats.iter().copied().find(|f| f.format == preferred) {
-            return found;
-        }
+        && let Some(found) =
+            formats.iter().copied().find(|f| f.format == preferred)
+    {
+        return found;
+    }
 
     formats
         .iter()
@@ -58,7 +62,9 @@ fn choose_surface_format(
         .unwrap_or(formats[0])
 }
 
-fn choose_present_mode(present_modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+fn choose_present_mode(
+    present_modes: &[vk::PresentModeKHR],
+) -> vk::PresentModeKHR {
     present_modes
         .iter()
         .copied()
@@ -94,7 +100,9 @@ fn choose_image_count(capabilities: &vk::SurfaceCapabilitiesKHR) -> u32 {
     image_count
 }
 
-fn choose_composite_alpha(capabilities: &vk::SurfaceCapabilitiesKHR) -> vk::CompositeAlphaFlagsKHR {
+fn choose_composite_alpha(
+    capabilities: &vk::SurfaceCapabilitiesKHR,
+) -> vk::CompositeAlphaFlagsKHR {
     if capabilities
         .supported_composite_alpha
         .contains(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -124,7 +132,9 @@ fn create_default_swapchain_image_views<FCreate, FDestroy, FName>(
     mut name_image_view: FName,
 ) -> Result<Vec<vk::ImageView>, CreateSwapchainError>
 where
-    FCreate: FnMut(&vk::ImageViewCreateInfo<'_>) -> Result<vk::ImageView, vk::Result>,
+    FCreate: FnMut(
+        &vk::ImageViewCreateInfo<'_>,
+    ) -> Result<vk::ImageView, vk::Result>,
     FDestroy: FnMut(vk::ImageView),
     FName: FnMut(usize, vk::ImageView),
 {
@@ -175,9 +185,10 @@ pub struct Swapchain<T: HasDisplayHandle + HasWindowHandle> {
     acquire_lock: Mutex<()>,
 }
 
-struct SwapchainDebugWithSource<'a, T: HasDisplayHandle + HasWindowHandle + std::fmt::Debug>(
-    &'a Swapchain<T>,
-);
+struct SwapchainDebugWithSource<
+    'a,
+    T: HasDisplayHandle + HasWindowHandle + std::fmt::Debug,
+>(&'a Swapchain<T>);
 
 impl<T: HasDisplayHandle + HasWindowHandle + std::fmt::Debug> std::fmt::Debug
     for SwapchainDebugWithSource<'_, T>
@@ -283,27 +294,38 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
             });
         }
 
-        if !std::sync::Arc::ptr_eq(parent_surface.get_parent(), parent_device.get_parent()) {
+        if !std::sync::Arc::ptr_eq(
+            parent_surface.get_parent(),
+            parent_device.get_parent(),
+        ) {
             return Err(CreateSwapchainError::MismatchedParams);
         }
 
         if let Some(old_swapchain) = old_swapchain
-            && (!std::sync::Arc::ptr_eq(&old_swapchain.parent_device, parent_device)
-                || !std::sync::Arc::ptr_eq(&old_swapchain._parent_surface, parent_surface))
+            && (!std::sync::Arc::ptr_eq(
+                &old_swapchain.parent_device,
+                parent_device,
+            ) || !std::sync::Arc::ptr_eq(
+                &old_swapchain._parent_surface,
+                parent_surface,
+            ))
         {
             return Err(CreateSwapchainError::MismatchedParams);
         }
 
         let physical_device = parent_device.get_physical_device();
-        let present_queue_family = parent_device.graphics_present_queue_family();
+        let present_queue_family =
+            parent_device.graphics_present_queue_family();
 
         // SAFETY: physical_device belongs to parent_device's instance, and
         // parent_surface is derived from the same instance (validated above).
-        let capabilities = unsafe { parent_surface.query_capabilities(physical_device) }?;
+        let capabilities =
+            unsafe { parent_surface.query_capabilities(physical_device) }?;
         // SAFETY: same reasoning as above.
         let formats = unsafe { parent_surface.query_formats(physical_device) }?;
         // SAFETY: same reasoning as above.
-        let present_modes = unsafe { parent_surface.query_present_modes(physical_device) }?;
+        let present_modes =
+            unsafe { parent_surface.query_present_modes(physical_device) }?;
 
         if formats.is_empty() {
             return Err(CreateSwapchainError::NoSurfaceFormats);
@@ -342,21 +364,30 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
 
         // SAFETY: create info references valid handles and values selected from
         // queried surface support details.
-        let handle = unsafe { parent_device.create_raw_swapchain(&swapchain_create_info) }?;
+        let handle = unsafe {
+            parent_device.create_raw_swapchain(&swapchain_create_info)
+        }?;
         let swapchain_debug_index = parent_device.next_swapchain_debug_index();
         // SAFETY: `handle` is a valid swapchain created from `parent_device`.
         match unsafe {
             parent_device.set_object_name_with(handle, || {
-                std::ffi::CString::new(format!("Swapchain {swapchain_debug_index}")).ok()
+                std::ffi::CString::new(format!(
+                    "Swapchain {swapchain_debug_index}"
+                ))
+                .ok()
             })
         } {
             Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-            Err(e) => tracing::warn!("Failed to name swapchain {:?}: {e}", handle),
+            Err(e) => {
+                tracing::warn!("Failed to name swapchain {:?}: {e}", handle)
+            }
         }
-        // SAFETY: handle was created by this device's swapchain loader and is valid.
-        let images =
-            unsafe { parent_device.get_raw_swapchain_images(handle) }.inspect_err(|_| {
-                // SAFETY: handle was created above and must be destroyed on early exit.
+        // SAFETY: handle was created by this device's swapchain loader
+        // and is valid.
+        let images = unsafe { parent_device.get_raw_swapchain_images(handle) }
+            .inspect_err(|_| {
+                // SAFETY: handle was created above and must be
+                // destroyed on early exit.
                 unsafe { parent_device.destroy_raw_swapchain(handle) };
             })?;
 
@@ -372,7 +403,10 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
                 })
             } {
                 Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-                Err(e) => tracing::warn!("Failed to name swapchain image {:?}: {e}", image),
+                Err(e) => tracing::warn!(
+                    "Failed to name swapchain image {:?}: {e}",
+                    image
+                ),
             }
         }
 
@@ -383,27 +417,39 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
                     surface_format.format,
                     swapchain_debug_index,
                     |create_info| {
-                        // SAFETY: create_info references a valid swapchain image from
-                        // this device, and uses a standard 2D color subresource range.
-                        unsafe { parent_device.create_raw_image_view(create_info) }
+                        // SAFETY: create_info references a valid
+                        // swapchain image from this device, and uses a
+                        // standard 2D color subresource range.
+                        unsafe {
+                            parent_device.create_raw_image_view(create_info)
+                        }
                     },
                     |image_view| {
-                        // SAFETY: image_view was created by parent_device and must be
-                        // destroyed on early exit.
-                        unsafe { parent_device.destroy_raw_image_view(image_view) };
+                        // SAFETY: image_view was created by
+                        // parent_device and must be destroyed on
+                        // early exit.
+                        unsafe {
+                            parent_device.destroy_raw_image_view(image_view)
+                        };
                     },
                     |index, image_view| {
-                        // SAFETY: image_view is valid and created from parent_device.
+                        // SAFETY: image_view is valid and created
+                        // from parent_device.
                         match unsafe {
-                            parent_device.set_object_name_with(image_view, || {
-                                std::ffi::CString::new(format!(
-                                    "Swapchain {swapchain_debug_index} ImageView {}",
-                                    index + 1,
-                                ))
-                                .ok()
-                            })
+                            parent_device.set_object_name_with(
+                                image_view,
+                                || {
+                                    std::ffi::CString::new(format!(
+                                        "Swapchain {swapchain_debug_index} \
+                                     ImageView {}",
+                                        index + 1,
+                                    ))
+                                    .ok()
+                                },
+                            )
                         } {
-                            Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
+                            Ok(())
+                            | Err(NameObjectError::DebugUtilsNotEnabled) => {}
                             Err(e) => tracing::warn!(
                                 "Failed to name swapchain image view {:?}: {e}",
                                 image_view
@@ -443,8 +489,9 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
     /// `parent_surface` must be derived from the same parent instance as
     /// `parent_device`.
     ///
-    /// `image_views`, when `Some`, should correspond to images in `images` (same image,
-    /// format compatibility, and subresource range expectations).
+    /// `image_views`, when `Some`, should correspond to images in
+    /// `images` (same image, format compatibility, and subresource range
+    /// expectations).
     ///
     /// All resources passed here must follow Vulkan destruction ordering
     /// requirements (views before swapchain).
@@ -510,12 +557,19 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         semaphore: vk::Semaphore,
         fence: vk::Fence,
     ) -> Result<(u32, bool), vk::Result> {
-        let _guard = self.acquire_lock.lock().expect("swapchain acquire lock poisoned");
+        let _guard = self
+            .acquire_lock
+            .lock()
+            .expect("swapchain acquire lock poisoned");
         // SAFETY: Caller guarantees semaphore and fence validity. self.handle
         // is valid for the lifetime of this Swapchain.
         unsafe {
-            self.parent_device
-                .acquire_next_swapchain_image(self.handle, timeout_ns, semaphore, fence)
+            self.parent_device.acquire_next_swapchain_image(
+                self.handle,
+                timeout_ns,
+                semaphore,
+                fence,
+            )
         }
     }
 }
@@ -526,7 +580,8 @@ impl<T: HasDisplayHandle + HasWindowHandle> Drop for Swapchain<T> {
         // NOTE: Callers must ensure GPU synchronization before drop (for
         // example, waiting on fences/device idle) so no in-flight work still
         // references these views or the swapchain.
-        for image_view in self.image_views.iter_mut().flat_map(|v| v.drain(..)) {
+        for image_view in self.image_views.iter_mut().flat_map(|v| v.drain(..))
+        {
             // SAFETY: image_view was created by parent_device and is being
             // destroyed during swapchain teardown.
             unsafe { self.parent_device.destroy_raw_image_view(image_view) };
@@ -561,7 +616,10 @@ mod tests {
 
     #[test]
     fn choose_present_mode_prefers_mailbox() {
-        let chosen = choose_present_mode(&[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX]);
+        let chosen = choose_present_mode(&[
+            vk::PresentModeKHR::FIFO,
+            vk::PresentModeKHR::MAILBOX,
+        ]);
         assert_eq!(chosen, vk::PresentModeKHR::MAILBOX);
     }
 
@@ -637,8 +695,9 @@ mod tests {
     #[test]
     fn choose_composite_alpha_prefers_opaque_then_pre_multiplied() {
         let capabilities = vk::SurfaceCapabilitiesKHR {
-            supported_composite_alpha: vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED
-                | vk::CompositeAlphaFlagsKHR::OPAQUE,
+            supported_composite_alpha:
+                vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED
+                    | vk::CompositeAlphaFlagsKHR::OPAQUE,
             ..Default::default()
         };
 
@@ -655,7 +714,8 @@ mod tests {
             vk::Image::from_raw(2),
             vk::Image::from_raw(3),
         ];
-        let created_views = [vk::ImageView::from_raw(10), vk::ImageView::from_raw(11)];
+        let created_views =
+            [vk::ImageView::from_raw(10), vk::ImageView::from_raw(11)];
         let create_calls = RefCell::new(0usize);
         let destroyed = RefCell::new(Vec::<vk::ImageView>::new());
 
@@ -688,7 +748,8 @@ mod tests {
     #[test]
     fn image_view_helper_returns_all_views_on_success() {
         let images = [vk::Image::from_raw(1), vk::Image::from_raw(2)];
-        let views = [vk::ImageView::from_raw(100), vk::ImageView::from_raw(101)];
+        let views =
+            [vk::ImageView::from_raw(100), vk::ImageView::from_raw(101)];
         let create_calls = RefCell::new(0usize);
         let name_calls = RefCell::new(0usize);
 

@@ -14,7 +14,10 @@ pub enum CreateSurfaceError {
     InvalidWindowHandle(raw_window_handle::HandleError),
     #[error("Vulkan surface creation failed: {0}")]
     VulkanError(ash::vk::Result),
-    #[error("Parent instance did not have the surface extensions for this platform loaded")]
+    #[error(
+        "Parent instance did not have the surface extensions \
+         for this platform loaded"
+    )]
     MissingExtension,
 }
 
@@ -40,9 +43,10 @@ pub struct Surface<T: HasWindowHandle + HasDisplayHandle> {
     _surface_source: Arc<T>,
 }
 
-struct SurfaceDebugWithSource<'a, T: HasWindowHandle + HasDisplayHandle + std::fmt::Debug>(
-    &'a Surface<T>,
-);
+struct SurfaceDebugWithSource<
+    'a,
+    T: HasWindowHandle + HasDisplayHandle + std::fmt::Debug,
+>(&'a Surface<T>);
 
 impl<T: HasWindowHandle + HasDisplayHandle + std::fmt::Debug> std::fmt::Debug
     for SurfaceDebugWithSource<'_, T>
@@ -158,7 +162,8 @@ impl<T: HasWindowHandle + HasDisplayHandle> Surface<T> {
         &self,
         physical_device: vk::PhysicalDevice,
     ) -> Result<vk::SurfaceCapabilitiesKHR, SurfaceQueryError> {
-        // SAFETY: Caller guarantees physical_device provenance for this instance.
+        // SAFETY: Caller guarantees physical_device provenance for
+        // this instance.
         unsafe {
             self.parent_instance
                 .get_surface_capabilities(physical_device, self.handle)
@@ -174,7 +179,8 @@ impl<T: HasWindowHandle + HasDisplayHandle> Surface<T> {
         &self,
         physical_device: vk::PhysicalDevice,
     ) -> Result<Vec<vk::SurfaceFormatKHR>, SurfaceQueryError> {
-        // SAFETY: Caller guarantees physical_device provenance for this instance.
+        // SAFETY: Caller guarantees physical_device provenance for
+        // this instance.
         unsafe {
             self.parent_instance
                 .get_surface_formats(physical_device, self.handle)
@@ -190,7 +196,8 @@ impl<T: HasWindowHandle + HasDisplayHandle> Surface<T> {
         &self,
         physical_device: vk::PhysicalDevice,
     ) -> Result<Vec<vk::PresentModeKHR>, SurfaceQueryError> {
-        // SAFETY: Caller guarantees physical_device provenance for this instance.
+        // SAFETY: Caller guarantees physical_device provenance for
+        // this instance.
         unsafe {
             self.parent_instance
                 .get_surface_present_modes(physical_device, self.handle)
@@ -203,8 +210,13 @@ impl<T: HasWindowHandle + HasDisplayHandle> Drop for Surface<T> {
         tracing::debug!("Dropping surface {:?}", self.handle);
         //SAFETY: This is being dropped which means all derived objects should
         //also be being dropped and no in-flight work may still reference it.
-        let _ = unsafe { self.parent_instance.destroy_raw_surface(self.handle) }.inspect_err(|e| {
-            tracing::error!("Error while dropping surface {:?}: {e}", self.handle)
-        });
+        let _ =
+            unsafe { self.parent_instance.destroy_raw_surface(self.handle) }
+                .inspect_err(|e| {
+                    tracing::error!(
+                        "Error while dropping surface {:?}: {e}",
+                        self.handle
+                    )
+                });
     }
 }
