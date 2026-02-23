@@ -622,6 +622,13 @@ impl Instance {
         ash::khr::dynamic_rendering::Device::new(&self.handle, device)
     }
 
+    pub fn create_synchronization2_loader(
+        &self,
+        device: &ash::Device,
+    ) -> ash::khr::synchronization2::Device {
+        ash::khr::synchronization2::Device::new(&self.handle, device)
+    }
+
     pub fn create_debug_utils_device_loader(
         &self,
         device: &ash::Device,

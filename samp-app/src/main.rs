@@ -9,12 +9,14 @@ use std::{
 use clap::Parser;
 use rgpu::{
     ash::vk,
+    command::{ResettableCommandBuffer, ResettableCommandPool},
     device::{Device, DeviceConfig, QueueMode},
     instance::{Instance, InstanceExtensions},
     pipeline::{DynamicPipeline, DynamicPipelineDesc},
     shader::{ShaderModule, ShaderStage},
     surface::Surface,
     swapchain::Swapchain,
+    sync::{Fence, Semaphore},
 };
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use winit::{
@@ -126,9 +128,6 @@ fn main() -> eyre::Result<()> {
             .with_writer(log_file)
             .with_ansi(false);
 
-        println!("log_file_path: {}", log_file_path.display());
-        println!("cli_args: {:#?}", cli_args);
-
         let stdout_log = tracing_subscriber::fmt::layer().pretty();
 
         tracing_subscriber::registry()
@@ -140,6 +139,9 @@ fn main() -> eyre::Result<()> {
                     .and_then(file_log),
             )
             .init();
+
+        tracing::debug!("log_file_path: {}", log_file_path.display());
+        tracing::debug!("cli_args: {:#?}", cli_args);
     }
 
     let event_loop = winit::event_loop::EventLoop::builder().build()?;
@@ -181,6 +183,93 @@ enum App {
     Exiting(ExitingState),
 }
 
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+/// Per-frame-in-flight synchronization primitives and command buffer.
+#[derive(Debug)]
+struct FrameSync {
+    image_available: Semaphore,
+    /// Signaled by the queue submit when rendering of this frame is complete.
+    /// Waited on by `vkQueuePresentKHR`. Lives here (not keyed by swapchain image)
+    /// so it is not destroyed when the swapchain is recreated mid-flight.
+    render_finished: Semaphore,
+    in_flight_fence: Fence,
+    command_buffer: ResettableCommandBuffer,
+    /// Keeps the swapchain alive until this frame slot's fence signals.
+    ///
+    /// Set to the current swapchain after each submit and cleared at the
+    /// start of the next use of this slot (after `wait_and_reset`). This
+    /// prevents a retired swapchain from being destroyed while the
+    /// presentation engine may still hold references to its images.
+    retained_swapchain: Option<Arc<Swapchain<WinitWindow>>>,
+    /// Keeps the pipeline alive until this frame slot's fence signals.
+    ///
+    /// Set to the current pipeline after each submit and cleared at the
+    /// start of the next use of this slot. This prevents a retired pipeline
+    /// from being destroyed while in-flight command buffers still reference it.
+    retained_pipeline: Option<Arc<DynamicPipeline>>,
+}
+
+impl FrameSync {
+    /// Release all retained resource references for this frame slot.
+    ///
+    /// # Safety
+    /// The GPU must not be accessing any of the retained resources. The caller
+    /// must ensure either this slot's fence has signaled, or `vkDeviceWaitIdle`
+    /// has returned successfully, before calling this function.
+    unsafe fn release_retained(&mut self) {
+        self.retained_swapchain = None;
+        self.retained_pipeline = None;
+    }
+}
+
+/// Ensures [`Device::wait_idle`] is called before [`RunningState`]'s Vulkan
+/// resources are destroyed.
+///
+/// Stored as the **first** field of `RunningState` so that Rust's field drop
+/// order guarantees `wait_idle` fires before the swapchain, frames,
+/// semaphores, and fences are freed.
+///
+/// The two exit paths are:
+///
+/// - **Drop** (`exit_from_running`, etc.): the guard is dropped with the rest
+///   of `RunningState`; `Drop` calls `wait_idle` automatically.
+/// - **Destructure** (`suspended()` transition): `RunningState` is
+///   destructured to move fields into `SuspendedState`; `wait_idle` is called
+///   explicitly first (for error handling), and the guard drops at end of
+///   scope, calling `wait_idle` a second time — which is a harmless no-op on
+///   an already-idle device.
+struct RunningStateTransitionGuard {
+    device: Arc<Device>,
+}
+
+impl std::fmt::Debug for RunningStateTransitionGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunningStateTransitionGuard")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunningStateTransitionGuard {
+    /// # Safety
+    /// This guard **must** be dropped rather than forgotten. Dropping it calls
+    /// `vkDeviceWaitIdle`, ensuring the GPU is idle before the caller's Vulkan
+    /// resources are freed. Forgetting it (via `mem::forget`, `ManuallyDrop`,
+    /// etc.) skips that wait and may allow resources to be destroyed while
+    /// the GPU is still accessing them.
+    unsafe fn new(device: Arc<Device>) -> Self {
+        Self { device }
+    }
+}
+
+impl Drop for RunningStateTransitionGuard {
+    fn drop(&mut self) {
+        if let Err(e) = self.device.wait_idle() {
+            tracing::error!("Error waiting for device idle on RunningState drop: {e}");
+        }
+    }
+}
+
 #[derive(Debug)]
 struct InitializingState {
     instance: Arc<Instance>,
@@ -189,25 +278,30 @@ struct InitializingState {
 }
 #[derive(Debug)]
 struct RunningState {
-    instance: Arc<Instance>,
+    /// First field: drops first, calling `wait_idle` before all other resources.
+    _idle_guard: RunningStateTransitionGuard,
     win: Arc<WinitWindow>,
     device: Arc<Device>,
     _surface: Arc<Surface<WinitWindow>>,
     // `None` means the window/surface is currently zero-sized. We stay in
     // Running and recreate on the next non-zero resize/scale event.
-    swapchain: Option<Swapchain<WinitWindow>>,
+    swapchain: Option<Arc<Swapchain<WinitWindow>>>,
     shader: ShaderModule,
-    pipeline: DynamicPipeline,
+    pipeline: Arc<DynamicPipeline>,
     pipeline_color_format: vk::Format,
+    command_pool: ResettableCommandPool,
+    frames: Vec<FrameSync>,
+    current_frame: usize,
 }
 #[derive(Debug)]
 struct SuspendedState {
-    instance: Arc<Instance>,
     win: Arc<WinitWindow>,
     device: Arc<Device>,
     shader: ShaderModule,
-    pipeline: DynamicPipeline,
+    pipeline: Arc<DynamicPipeline>,
     pipeline_color_format: vk::Format,
+    command_pool: ResettableCommandPool,
+    frames: Vec<FrameSync>,
 }
 #[derive(Debug)]
 struct ExitingState {}
@@ -255,7 +349,7 @@ impl ApplicationHandler for AppRunner {
                     .entered();
             event_loop.set_control_flow(ControlFlow::Wait);
             let RunningState {
-                instance,
+                _idle_guard,
                 win,
                 device,
                 _surface: _,
@@ -263,6 +357,9 @@ impl ApplicationHandler for AppRunner {
                 shader,
                 pipeline,
                 pipeline_color_format,
+                command_pool,
+                mut frames,
+                current_frame: _,
             } = running_state;
 
             if let Err(e) = device.wait_idle() {
@@ -271,13 +368,21 @@ impl ApplicationHandler for AppRunner {
                 return;
             }
 
+            // GPU is idle; eagerly release all retained references so resources
+            // dropped via field destructuring above are destroyed now.
+            for frame in &mut frames {
+                // SAFETY: wait_idle() succeeded above; no GPU work is in flight.
+                unsafe { frame.release_retained() };
+            }
+
             self.set_suspended(SuspendedState {
-                instance,
                 win,
                 device,
                 shader,
                 pipeline,
                 pipeline_color_format,
+                command_pool,
+                frames,
             });
         }
     }
@@ -304,7 +409,7 @@ impl ApplicationHandler for AppRunner {
                 let desired_extent = {
                     if let Some(running_state) = self.as_running()
                         && let Some(extent) =
-                            Self::desired_extent_for_event(running_state, &window_event)
+                            Self::desired_extent_for_event(&running_state.win, &window_event)
                     {
                         extent
                     } else {
@@ -326,6 +431,258 @@ impl ApplicationHandler for AppRunner {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let outcome = match self.as_running_mut() {
+            Some(state) => Self::draw_frame(state),
+            None => return,
+        };
+
+        match outcome {
+            DrawFrameOutcome::Success => {}
+            DrawFrameOutcome::SwapchainOutOfDate => {
+                if let Some(running_state) = self.as_running_mut() {
+                    let size = running_state.win.inner_size();
+                    let extent = vk::Extent2D {
+                        width: size.width,
+                        height: size.height,
+                    };
+                    if !Self::recreate_swapchain_if_needed(running_state, extent) {
+                        self.exit_from_running(event_loop);
+                    }
+                }
+            }
+            DrawFrameOutcome::Fatal(msg) => {
+                tracing::error!("Fatal frame error: {msg}");
+                self.exit_from_running(event_loop);
+            }
+        }
+    }
+}
+
+enum DrawFrameOutcome {
+    Success,
+    SwapchainOutOfDate,
+    Fatal(String),
+}
+
+impl AppRunner {
+    fn draw_frame(state: &mut RunningState) -> DrawFrameOutcome {
+        // Skip if the window is currently zero-sized (no swapchain).
+        if state.swapchain.is_none() {
+            return DrawFrameOutcome::Success;
+        }
+
+        let frame_idx = state.current_frame;
+
+        // Wait until this frame slot's previous GPU work is done, then reset the
+        // fence for reuse. This also guarantees image_available is unsignaled and
+        // the command buffer is no longer in use.
+        //
+        // SAFETY: fence was submitted with GPU work for this frame slot; the wait
+        // ensures all that work has completed.
+        if let Err(e) = unsafe {
+            state.frames[frame_idx]
+                .in_flight_fence
+                .wait_and_reset(u64::MAX)
+        } {
+            return DrawFrameOutcome::Fatal(format!("Fence wait/reset failed: {e}"));
+        }
+
+        // GPU work for this slot is done; release retained references.
+        // This allows retired resources to be destroyed once all slots have cleared.
+        // SAFETY: wait_and_reset() succeeded above; this slot's GPU work is complete.
+        unsafe { state.frames[frame_idx].release_retained() };
+
+        // SAFETY: is_none() is checked at the top of this function.
+        let sc = state
+            .swapchain
+            .as_ref()
+            .expect("swapchain present: checked above");
+        let swapchain_raw = sc.raw_handle();
+        let image_available = state.frames[frame_idx].image_available.raw_handle();
+
+        // Acquire the next presentable image.
+        //
+        // SAFETY: image_available is unsignaled (fence wait above ensures the
+        // previous acquire+submit cycle for this slot has completed).
+        let acquire_result =
+            unsafe { sc.acquire_next_image(u64::MAX, image_available, vk::Fence::null()) };
+
+        let (image_index, suboptimal) = match acquire_result {
+            Ok(result) => result,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return DrawFrameOutcome::SwapchainOutOfDate,
+            Err(e) => return DrawFrameOutcome::Fatal(format!("Acquire failed: {e}")),
+        };
+
+        let i = image_index as usize;
+        let extent = sc.extent();
+        let image = sc.images()[i];
+        let image_view = sc
+            .image_views()
+            .expect("image views were created with the swapchain")[i];
+        // Clone the retained reference now while sc is borrowed; sc's borrow ends here.
+        let retained = Arc::clone(sc);
+        let render_finished = state.frames[frame_idx].render_finished.raw_handle();
+
+        let fence = state.frames[frame_idx].in_flight_fence.raw_handle();
+        let pipeline_handle = state.pipeline.raw_handle();
+        let frame_cmd = &mut state.frames[frame_idx].command_buffer;
+
+        // Reset and re-record the command buffer for this frame slot.
+        //
+        // SAFETY: fence wait above guarantees the buffer is not pending on the GPU.
+        if let Err(e) = unsafe { frame_cmd.reset() } {
+            return DrawFrameOutcome::Fatal(format!("Command buffer reset failed: {e}"));
+        }
+        // SAFETY: buffer was just reset to the initial state.
+        if let Err(e) = unsafe { frame_cmd.begin() } {
+            return DrawFrameOutcome::Fatal(format!("Command buffer begin failed: {e}"));
+        }
+
+        let subresource_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+
+        // Transition: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
+        let to_color = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(image)
+            .subresource_range(subresource_range);
+        let dep_info =
+            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_color));
+        // SAFETY: recording state; image is a valid swapchain image.
+        unsafe { frame_cmd.pipeline_barrier2(&dep_info) };
+
+        // Begin dynamic rendering with a clear.
+        let clear = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        };
+        let color_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(image_view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(clear);
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent,
+            })
+            .layer_count(1)
+            .color_attachments(std::slice::from_ref(&color_attachment));
+        // SAFETY: recording; image in COLOR_ATTACHMENT_OPTIMAL; image_view valid.
+        if let Err(e) = unsafe { frame_cmd.begin_rendering(&rendering_info) } {
+            return DrawFrameOutcome::Fatal(format!("begin_rendering failed: {e}"));
+        }
+
+        // Bind pipeline, set dynamic viewport/scissor, draw.
+        // SAFETY: inside a dynamic render pass with a compatible color attachment.
+        unsafe { frame_cmd.bind_graphics_pipeline(pipeline_handle) };
+
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: extent.width as f32,
+            height: extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        // SAFETY: pipeline declares VK_DYNAMIC_STATE_VIEWPORT.
+        unsafe { frame_cmd.set_viewport(std::slice::from_ref(&viewport)) };
+
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        // SAFETY: pipeline declares VK_DYNAMIC_STATE_SCISSOR.
+        unsafe { frame_cmd.set_scissor(std::slice::from_ref(&scissor)) };
+
+        // 3 vertices hard-coded in the shader; 1 instance.
+        // SAFETY: all required dynamic state has been set; render pass is active.
+        unsafe { frame_cmd.draw(3, 1, 0, 0) };
+
+        // SAFETY: inside a dynamic render pass.
+        if let Err(e) = unsafe { frame_cmd.end_rendering() } {
+            return DrawFrameOutcome::Fatal(format!("end_rendering failed: {e}"));
+        }
+
+        // Transition: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
+        let to_present = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
+            .dst_access_mask(vk::AccessFlags2::NONE)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .image(image)
+            .subresource_range(subresource_range);
+        let dep_info_present =
+            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_present));
+        // SAFETY: recording; image is in COLOR_ATTACHMENT_OPTIMAL.
+        unsafe { frame_cmd.pipeline_barrier2(&dep_info_present) };
+
+        // SAFETY: recording state.
+        if let Err(e) = unsafe { frame_cmd.end() } {
+            return DrawFrameOutcome::Fatal(format!("Command buffer end failed: {e}"));
+        }
+
+        let cmd_handle = frame_cmd.raw_handle();
+        // frame_cmd borrow ends here; subsequent accesses are on different fields.
+
+        // Submit — wait on image_available, signal render_finished, signal fence when done.
+        let wait_info = vk::SemaphoreSubmitInfo::default()
+            .semaphore(image_available)
+            .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
+        let signal_info = vk::SemaphoreSubmitInfo::default()
+            .semaphore(render_finished)
+            .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
+        let cmd_submit_info = vk::CommandBufferSubmitInfo::default().command_buffer(cmd_handle);
+        let submit = vk::SubmitInfo2::default()
+            .wait_semaphore_infos(std::slice::from_ref(&wait_info))
+            .command_buffer_infos(std::slice::from_ref(&cmd_submit_info))
+            .signal_semaphore_infos(std::slice::from_ref(&signal_info));
+        // SAFETY: image_available is signaled by acquire; render_finished is unsignaled;
+        // fence is unsignaled (just reset above); cmd is in the executable state.
+        if let Err(e) = unsafe {
+            state
+                .device
+                .graphics_present_queue_submit2(std::slice::from_ref(&submit), fence)
+        } {
+            return DrawFrameOutcome::Fatal(format!("Queue submit failed: {e}"));
+        }
+
+        // Retain references until this slot's fence signals, preventing the
+        // presentation engine / GPU from accessing destroyed resources.
+        state.frames[frame_idx].retained_swapchain = Some(retained);
+        state.frames[frame_idx].retained_pipeline = Some(Arc::clone(&state.pipeline));
+
+        // Present — wait on render_finished.
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(std::slice::from_ref(&render_finished))
+            .swapchains(std::slice::from_ref(&swapchain_raw))
+            .image_indices(std::slice::from_ref(&image_index));
+        // SAFETY: render_finished is signaled by submit; image is in PRESENT_SRC_KHR.
+        let present_result = unsafe { state.device.queue_present(&present_info) };
+
+        state.current_frame = (state.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+        match present_result {
+            Ok(false) if !suboptimal => DrawFrameOutcome::Success,
+            Ok(_) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => DrawFrameOutcome::SwapchainOutOfDate,
+            Err(e) => DrawFrameOutcome::Fatal(format!("Present failed: {e}")),
         }
     }
 }
@@ -391,7 +748,7 @@ impl AppRunner {
             .entered();
             let swapchain = Swapchain::new(&device, &surface, requested_extent, true, None)?;
             drop(swapchain_create_span);
-            Some(swapchain)
+            Some(Arc::new(swapchain))
         };
 
         let shader_dir = state.self_dir.join("shaders");
@@ -413,16 +770,46 @@ impl AppRunner {
                 color_format = ?pipeline_color_format,
             )
             .entered();
-            build_pipeline(
+            Arc::new(build_pipeline(
                 &device,
                 &shader,
                 pipeline_color_format,
                 Some("main pipeline"),
-            )?
+            )?)
         };
 
+        let command_pool = ResettableCommandPool::new(
+            &device,
+            device.graphics_present_queue_family(),
+            Some("graphics command pool"),
+        )?;
+
+        // Start each fence signaled so the first frame's wait_and_reset returns immediately.
+        // Each frame slot owns its command buffer so the CPU can encode frame N while the
+        // GPU executes frame N-1 without contention.
+        let frames = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|i| -> eyre::Result<FrameSync> {
+                Ok(FrameSync {
+                    image_available: Semaphore::new(
+                        &device,
+                        Some(&format!("image available [{i}]")),
+                    )?,
+                    render_finished: Semaphore::new(
+                        &device,
+                        Some(&format!("render finished [{i}]")),
+                    )?,
+                    in_flight_fence: Fence::new(&device, true, Some(&format!("in flight [{i}]")))?,
+                    command_buffer: command_pool.allocate_command_buffer()?,
+                    retained_swapchain: None,
+                    retained_pipeline: None,
+                })
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+
+        // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
+        let idle_guard = unsafe { RunningStateTransitionGuard::new(Arc::clone(&device)) };
         Ok(RunningState {
-            instance: state.instance,
+            _idle_guard: idle_guard,
             win,
             device,
             _surface: surface,
@@ -430,12 +817,16 @@ impl AppRunner {
             shader,
             pipeline,
             pipeline_color_format,
+            command_pool,
+            frames,
+            current_frame: 0,
         })
     }
 
     fn suspended_to_running(state: SuspendedState) -> eyre::Result<RunningState> {
         //SAFETY: We will drop surface when we enter into `suspend`
-        let surface = Arc::new(unsafe { Surface::new(&state.instance, Arc::clone(&state.win)) }?);
+        let surface =
+            Arc::new(unsafe { Surface::new(state.device.get_parent(), Arc::clone(&state.win)) }?);
 
         let win_size = state.win.inner_size();
         let swapchain = if win_size.width == 0 || win_size.height == 0 {
@@ -446,7 +837,7 @@ impl AppRunner {
             );
             None
         } else {
-            Some(Swapchain::new(
+            Some(Arc::new(Swapchain::new(
                 &state.device,
                 &surface,
                 vk::Extent2D {
@@ -455,7 +846,7 @@ impl AppRunner {
                 },
                 true,
                 Some(state.pipeline_color_format),
-            )?)
+            )?))
         };
 
         // Reuse the existing pipeline when the swapchain honored the preferred
@@ -476,12 +867,12 @@ impl AppRunner {
                         color_format = ?new_format,
                     )
                     .entered();
-                    build_pipeline(
+                    Arc::new(build_pipeline(
                         &state.device,
                         &state.shader,
                         new_format,
                         Some("main pipeline"),
-                    )?
+                    )?)
                 };
                 (pipeline, new_format)
             }
@@ -489,8 +880,10 @@ impl AppRunner {
             (state.pipeline, state.pipeline_color_format)
         };
 
+        // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
+        let idle_guard = unsafe { RunningStateTransitionGuard::new(Arc::clone(&state.device)) };
         Ok(RunningState {
-            instance: state.instance,
+            _idle_guard: idle_guard,
             win: state.win,
             device: state.device,
             _surface: surface,
@@ -498,60 +891,10 @@ impl AppRunner {
             shader: state.shader,
             pipeline,
             pipeline_color_format,
+            command_pool: state.command_pool,
+            frames: state.frames,
+            current_frame: 0,
         })
-    }
-}
-
-#[allow(dead_code, reason = "these functions exist for API completeness")]
-impl AppRunner {
-    fn transition_to_exiting(
-        &mut self,
-        from_state: &'static str,
-        event_loop: &winit::event_loop::ActiveEventLoop,
-    ) {
-        let _span =
-            tracing::debug_span!("state_transition", from = from_state, to = "Exiting").entered();
-        self.set_exiting(ExitingState {});
-        event_loop.exit();
-    }
-
-    fn exit_from_running(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        if self.take_running().is_some() {
-            self.transition_to_exiting("Running", event_loop);
-        } else {
-            tracing::warn!("Requested Running -> Exiting transition while not in Running state");
-            event_loop.exit();
-        }
-    }
-
-    fn desired_extent_for_event(
-        running_state: &RunningState,
-        window_event: &WindowEvent,
-    ) -> Option<rgpu::ash::vk::Extent2D> {
-        match window_event {
-            WindowEvent::Resized(size) => Some(rgpu::ash::vk::Extent2D {
-                width: size.width,
-                height: size.height,
-            }),
-            WindowEvent::ScaleFactorChanged { .. } => {
-                let size = running_state.win.inner_size();
-                Some(rgpu::ash::vk::Extent2D {
-                    width: size.width,
-                    height: size.height,
-                })
-            }
-            _ => None,
-        }
-    }
-
-    fn is_running_window(&self, window_id: winit::window::WindowId) -> bool {
-        if let Some(running_state) = self.as_running()
-            && window_id == running_state.win.id()
-        {
-            true
-        } else {
-            false
-        }
     }
 
     fn recreate_swapchain_if_needed(
@@ -568,6 +911,10 @@ impl AppRunner {
             if let Err(e) = running_state.device.wait_idle() {
                 tracing::error!("Error while waiting for device idle on zero extent: {}", e);
                 return false;
+            }
+            for frame in &mut running_state.frames {
+                // SAFETY: wait_idle() succeeded above; no GPU work is in flight.
+                unsafe { frame.release_retained() };
             }
             running_state.swapchain = None;
             return true;
@@ -595,7 +942,7 @@ impl AppRunner {
             &running_state.device,
             &running_state._surface,
             desired_extent,
-            running_state.swapchain.as_ref(),
+            running_state.swapchain.as_ref().map(|sc| sc.as_ref()),
             true,
             Some(running_state.pipeline_color_format),
         ) {
@@ -606,7 +953,7 @@ impl AppRunner {
                     desired_extent.height
                 );
                 let new_format = swapchain.format();
-                running_state.swapchain = Some(swapchain);
+                running_state.swapchain = Some(Arc::new(swapchain));
 
                 if new_format != running_state.pipeline_color_format {
                     tracing::debug!(
@@ -626,7 +973,9 @@ impl AppRunner {
                         Some("main pipeline"),
                     ) {
                         Ok(pipeline) => {
-                            running_state.pipeline = pipeline;
+                            // Arc::clone in draw_frame's retained_pipeline keeps the
+                            // old pipeline alive until each in-flight slot's fence signals.
+                            running_state.pipeline = Arc::new(pipeline);
                             running_state.pipeline_color_format = new_format;
                         }
                         Err(e) => {
@@ -642,6 +991,62 @@ impl AppRunner {
                 tracing::error!("Error while recreating swapchain: {}", e);
                 false
             }
+        }
+    }
+
+    fn desired_extent_for_event(
+        win: &WinitWindow,
+        window_event: &WindowEvent,
+    ) -> Option<rgpu::ash::vk::Extent2D> {
+        match window_event {
+            WindowEvent::Resized(size) => Some(rgpu::ash::vk::Extent2D {
+                width: size.width,
+                height: size.height,
+            }),
+            WindowEvent::ScaleFactorChanged { .. } => {
+                let size = win.inner_size();
+                Some(rgpu::ash::vk::Extent2D {
+                    width: size.width,
+                    height: size.height,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[allow(dead_code, reason = "these functions exist for API completeness")]
+impl AppRunner {
+    fn transition_to_exiting(
+        &mut self,
+        from_state: &'static str,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) {
+        let _span =
+            tracing::debug_span!("state_transition", from = from_state, to = "Exiting").entered();
+        self.set_exiting(ExitingState {});
+        event_loop.exit();
+    }
+
+    fn exit_from_running(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if let Some(running_state) = self.take_running() {
+            // _idle_guard drops first (first field), calling wait_idle before
+            // the swapchain, frames, semaphores, and fences are freed.
+            drop(running_state);
+            self.transition_to_exiting("Running", event_loop);
+        } else {
+            tracing::warn!("Requested Running -> Exiting transition while not in Running state");
+            event_loop.exit();
+        }
+    }
+
+    fn is_running_window(&self, window_id: winit::window::WindowId) -> bool {
+        if let Some(running_state) = self.as_running()
+            && window_id == running_state.win.id()
+        {
+            true
+        } else {
+            false
         }
     }
 
