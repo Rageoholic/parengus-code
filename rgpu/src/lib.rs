@@ -6,6 +6,7 @@
               refactoring annoying"
 )]
 
+pub mod command;
 pub mod device;
 pub mod instance;
 pub mod log;
@@ -13,6 +14,7 @@ pub mod pipeline;
 pub mod shader;
 pub mod surface;
 pub mod swapchain;
+pub mod sync;
 
 pub use ash;
 pub use raw_window_handle::HandleError as RWHHandleError;

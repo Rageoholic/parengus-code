@@ -1,6 +1,6 @@
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use crate::device::{Device, NameObjectError};
@@ -170,6 +170,9 @@ pub struct Swapchain<T: HasDisplayHandle + HasWindowHandle> {
     extent: vk::Extent2D,
     images: Vec<vk::Image>,
     image_views: Option<Vec<vk::ImageView>>,
+    /// Serializes `vkAcquireNextImageKHR`, which the Vulkan spec requires to
+    /// be externally synchronized with respect to the swapchain handle.
+    acquire_lock: Mutex<()>,
 }
 
 struct SwapchainDebugWithSource<'a, T: HasDisplayHandle + HasWindowHandle + std::fmt::Debug>(
@@ -462,6 +465,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
             extent,
             images,
             image_views,
+            acquire_lock: Mutex::new(()),
         }
     }
 
@@ -483,6 +487,36 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
 
     pub fn image_views(&self) -> Option<&[vk::ImageView]> {
         self.image_views.as_deref()
+    }
+
+    /// Acquire the next presentable image from the swapchain.
+    ///
+    /// Logically mutates the swapchain (dequeues a GPU image slot), though
+    /// no Rust-visible fields change. `&self` is required because the swapchain
+    /// is typically shared via `Arc`.
+    ///
+    /// Returns `(image_index, suboptimal)`. When `suboptimal` is `true` the
+    /// swapchain is still usable but recreation is recommended.
+    ///
+    /// Returns `Err(vk::Result::ERROR_OUT_OF_DATE_KHR)` when the swapchain is
+    /// incompatible with the surface and must be recreated.
+    ///
+    /// # Safety
+    /// `semaphore` and `fence`, when not null, must be valid unsignaled handles
+    /// created from this swapchain's device.
+    pub unsafe fn acquire_next_image(
+        &self,
+        timeout_ns: u64,
+        semaphore: vk::Semaphore,
+        fence: vk::Fence,
+    ) -> Result<(u32, bool), vk::Result> {
+        let _guard = self.acquire_lock.lock().expect("swapchain acquire lock poisoned");
+        // SAFETY: Caller guarantees semaphore and fence validity. self.handle
+        // is valid for the lifetime of this Swapchain.
+        unsafe {
+            self.parent_device
+                .acquire_next_swapchain_image(self.handle, timeout_ns, semaphore, fence)
+        }
     }
 }
 

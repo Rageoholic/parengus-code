@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ash::vk;
@@ -20,6 +20,13 @@ enum DynamicRenderingLoader {
     Extension(ash::khr::dynamic_rendering::Device),
 }
 
+enum Synchronization2Loader {
+    /// Vulkan 1.3+: synchronization2 is core; dispatch through `ash::Device`.
+    Core,
+    /// Vulkan < 1.3: loaded via `VK_KHR_synchronization2`.
+    Extension(ash::khr::synchronization2::Device),
+}
+
 #[allow(dead_code)]
 pub struct Device {
     parent: Arc<Instance>,
@@ -27,11 +34,14 @@ pub struct Device {
     swapchain_device: Option<ash::khr::swapchain::Device>,
     debug_utils_device: Option<ash::ext::debug_utils::Device>,
     dynamic_rendering: Option<DynamicRenderingLoader>,
+    synchronization2: Synchronization2Loader,
     swapchain_name_counter: AtomicU64,
     physical_device: vk::PhysicalDevice,
-    graphics_present_queue: (vk::Queue, u32),
-    transfer_queue: (vk::Queue, u32),
-    compute_queue: (vk::Queue, u32),
+    /// Aliased queues share the same `Arc<Mutex<vk::Queue>>` so that locking
+    /// either role serializes on the same underlying resource.
+    graphics_present_queue: (Arc<Mutex<vk::Queue>>, u32),
+    transfer_queue: (Arc<Mutex<vk::Queue>>, u32),
+    compute_queue: (Arc<Mutex<vk::Queue>>, u32),
 }
 
 impl std::fmt::Debug for Device {
@@ -82,6 +92,12 @@ pub enum CreateCompatibleError {
          supported by the selected physical device"
     )]
     DynamicRenderingNotAvailable,
+
+    #[error(
+        "VK_KHR_synchronization2 is not supported by the selected physical device \
+         (required on Vulkan < 1.3)"
+    )]
+    Synchronization2NotAvailable,
 }
 
 #[derive(Debug, Error)]
@@ -320,6 +336,22 @@ impl Device {
             }
         }
 
+        // VK_KHR_synchronization2: core in 1.3, extension on older drivers.
+        // `use_sync2_ext` is true only when the extension loader must be used.
+        let use_sync2_ext = if is_pre_1_3 {
+            let has_sync2 = device_exts
+                .iter()
+                .any(|ext| ext.extension_name_as_c_str() == Ok(ash::khr::synchronization2::NAME));
+            if has_sync2 {
+                mandatory_exts.push(ash::khr::synchronization2::NAME);
+                true
+            } else {
+                return Err(CreateCompatibleError::Synchronization2NotAvailable);
+            }
+        } else {
+            false
+        };
+
         // VK_KHR_dynamic_rendering: core in 1.3, extension on older drivers.
         // `use_dr_ext` is true only when the extension loader must be used.
         let use_dr_ext = if config.dynamic_rendering && is_pre_1_3 {
@@ -338,7 +370,7 @@ impl Device {
 
         let ext_ptrs: Vec<*const i8> = mandatory_exts.iter().map(|e| e.as_ptr()).collect();
 
-        // Enable synchronization2
+        // Enable synchronization2 (core 1.3 or via VK_KHR_synchronization2).
         let mut sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
         // Enable dynamic rendering if requested (core 1.3 or via extension).
@@ -375,6 +407,22 @@ impl Device {
         let transfer_queue_handle = get_next_queue(transfer_family);
         let compute_queue_handle = get_next_queue(compute_family);
 
+        // Aliased queues (same underlying VkQueue handle) must share a single
+        // Mutex so that locking any role serializes on the same resource.
+        let gfx_queue_arc = Arc::new(Mutex::new(graphics_present_queue_handle));
+        let transfer_queue_arc = if transfer_queue_handle == graphics_present_queue_handle {
+            Arc::clone(&gfx_queue_arc)
+        } else {
+            Arc::new(Mutex::new(transfer_queue_handle))
+        };
+        let compute_queue_arc = if compute_queue_handle == graphics_present_queue_handle {
+            Arc::clone(&gfx_queue_arc)
+        } else if compute_queue_handle == transfer_queue_handle {
+            Arc::clone(&transfer_queue_arc)
+        } else {
+            Arc::new(Mutex::new(compute_queue_handle))
+        };
+
         Ok(Self {
             parent: instance.clone(),
             swapchain_device: if config.swapchain {
@@ -394,12 +442,17 @@ impl Device {
             } else {
                 None
             },
+            synchronization2: if use_sync2_ext {
+                Synchronization2Loader::Extension(instance.create_synchronization2_loader(&device))
+            } else {
+                Synchronization2Loader::Core
+            },
             swapchain_name_counter: AtomicU64::new(0),
             handle: device,
             physical_device,
-            graphics_present_queue: (graphics_present_queue_handle, graphics_present_family),
-            transfer_queue: (transfer_queue_handle, transfer_family),
-            compute_queue: (compute_queue_handle, compute_family),
+            graphics_present_queue: (gfx_queue_arc, graphics_present_family),
+            transfer_queue: (transfer_queue_arc, transfer_family),
+            compute_queue: (compute_queue_arc, compute_family),
         })
     }
 
@@ -506,6 +559,66 @@ impl Device {
     pub unsafe fn destroy_raw_image_view(&self, image_view: vk::ImageView) {
         // SAFETY: Caller guarantees image_view provenance and drop ordering.
         unsafe { self.handle.destroy_image_view(image_view, None) };
+    }
+
+    /// Acquire the next presentable swapchain image.
+    ///
+    /// Returns `(image_index, is_suboptimal)`. A suboptimal result means the
+    /// image was acquired successfully but the swapchain no longer exactly
+    /// matches the surface; recreation at the next opportunity is recommended.
+    ///
+    /// Returns `Err(vk::Result::ERROR_OUT_OF_DATE_KHR)` when the swapchain is
+    /// incompatible with the surface and must be recreated before presentation
+    /// can resume.
+    ///
+    /// # Safety
+    /// `swapchain` must be a valid handle created from this device.
+    /// `semaphore` and `fence`, when not null, must be valid unsignaled handles
+    /// created from this device.
+    pub unsafe fn acquire_next_swapchain_image(
+        &self,
+        swapchain: vk::SwapchainKHR,
+        timeout_ns: u64,
+        semaphore: vk::Semaphore,
+        fence: vk::Fence,
+    ) -> Result<(u32, bool), vk::Result> {
+        let swapchain_device = self
+            .swapchain_device
+            .as_ref()
+            .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
+        // SAFETY: Caller guarantees swapchain, semaphore, and fence validity.
+        unsafe { swapchain_device.acquire_next_image(swapchain, timeout_ns, semaphore, fence) }
+    }
+
+    /// Present a rendered swapchain image to the surface via the
+    /// graphics/present queue.
+    ///
+    /// Returns `Ok(true)` when the swapchain is suboptimal and should be
+    /// recreated at the next opportunity.
+    ///
+    /// Returns `Err(vk::Result::ERROR_OUT_OF_DATE_KHR)` when recreation is
+    /// mandatory before the next present.
+    ///
+    /// # Safety
+    /// All handles in `present_info` must be valid and derived from this
+    /// device. Wait semaphores must be signaled. The presented image must be in
+    /// `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` and not referenced by any pending
+    /// GPU work other than this presentation.
+    pub unsafe fn queue_present(
+        &self,
+        present_info: &vk::PresentInfoKHR<'_>,
+    ) -> Result<bool, vk::Result> {
+        let swapchain_device = self
+            .swapchain_device
+            .as_ref()
+            .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
+        let queue = self
+            .graphics_present_queue
+            .0
+            .lock()
+            .expect("graphics/present queue lock poisoned");
+        // SAFETY: Caller guarantees all handles and synchronization requirements.
+        unsafe { swapchain_device.queue_present(*queue, present_info) }
     }
 
     pub fn has_swapchain_support(&self) -> bool {
@@ -727,7 +840,10 @@ impl Device {
             None => Err(DynamicRenderingError::NotEnabled),
             Some(DynamicRenderingLoader::Core) => {
                 // SAFETY: Caller guarantees command_buffer and rendering_info validity.
-                unsafe { self.handle.cmd_begin_rendering(command_buffer, rendering_info) };
+                unsafe {
+                    self.handle
+                        .cmd_begin_rendering(command_buffer, rendering_info)
+                };
                 Ok(())
             }
             Some(DynamicRenderingLoader::Extension(loader)) => {
@@ -761,6 +877,316 @@ impl Device {
                 Ok(())
             }
         }
+    }
+}
+
+// Queue submit functionality
+impl Device {
+    /// Submit work to the graphics/present queue using the synchronization2 API.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled. `fence`, when not null,
+    /// must be an unsignaled fence created from this device.
+    pub unsafe fn graphics_present_queue_submit2(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        let queue = self
+            .graphics_present_queue
+            .0
+            .lock()
+            .expect("graphics/present queue lock poisoned");
+        match &self.synchronization2 {
+            // SAFETY: Caller guarantees all handle validity and synchronization state.
+            Synchronization2Loader::Core => unsafe {
+                self.handle.queue_submit2(*queue, submits, fence)
+            },
+            // SAFETY: Caller guarantees all handle validity and synchronization state.
+            Synchronization2Loader::Extension(loader) => unsafe {
+                loader.queue_submit2(*queue, submits, fence)
+            },
+        }
+    }
+}
+
+// Recording commands
+impl Device {
+    /// Record a pipeline barrier using the synchronization2 API.
+    ///
+    /// # Safety
+    /// `command_buffer` must be a valid handle in the recording state, derived
+    /// from this device. All handles and image layouts in `dependency_info`
+    /// must be valid and consistent with the command buffer's current state.
+    pub unsafe fn cmd_pipeline_barrier2(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        dependency_info: &vk::DependencyInfo<'_>,
+    ) {
+        // SAFETY: Caller guarantees command_buffer and dependency_info validity.
+        match &self.synchronization2 {
+            // SAFETY: Caller guarantees command_buffer and dependency_info validity.
+            Synchronization2Loader::Core => unsafe {
+                self.handle
+                    .cmd_pipeline_barrier2(command_buffer, dependency_info)
+            },
+            // SAFETY: Caller guarantees command_buffer and dependency_info validity.
+            Synchronization2Loader::Extension(loader) => unsafe {
+                loader.cmd_pipeline_barrier2(command_buffer, dependency_info)
+            },
+        }
+    }
+
+    /// Bind a graphics pipeline for subsequent draw commands.
+    ///
+    /// # Safety
+    /// `command_buffer` must be in the recording state. `pipeline` must be a
+    /// valid graphics pipeline created from this device.
+    pub unsafe fn cmd_bind_graphics_pipeline(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        pipeline: vk::Pipeline,
+    ) {
+        // SAFETY: Caller guarantees command_buffer state and pipeline validity.
+        unsafe {
+            self.handle
+                .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline)
+        }
+    }
+
+    /// Set the viewport dynamically.
+    ///
+    /// # Safety
+    /// `command_buffer` must be in the recording state with a pipeline bound
+    /// that declares `VK_DYNAMIC_STATE_VIEWPORT`.
+    pub unsafe fn cmd_set_viewport(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        viewports: &[vk::Viewport],
+    ) {
+        // SAFETY: Caller guarantees command_buffer state and pipeline dynamic state.
+        unsafe { self.handle.cmd_set_viewport(command_buffer, 0, viewports) }
+    }
+
+    /// Set the scissor rectangle dynamically.
+    ///
+    /// # Safety
+    /// `command_buffer` must be in the recording state with a pipeline bound
+    /// that declares `VK_DYNAMIC_STATE_SCISSOR`.
+    pub unsafe fn cmd_set_scissor(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        scissors: &[vk::Rect2D],
+    ) {
+        // SAFETY: Caller guarantees command_buffer state and pipeline dynamic state.
+        unsafe { self.handle.cmd_set_scissor(command_buffer, 0, scissors) }
+    }
+
+    /// Record a non-indexed draw call.
+    ///
+    /// # Safety
+    /// `command_buffer` must be in the recording state inside an active render
+    /// pass, with a compatible graphics pipeline bound and all required dynamic
+    /// state set.
+    pub unsafe fn cmd_draw(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) {
+        // SAFETY: Caller guarantees render pass and pipeline state validity.
+        unsafe {
+            self.handle.cmd_draw(
+                command_buffer,
+                vertex_count,
+                instance_count,
+                first_vertex,
+                first_instance,
+            )
+        }
+    }
+}
+
+// Command pool functionality
+impl Device {
+    /// # Safety
+    /// `create_info` must have a valid `queue_family_index` for this device.
+    /// All referenced pointers must remain valid for the duration of the call.
+    pub unsafe fn create_raw_command_pool(
+        &self,
+        create_info: &vk::CommandPoolCreateInfo<'_>,
+    ) -> Result<vk::CommandPool, vk::Result> {
+        // SAFETY: Caller guarantees create_info validity and queue family provenance.
+        unsafe { self.handle.create_command_pool(create_info, None) }
+    }
+
+    /// # Safety
+    /// `pool` must be a valid handle created from this device and not yet
+    /// destroyed. All command buffers allocated from it must have finished
+    /// execution and must not be referenced by any pending GPU work.
+    pub unsafe fn destroy_raw_command_pool(&self, pool: vk::CommandPool) {
+        // SAFETY: Caller guarantees pool provenance and drop ordering.
+        unsafe { self.handle.destroy_command_pool(pool, None) };
+    }
+
+    /// # Safety
+    /// `pool` must be a valid handle created from this device. All command
+    /// buffers allocated from it must not be pending execution on the GPU.
+    pub unsafe fn reset_raw_command_pool(
+        &self,
+        pool: vk::CommandPool,
+        flags: vk::CommandPoolResetFlags,
+    ) -> Result<(), vk::Result> {
+        // SAFETY: Caller guarantees pool provenance and command buffer idle state.
+        unsafe { self.handle.reset_command_pool(pool, flags) }
+    }
+
+    /// # Safety
+    /// `allocate_info.command_pool` must be a valid pool created from this
+    /// device. `command_buffer_count` must be non-zero.
+    pub unsafe fn allocate_raw_command_buffers(
+        &self,
+        allocate_info: &vk::CommandBufferAllocateInfo<'_>,
+    ) -> Result<Vec<vk::CommandBuffer>, vk::Result> {
+        // SAFETY: Caller guarantees allocate_info validity and pool provenance.
+        unsafe { self.handle.allocate_command_buffers(allocate_info) }
+    }
+
+    /// # Safety
+    /// `command_buffer` must be in the initial or executable state and must
+    /// not be pending execution. All pointers in `begin_info` must remain
+    /// valid for the duration of the call.
+    pub unsafe fn begin_raw_command_buffer(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        begin_info: &vk::CommandBufferBeginInfo<'_>,
+    ) -> Result<(), vk::Result> {
+        // SAFETY: Caller guarantees command_buffer state and begin_info validity.
+        unsafe { self.handle.begin_command_buffer(command_buffer, begin_info) }
+    }
+
+    /// # Safety
+    /// `command_buffer` must be in the recording state.
+    pub unsafe fn end_raw_command_buffer(
+        &self,
+        command_buffer: vk::CommandBuffer,
+    ) -> Result<(), vk::Result> {
+        // SAFETY: Caller guarantees command_buffer is in the recording state.
+        unsafe { self.handle.end_command_buffer(command_buffer) }
+    }
+
+    /// # Safety
+    /// `command_buffer` must not be pending execution on the GPU. The pool it
+    /// was allocated from must have been created with
+    /// `RESET_COMMAND_BUFFER`.
+    pub unsafe fn reset_raw_command_buffer(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        flags: vk::CommandBufferResetFlags,
+    ) -> Result<(), vk::Result> {
+        // SAFETY: Caller guarantees command_buffer is not pending and pool flag is set.
+        unsafe { self.handle.reset_command_buffer(command_buffer, flags) }
+    }
+
+    /// Free command buffers back to their source pool, returning memory to the
+    /// pool's internal allocator.
+    ///
+    /// A no-op when `command_buffers` is empty.
+    ///
+    /// # Safety
+    /// - All handles in `command_buffers` must have been allocated from `pool`.
+    /// - No buffer in `command_buffers` may be pending execution on the GPU.
+    /// - The caller must externally synchronize access to `pool` (e.g. by
+    ///   ensuring no other thread is allocating or resetting from it
+    ///   concurrently).
+    pub unsafe fn free_raw_command_buffers(
+        &self,
+        pool: vk::CommandPool,
+        command_buffers: &[vk::CommandBuffer],
+    ) {
+        if command_buffers.is_empty() {
+            return;
+        }
+        // SAFETY: Caller guarantees pool/buffer provenance, idle state, and
+        // external synchronization on pool.
+        unsafe { self.handle.free_command_buffers(pool, command_buffers) }
+    }
+}
+
+// Fence and semaphore functionality
+impl Device {
+    /// # Safety
+    /// `create_info` must be a valid fence create info. All referenced pointers
+    /// must remain valid for the duration of the call.
+    pub unsafe fn create_raw_fence(
+        &self,
+        create_info: &vk::FenceCreateInfo<'_>,
+    ) -> Result<vk::Fence, vk::Result> {
+        // SAFETY: Caller guarantees create_info validity.
+        unsafe { self.handle.create_fence(create_info, None) }
+    }
+
+    /// # Safety
+    /// `fence` must be a valid handle created from this device and not yet
+    /// destroyed. No GPU work may reference this fence at time of destruction.
+    pub unsafe fn destroy_raw_fence(&self, fence: vk::Fence) {
+        // SAFETY: Caller guarantees fence provenance and drop ordering.
+        unsafe { self.handle.destroy_fence(fence, None) };
+    }
+
+    /// # Safety
+    /// All handles in `fences` must be valid fences created from this device.
+    pub unsafe fn wait_for_raw_fences(
+        &self,
+        fences: &[vk::Fence],
+        wait_all: bool,
+        timeout_ns: u64,
+    ) -> Result<(), vk::Result> {
+        // SAFETY: Caller guarantees fence handle validity.
+        unsafe { self.handle.wait_for_fences(fences, wait_all, timeout_ns) }
+    }
+
+    /// # Safety
+    /// All handles in `fences` must be valid fences created from this device
+    /// and must not be currently pending on any queue submission.
+    pub unsafe fn reset_raw_fences(&self, fences: &[vk::Fence]) -> Result<(), vk::Result> {
+        // SAFETY: Caller guarantees fence handle validity and non-pending state.
+        unsafe { self.handle.reset_fences(fences) }
+    }
+
+    /// Query whether a fence is signaled.
+    ///
+    /// Returns `Ok(true)` if signaled, `Ok(false)` if not yet signaled.
+    ///
+    /// # Safety
+    /// `fence` must be a valid handle created from this device and not yet
+    /// destroyed.
+    pub unsafe fn get_raw_fence_status(&self, fence: vk::Fence) -> Result<bool, vk::Result> {
+        // SAFETY: Caller guarantees fence provenance and validity.
+        unsafe { self.handle.get_fence_status(fence) }
+    }
+
+    /// # Safety
+    /// `create_info` must be a valid semaphore create info. All referenced
+    /// pointers must remain valid for the duration of the call.
+    pub unsafe fn create_raw_semaphore(
+        &self,
+        create_info: &vk::SemaphoreCreateInfo<'_>,
+    ) -> Result<vk::Semaphore, vk::Result> {
+        // SAFETY: Caller guarantees create_info validity.
+        unsafe { self.handle.create_semaphore(create_info, None) }
+    }
+
+    /// # Safety
+    /// `semaphore` must be a valid handle created from this device and not yet
+    /// destroyed. No GPU work may be waiting on or about to signal it.
+    pub unsafe fn destroy_raw_semaphore(&self, semaphore: vk::Semaphore) {
+        // SAFETY: Caller guarantees semaphore provenance and drop ordering.
+        unsafe { self.handle.destroy_semaphore(semaphore, None) };
     }
 }
 
