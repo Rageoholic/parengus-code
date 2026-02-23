@@ -29,8 +29,9 @@ use winit::{
     window::{Window as WinitWindow, WindowAttributes},
 };
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
-#[derive(clap::ValueEnum)]
+#[derive(
+    Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default, clap::ValueEnum,
+)]
 enum TracingLogLevel {
     Off,
     Trace,
@@ -254,13 +255,6 @@ struct RunningStateTransitionGuard {
     device: Arc<Device>,
 }
 
-impl std::fmt::Debug for RunningStateTransitionGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RunningStateTransitionGuard")
-            .finish_non_exhaustive()
-    }
-}
-
 impl RunningStateTransitionGuard {
     /// # Safety
     /// This guard **must** be dropped rather than forgotten. Dropping it calls
@@ -289,7 +283,6 @@ struct InitializingState {
     device_config: DeviceConfig,
     self_dir: std::path::PathBuf,
 }
-#[derive(Debug)]
 struct RunningState {
     /// First field: drops first, calling `wait_idle` before all other
     /// resources.
@@ -307,6 +300,24 @@ struct RunningState {
     frames: Vec<FrameSync>,
     current_frame: usize,
 }
+
+impl std::fmt::Debug for RunningState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunningState")
+            .field("win", &self.win)
+            .field("device", &self.device)
+            .field("_surface", &self._surface)
+            .field("swapchain", &self.swapchain)
+            .field("shader", &self.shader)
+            .field("pipeline", &self.pipeline)
+            .field("pipeline_color_format", &self.pipeline_color_format)
+            .field("command_pool", &self.command_pool)
+            .field("frames", &self.frames)
+            .field("current_frame", &self.current_frame)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 struct SuspendedState {
     win: Arc<WinitWindow>,

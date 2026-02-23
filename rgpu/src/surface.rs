@@ -73,7 +73,7 @@ impl<T: HasWindowHandle + HasDisplayHandle> Surface<T> {
     /// Creates a new surface associated with the source. We might want to
     /// separate the DisplayHandle source and the WindowHandle source but rn
     /// winit doesn't seem to require it and I feel like any good windowing lib
-    /// wouldn't. We'll do some reasearch in the future
+    /// wouldn't. We'll do some research in the future
     ///
     /// # Safety
     /// This must be dropped on events like suspend in winit due to the surface
