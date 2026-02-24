@@ -20,7 +20,7 @@ use rgpu::{
     sync::{Fence, Semaphore},
 };
 use tracing_subscriber::{
-    Layer, layer::SubscriberExt, util::SubscriberInitExt,
+    Layer, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
 };
 use winit::{
     application::ApplicationHandler,
@@ -43,17 +43,16 @@ enum TracingLogLevel {
     Error,
 }
 
-impl From<TracingLogLevel> for tracing::Level {
+impl From<TracingLogLevel> for LevelFilter {
     fn from(value: TracingLogLevel) -> Self {
+        use tracing_subscriber::filter::LevelFilter;
         match value {
-            //We clamp this to the lowest possible level but this
-            //shouldn't happen
-            TracingLogLevel::Off => tracing::Level::TRACE,
-            TracingLogLevel::Trace => tracing::Level::TRACE,
-            TracingLogLevel::Info => tracing::Level::INFO,
-            TracingLogLevel::Debug => tracing::Level::DEBUG,
-            TracingLogLevel::Warn => tracing::Level::WARN,
-            TracingLogLevel::Error => tracing::Level::ERROR,
+            TracingLogLevel::Off => LevelFilter::OFF,
+            TracingLogLevel::Trace => LevelFilter::TRACE,
+            TracingLogLevel::Info => LevelFilter::INFO,
+            TracingLogLevel::Debug => LevelFilter::DEBUG,
+            TracingLogLevel::Warn => LevelFilter::WARN,
+            TracingLogLevel::Error => LevelFilter::ERROR,
         }
     }
 }
@@ -143,11 +142,7 @@ fn main() -> eyre::Result<()> {
         tracing_subscriber::registry()
             .with(
                 stdout_log
-                    .with_filter(
-                        tracing_subscriber::filter::LevelFilter::from_level(
-                            cli_args.tracing_log_level.into(),
-                        ),
-                    )
+                    .with_filter(LevelFilter::from(cli_args.tracing_log_level))
                     .and_then(file_log),
             )
             .init();
@@ -158,7 +153,11 @@ fn main() -> eyre::Result<()> {
 
     let event_loop = winit::event_loop::EventLoop::builder().build()?;
 
-    //SAFETY: Loads vulkan via libloading which is kinda unsafe but we're fine
+    // SAFETY: Instance::new loads the Vulkan library via
+    // ash::Entry::load (libloading). The loaded Entry must outlive
+    // all Vulkan objects derived from it; wrapping the Instance in
+    // an Arc ensures it stays alive at least as long as any derived
+    // object does.
     let instance = Arc::new(unsafe {
         rgpu::instance::Instance::new(
             "samp-app",
@@ -843,7 +842,13 @@ impl AppRunner {
             }),
         )?);
 
-        //SAFETY: We will drop surface when we enter into `suspend`
+        // SAFETY: Surface must be destroyed only after all swapchains
+        // derived from it are destroyed and no GPU work accesses their
+        // images. Swapchain holds Arc<Surface>, so the surface outlives
+        // the swapchain. Frame slots hold Arc<Swapchain> via
+        // retained_swapchain, which is cleared only after
+        // device.wait_idle() in the suspended() handler — so the
+        // surface is not freed while GPU work is pending.
         let surface = Arc::new(unsafe {
             Surface::new(&state.instance, Arc::clone(&win))
         }?);
@@ -976,7 +981,10 @@ impl AppRunner {
     fn suspended_to_running(
         state: SuspendedState,
     ) -> eyre::Result<RunningState> {
-        //SAFETY: We will drop surface when we enter into `suspend`
+        // SAFETY: Same contract as initializing_to_running: the surface
+        // outlives all derived swapchains via Arc<Surface>, and frame
+        // slots' retained_swapchain Arcs are cleared only after
+        // device.wait_idle() in the next suspended() call.
         let surface = Arc::new(unsafe {
             Surface::new(state.device.get_parent(), Arc::clone(&state.win))
         }?);

@@ -201,15 +201,24 @@ impl Instance {
         //before Entry is dropped (handled in the Drop impl of Instance)
         let entry = unsafe { ash::Entry::load() }.map_err(Error::Loading)?;
 
-        //SAFETY: Basically always fine Relax
+        // SAFETY: entry is a live Vulkan entry (loaded on line 202);
+        // vkEnumerateInstanceVersion has no preconditions beyond a valid
+        // entry point.
         let api_version = unsafe { entry.try_enumerate_instance_version() }
             .unwrap_or(Some(vk::API_VERSION_1_0))
             .unwrap_or(vk::API_VERSION_1_0);
         let mut mandatory_exts = Vec::with_capacity(256);
 
+        // Tracks whether surface extensions were actually enabled on
+        // the instance. Being requested (`enabled_exts.surface`) is
+        // not enough — the platform extensions are only added to
+        // `mandatory_exts` when a display handle source is provided.
+        let mut surface_ext_loaded = false;
+
         if let Some(display_handle_source) = display_handle_source
             && enabled_exts.surface
         {
+            surface_ext_loaded = true;
             // ash_window will be necessary to get a surface later,
             // but surfaces are an extension. This gets those extensions
             // to start as a base to the set of mandatory extensions we
@@ -234,10 +243,12 @@ impl Instance {
             );
         }
 
-        //SAFETY: Pretty much always okay
+        // SAFETY: entry is a live Vulkan entry; passing None queries
+        // global extensions and does not dereference any layer name.
         let instance_exts_avail =
             unsafe { entry.enumerate_instance_extension_properties(None) }?;
-        //SAFETY: Pretty much always okay
+        // SAFETY: entry is a live Vulkan entry;
+        // vkEnumerateInstanceLayerProperties has no additional preconditions.
         let instance_layers_avail =
             unsafe { entry.enumerate_instance_layer_properties() };
 
@@ -372,8 +383,7 @@ impl Instance {
         } else {
             None
         };
-        let surface_instance = enabled_exts
-            .surface
+        let surface_instance = surface_ext_loaded
             .then(|| ash::khr::surface::Instance::new(&entry, &instance));
 
         Ok(Instance {

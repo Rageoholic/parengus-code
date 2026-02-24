@@ -141,17 +141,13 @@ impl Device {
             return Err(CreateCompatibleError::MismatchedParams);
         }
 
-        let mut mandatory_exts: Vec<&CStr> = Vec::with_capacity(2);
-        if config.swapchain {
-            mandatory_exts.push(ash::khr::swapchain::NAME);
-        }
-
-        // Select best physical device.
-        // Gather properties and queue families upfront so we only query once
-        // per device.
-        // Score: (dedicated_queue_count, device_type_priority) — compared
-        // lexicographically so dedicated queues matter most, then device type
-        // breaks ties.
+        // Evaluate every physical device, filtering out those that
+        // lack required extensions or a graphics+present queue, then
+        // score the survivors so we can pick the best.
+        //
+        // Score: (dedicated_queue_count, device_type_priority)
+        // compared lexicographically — dedicated queues matter most,
+        // then device type breaks ties.
         let physical_devices = instance.fetch_physical_devices()?;
         let device_type_priority = |dt: vk::PhysicalDeviceType| -> u32 {
             match dt {
@@ -162,81 +158,211 @@ impl Device {
             }
         };
 
-        struct DeviceInfo {
+        struct DeviceCandidate {
             handle: vk::PhysicalDevice,
             props: vk::PhysicalDeviceProperties,
             queue_families: Vec<vk::QueueFamilyProperties>,
+            graphics_present_family: u32,
             score: (u32, u32),
+            /// True when sync2 must use the extension loader.
+            use_sync2_ext: bool,
+            /// True when dynamic rendering must use the extension loader.
+            use_dr_ext: bool,
+            /// True when VK_KHR_shader_non_semantic_info should be
+            /// enabled (available on this pre-1.3 device).
+            enable_shader_non_semantic: bool,
         }
 
-        let device_infos: Vec<DeviceInfo> = physical_devices
-            .iter()
-            .map(|&dev| {
-                //SAFETY: dev was derived from instance
-                let props =
-                    unsafe { instance.get_raw_physical_device_properties(dev) };
-                //SAFETY: dev was derived from instance
-                let queue_families = unsafe {
-                    instance
-                        .get_raw_physical_device_queue_family_properties(dev)
+        let mut candidates: Vec<DeviceCandidate> = Vec::new();
+
+        'dev: for &dev in &physical_devices {
+            // SAFETY: dev was derived from instance.
+            let props = unsafe {
+                instance.get_raw_physical_device_properties(dev)
+            };
+            // SAFETY: dev was derived from instance.
+            let queue_families = unsafe {
+                instance
+                    .get_raw_physical_device_queue_family_properties(dev)
+            };
+
+            // Use the device's own reported API version so that
+            // per-device capability differences are handled correctly
+            // rather than relying on the single instance-level version.
+            let dev_api =
+                crate::instance::VkVersion::from_raw(props.api_version);
+            let is_pre_1_3 = dev_api.major() < 1
+                || (dev_api.major() == 1 && dev_api.minor() < 3);
+
+            // VK_KHR_swapchain is never promoted to core; always check
+            // it when requested. Other extensions are only extensions on
+            // pre-1.3 devices.
+            let needs_ext_check = config.swapchain || is_pre_1_3;
+            let device_exts: Vec<vk::ExtensionProperties> =
+                if needs_ext_check {
+                    // SAFETY: dev was derived from instance.
+                    match unsafe {
+                        instance
+                            .enumerate_raw_device_extension_properties(dev)
+                    } {
+                        Ok(exts) => exts,
+                        Err(e) => {
+                            tracing::debug!(
+                                "Skipping {:?}: \
+                                 failed to enumerate extensions: {e}",
+                                props
+                                    .device_name_as_c_str()
+                                    .unwrap_or(c"unknown"),
+                            );
+                            continue 'dev;
+                        }
+                    }
+                } else {
+                    Vec::new()
                 };
 
-                let has_dedicated_transfer = queue_families.iter().any(|qf| {
-                    qf.queue_flags.contains(vk::QueueFlags::TRANSFER)
-                        && !qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                });
-                let has_dedicated_compute = queue_families.iter().any(|qf| {
-                    qf.queue_flags.contains(vk::QueueFlags::COMPUTE)
-                        && !qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                });
+            let has_ext = |name: &CStr| -> bool {
+                device_exts
+                    .iter()
+                    .any(|e| e.extension_name_as_c_str() == Ok(name))
+            };
 
-                let dedicated_count = has_dedicated_transfer as u32
-                    + has_dedicated_compute as u32;
-                let score =
-                    (dedicated_count, device_type_priority(props.device_type));
+            // VK_KHR_swapchain is always an extension; filter hard.
+            if config.swapchain && !has_ext(ash::khr::swapchain::NAME) {
+                tracing::debug!(
+                    "Skipping {:?}: missing VK_KHR_swapchain",
+                    props.device_name_as_c_str().unwrap_or(c"unknown"),
+                );
+                continue 'dev;
+            }
 
-                DeviceInfo {
-                    handle: dev,
-                    props,
-                    queue_families,
-                    score,
+            // VK_KHR_synchronization2: core in 1.3; required extension
+            // on older devices — hard filter.
+            let use_sync2_ext = if is_pre_1_3 {
+                if has_ext(ash::khr::synchronization2::NAME) {
+                    true
+                } else {
+                    tracing::debug!(
+                        "Skipping {:?}: missing VK_KHR_synchronization2",
+                        props
+                            .device_name_as_c_str()
+                            .unwrap_or(c"unknown"),
+                    );
+                    continue 'dev;
                 }
-            })
-            .collect();
+            } else {
+                false
+            };
 
-        let best = device_infos
+            // VK_KHR_shader_non_semantic_info: core in 1.3; optional
+            // on older devices.
+            let enable_shader_non_semantic = is_pre_1_3
+                && has_ext(ash::khr::shader_non_semantic_info::NAME);
+
+            // VK_KHR_dynamic_rendering: core in 1.3; required extension
+            // on older devices when dynamic rendering is requested —
+            // hard filter.
+            let use_dr_ext =
+                if config.dynamic_rendering && is_pre_1_3 {
+                    if has_ext(ash::khr::dynamic_rendering::NAME) {
+                        true
+                    } else {
+                        tracing::debug!(
+                            "Skipping {:?}: missing \
+                             VK_KHR_dynamic_rendering",
+                            props
+                                .device_name_as_c_str()
+                                .unwrap_or(c"unknown"),
+                        );
+                        continue 'dev;
+                    }
+                } else {
+                    false
+                };
+
+            // Find a queue family that supports both graphics and
+            // presentation — hard filter.
+            let Some(graphics_present_family) = queue_families
+                .iter()
+                .enumerate()
+                .find_map(|(idx, qf)| {
+                    if !qf
+                        .queue_flags
+                        .contains(vk::QueueFlags::GRAPHICS)
+                    {
+                        return None;
+                    }
+                    // SAFETY: dev and surf are both derived from the
+                    // same instance (validated at the top of this fn).
+                    let ok = unsafe {
+                        surf.supports_queue_family(dev, idx as u32)
+                    };
+                    match ok {
+                        Ok(true) => Some(idx as u32),
+                        _ => None,
+                    }
+                })
+            else {
+                tracing::debug!(
+                    "Skipping {:?}: no graphics+present queue family",
+                    props.device_name_as_c_str().unwrap_or(c"unknown"),
+                );
+                continue 'dev;
+            };
+
+            let has_dedicated_transfer =
+                queue_families.iter().any(|qf| {
+                    qf.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                        && !qf
+                            .queue_flags
+                            .contains(vk::QueueFlags::GRAPHICS)
+                });
+            let has_dedicated_compute =
+                queue_families.iter().any(|qf| {
+                    qf.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                        && !qf
+                            .queue_flags
+                            .contains(vk::QueueFlags::GRAPHICS)
+                });
+
+            let dedicated_count = has_dedicated_transfer as u32
+                + has_dedicated_compute as u32;
+            let score = (
+                dedicated_count,
+                device_type_priority(props.device_type),
+            );
+
+            candidates.push(DeviceCandidate {
+                handle: dev,
+                props,
+                queue_families,
+                graphics_present_family,
+                score,
+                use_sync2_ext,
+                use_dr_ext,
+                enable_shader_non_semantic,
+            });
+        }
+
+        let best = candidates
             .iter()
-            .max_by_key(|info| info.score)
+            .max_by_key(|c| c.score)
             .ok_or(CreateCompatibleError::NoSuitableDevice)?;
 
         let physical_device = best.handle;
         let queue_families = &best.queue_families;
+        let graphics_present_family = best.graphics_present_family;
+        let use_sync2_ext = best.use_sync2_ext;
+        let use_dr_ext = best.use_dr_ext;
         tracing::info!(
-            "Selected physical device: {:?} (type: {:?}, dedicated queues: {})",
-            best.props.device_name_as_c_str().unwrap_or(c"unknown"),
+            "Selected physical device: {:?} \
+             (type: {:?}, dedicated queues: {})",
+            best.props
+                .device_name_as_c_str()
+                .unwrap_or(c"unknown"),
             best.props.device_type,
             best.score.0,
         );
-
-        // Find graphics+present queue family
-        let graphics_present_family = queue_families
-            .iter()
-            .enumerate()
-            .find_map(|(idx, props)| {
-                if !props.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                    return None;
-                }
-                //SAFETY: physical_device was derived from instance, surface
-                //was derived from the same instance
-                let supports_present = unsafe {
-                    surf.supports_queue_family(physical_device, idx as u32)
-                };
-                match supports_present {
-                    Ok(true) => Some(idx as u32),
-                    _ => None,
-                }
-            })
-            .ok_or(CreateCompatibleError::NoGraphicsPresentQueue)?;
 
         // Find dedicated transfer and compute queue families
         let (transfer_family, compute_family) = if matches!(
@@ -249,8 +375,12 @@ impl Device {
                 .iter()
                 .enumerate()
                 .find_map(|(idx, props)| {
-                    if props.queue_flags.contains(vk::QueueFlags::TRANSFER)
-                        && !props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                    if props
+                        .queue_flags
+                        .contains(vk::QueueFlags::TRANSFER)
+                        && !props
+                            .queue_flags
+                            .contains(vk::QueueFlags::GRAPHICS)
                     {
                         Some(idx as u32)
                     } else {
@@ -263,8 +393,12 @@ impl Device {
                 .iter()
                 .enumerate()
                 .find_map(|(idx, props)| {
-                    if props.queue_flags.contains(vk::QueueFlags::COMPUTE)
-                        && !props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                    if props
+                        .queue_flags
+                        .contains(vk::QueueFlags::COMPUTE)
+                        && !props
+                            .queue_flags
+                            .contains(vk::QueueFlags::GRAPHICS)
                     {
                         Some(idx as u32)
                     } else {
@@ -277,16 +411,17 @@ impl Device {
         };
 
         tracing::info!(
-            "Queue families — graphics+present: {}, transfer: {}, compute: {}",
+            "Queue families — graphics+present: {}, \
+             transfer: {}, compute: {}",
             graphics_present_family,
             transfer_family,
             compute_family
         );
 
         // Build deduplicated queue create infos
-        // Count how many queues we need from each family
         let mut family_queue_counts: HashMap<u32, u32> = HashMap::new();
-        for family in [graphics_present_family, transfer_family, compute_family]
+        for family in
+            [graphics_present_family, transfer_family, compute_family]
         {
             *family_queue_counts.entry(family).or_insert(0) += 1;
         }
@@ -296,17 +431,19 @@ impl Device {
             if config.queue_mode == QueueMode::Single {
                 *count = 1;
             } else {
-                let available = queue_families[family as usize].queue_count;
+                let available =
+                    queue_families[family as usize].queue_count;
                 if *count > available {
                     *count = available;
                 }
             }
         }
 
-        let queue_priorities_storage: Vec<Vec<f32>> = family_queue_counts
-            .iter()
-            .map(|(_, &count)| vec![1.0; count as usize])
-            .collect();
+        let queue_priorities_storage: Vec<Vec<f32>> =
+            family_queue_counts
+                .iter()
+                .map(|(_, &count)| vec![1.0; count as usize])
+                .collect();
 
         let queue_create_infos: Vec<vk::DeviceQueueCreateInfo<'_>> =
             family_queue_counts
@@ -319,79 +456,31 @@ impl Device {
                 })
                 .collect();
 
-        let ver = instance.get_supported_ver();
-        let is_pre_1_3 =
-            ver.major() < 1 || (ver.major() == 1 && ver.minor() < 3);
-
-        // Enumerate device extensions once for all pre-1.3 optional checks.
-        let device_exts: Vec<vk::ExtensionProperties> = if is_pre_1_3 {
-            //SAFETY: physical_device was derived from instance
-            unsafe {
-                instance
-                    .enumerate_raw_device_extension_properties(physical_device)
-            }
-            .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // VK_KHR_shader_non_semantic_info: promoted to core in 1.3.
-        if is_pre_1_3 {
-            let has_non_semantic = device_exts.iter().any(|ext| {
-                ext.extension_name_as_c_str()
-                    == Ok(ash::khr::shader_non_semantic_info::NAME)
-            });
-            if has_non_semantic {
-                mandatory_exts.push(ash::khr::shader_non_semantic_info::NAME);
-            }
+        // Build extension list from the selected candidate's flags.
+        let mut mandatory_exts: Vec<&CStr> = Vec::with_capacity(4);
+        if config.swapchain {
+            mandatory_exts.push(ash::khr::swapchain::NAME);
         }
-
-        // VK_KHR_synchronization2: core in 1.3, extension on older drivers.
-        // `use_sync2_ext` is true only when the extension loader must be used.
-        let use_sync2_ext = if is_pre_1_3 {
-            let has_sync2 = device_exts.iter().any(|ext| {
-                ext.extension_name_as_c_str()
-                    == Ok(ash::khr::synchronization2::NAME)
-            });
-            if has_sync2 {
-                mandatory_exts.push(ash::khr::synchronization2::NAME);
-                true
-            } else {
-                return Err(
-                    CreateCompatibleError::Synchronization2NotAvailable,
-                );
-            }
-        } else {
-            false
-        };
-
-        // VK_KHR_dynamic_rendering: core in 1.3, extension on older drivers.
-        // `use_dr_ext` is true only when the extension loader must be used.
-        let use_dr_ext = if config.dynamic_rendering && is_pre_1_3 {
-            let has_dr = device_exts.iter().any(|ext| {
-                ext.extension_name_as_c_str()
-                    == Ok(ash::khr::dynamic_rendering::NAME)
-            });
-            if has_dr {
-                mandatory_exts.push(ash::khr::dynamic_rendering::NAME);
-                true
-            } else {
-                return Err(
-                    CreateCompatibleError::DynamicRenderingNotAvailable,
-                );
-            }
-        } else {
-            false
-        };
+        if best.enable_shader_non_semantic {
+            mandatory_exts
+                .push(ash::khr::shader_non_semantic_info::NAME);
+        }
+        if use_sync2_ext {
+            mandatory_exts.push(ash::khr::synchronization2::NAME);
+        }
+        if use_dr_ext {
+            mandatory_exts.push(ash::khr::dynamic_rendering::NAME);
+        }
 
         let ext_ptrs: Vec<*const i8> =
             mandatory_exts.iter().map(|e| e.as_ptr()).collect();
 
-        // Enable synchronization2 (core 1.3 or via VK_KHR_synchronization2).
+        // Enable synchronization2 (core 1.3 or via extension).
         let mut sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default()
                 .synchronization2(true);
-        // Enable dynamic rendering if requested (core 1.3 or via extension).
+        // Enable dynamic rendering if requested (core 1.3 or via
+        // extension).
         let mut dr_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default()
                 .dynamic_rendering(true);
@@ -401,26 +490,27 @@ impl Device {
             .enabled_extension_names(&ext_ptrs)
             .push_next(&mut sync2_features);
         if config.dynamic_rendering {
-            device_create_info = device_create_info.push_next(&mut dr_features);
+            device_create_info =
+                device_create_info.push_next(&mut dr_features);
         }
 
-        //SAFETY: physical_device was derived from instance, device_create_info
-        //is valid
+        // SAFETY: physical_device was derived from instance;
+        // device_create_info is fully initialised above.
         let device = unsafe {
             instance.create_ash_device(physical_device, &device_create_info)
         }
         .map_err(CreateCompatibleError::DeviceCreationFailed)?;
 
-        // Get queues. For families with multiple queues, assign incrementing
-        // indices. For families where we requested more queues than available,
-        // reuse index 0.
+        // Get queues. For families with multiple queues, assign
+        // incrementing indices. For families where we requested more
+        // queues than available, reuse index 0.
         let mut family_next_index: HashMap<u32, u32> = HashMap::new();
         let mut get_next_queue = |family: u32| -> vk::Queue {
             let idx = family_next_index.entry(family).or_insert(0);
             let max = family_queue_counts[&family];
             let queue_idx = if *idx < max { *idx } else { 0 };
             *idx += 1;
-            //SAFETY: device was just created with this queue family/index
+            // SAFETY: device was just created with this family/index.
             unsafe { device.get_device_queue(family, queue_idx) }
         };
 
@@ -429,9 +519,11 @@ impl Device {
         let transfer_queue_handle = get_next_queue(transfer_family);
         let compute_queue_handle = get_next_queue(compute_family);
 
-        // Aliased queues (same underlying VkQueue handle) must share a single
-        // Mutex so that locking any role serializes on the same resource.
-        let gfx_queue_arc = Arc::new(Mutex::new(graphics_present_queue_handle));
+        // Aliased queues (same underlying VkQueue handle) must share a
+        // single Mutex so that locking any role serializes on the same
+        // resource.
+        let gfx_queue_arc =
+            Arc::new(Mutex::new(graphics_present_queue_handle));
         let transfer_queue_arc =
             if transfer_queue_handle == graphics_present_queue_handle {
                 Arc::clone(&gfx_queue_arc)

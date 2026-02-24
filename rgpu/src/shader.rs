@@ -90,6 +90,10 @@ impl ShaderModule {
         //
         // SAFETY: u32 has no invalid bit patterns and we verified the length
         // is a multiple of 4, so the reinterpretation is sound.
+        // SPIR-V is defined as little-endian, so for the copy path we use
+        // from_le_bytes rather than from_ne_bytes to be correct on all
+        // platforms. The direct borrow path via align_to is only reached on
+        // little-endian targets where native and SPIR-V byte order match.
         let (prefix, aligned_words, _suffix) =
             unsafe { spirv_bytes.align_to::<u32>() };
         let owned;
@@ -98,7 +102,7 @@ impl ShaderModule {
         } else {
             owned = spirv_bytes
                 .chunks_exact(4)
-                .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
                 .collect::<Vec<u32>>();
             &owned
         };
