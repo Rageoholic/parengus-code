@@ -6,7 +6,7 @@ use std::{
 use ash::vk;
 use thiserror::Error;
 
-use crate::device::{Device, DynamicRenderingError, NameObjectError};
+use crate::device::{Device, DynamicRenderingError};
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -112,11 +112,9 @@ impl ResettableCommandPool {
             .map_err(CreateCommandPoolError::Vulkan)?;
 
         // SAFETY: pool is a valid command pool created from device.
-        match unsafe { device.set_object_name_str(pool, name) } {
-            Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-            Err(e) => {
-                tracing::warn!("Failed to name command pool {:?}: {e}", pool)
-            }
+        let name_result = unsafe { device.set_object_name_str(pool, name) };
+        if let Err(e) = name_result {
+            tracing::warn!("Failed to name command pool {:?}: {e}", pool);
         }
 
         let (sender, receiver) = mpsc::channel();

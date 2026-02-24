@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ash::vk;
 use thiserror::Error;
 
-use crate::device::{Device, NameObjectError};
+use crate::device::Device;
 use crate::shader::EntryPoint;
 
 // ---------------------------------------------------------------------------
@@ -174,13 +174,17 @@ impl DynamicPipeline {
     /// Create a [`DynamicPipeline`] from a description.
     ///
     /// `name` is an optional debug label applied via `VK_EXT_debug_utils` when
-    /// the extension is available. Naming failures are logged as warnings and
+    /// the extension is available. The closure is only called when the
+    /// extension is enabled. Naming failures are logged as warnings and
     /// do not cause the call to fail.
-    pub fn new(
+    pub fn new<F>(
         device: &Arc<Device>,
         desc: &DynamicPipelineDesc<'_>,
-        name: Option<&str>,
-    ) -> Result<Self, CreateDynamicPipelineError> {
+        name: Option<F>,
+    ) -> Result<Self, CreateDynamicPipelineError>
+    where
+        F: FnOnce() -> String,
+    {
         if desc.stages.is_empty() {
             return Err(CreateDynamicPipelineError::NoStages);
         }
@@ -275,11 +279,13 @@ impl DynamicPipeline {
                 .map_err(CreateDynamicPipelineError::PipelineCreation)?;
 
         // SAFETY: handle is a valid pipeline created from device.
-        match unsafe { device.set_object_name_str(handle, name) } {
-            Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-            Err(e) => {
-                tracing::warn!("Failed to name pipeline {:?}: {e}", handle)
-            }
+        let name_result = unsafe {
+            device.set_object_name_with(handle, || {
+                std::ffi::CString::new(name?()).ok()
+            })
+        };
+        if let Err(e) = name_result {
+            tracing::warn!("Failed to name pipeline {:?}: {e}", handle);
         }
 
         Ok(Self {

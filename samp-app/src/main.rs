@@ -2,6 +2,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::{
+    cell::Cell,
     fs::{self, File},
     sync::Arc,
 };
@@ -283,6 +284,33 @@ struct InitializingState {
     device_config: DeviceConfig,
     self_dir: std::path::PathBuf,
 }
+#[derive(Debug)]
+struct DebugCounters {
+    swapchain: Cell<u64>,
+    pipeline: Cell<u64>,
+}
+
+impl DebugCounters {
+    fn new() -> Self {
+        Self {
+            swapchain: Cell::new(0),
+            pipeline: Cell::new(0),
+        }
+    }
+
+    fn next_swapchain(&self) -> u64 {
+        let n = self.swapchain.get() + 1;
+        self.swapchain.set(n);
+        n
+    }
+
+    fn next_pipeline(&self) -> u64 {
+        let n = self.pipeline.get() + 1;
+        self.pipeline.set(n);
+        n
+    }
+}
+
 struct RunningState {
     /// First field: drops first, calling `wait_idle` before all other
     /// resources.
@@ -299,6 +327,7 @@ struct RunningState {
     command_pool: ResettableCommandPool,
     frames: Vec<FrameSync>,
     current_frame: usize,
+    debug_counters: DebugCounters,
 }
 
 impl std::fmt::Debug for RunningState {
@@ -314,6 +343,7 @@ impl std::fmt::Debug for RunningState {
             .field("command_pool", &self.command_pool)
             .field("frames", &self.frames)
             .field("current_frame", &self.current_frame)
+            .field("debug_counters", &self.debug_counters)
             .finish_non_exhaustive()
     }
 }
@@ -327,6 +357,7 @@ struct SuspendedState {
     pipeline_color_format: vk::Format,
     command_pool: ResettableCommandPool,
     frames: Vec<FrameSync>,
+    debug_counters: DebugCounters,
 }
 #[derive(Debug)]
 struct ExitingState {}
@@ -395,6 +426,7 @@ impl ApplicationHandler for AppRunner {
                 command_pool,
                 mut frames,
                 current_frame: _,
+                debug_counters,
             } = running_state;
 
             if let Err(e) = device.wait_idle() {
@@ -422,6 +454,7 @@ impl ApplicationHandler for AppRunner {
                 pipeline_color_format,
                 command_pool,
                 frames,
+                debug_counters,
             });
         }
     }
@@ -776,12 +809,15 @@ impl AppRunner {
     }
 }
 
-fn build_pipeline(
+fn build_pipeline<F>(
     device: &Arc<Device>,
     shader: &ShaderModule,
     color_format: vk::Format,
-    name: Option<&str>,
-) -> eyre::Result<DynamicPipeline> {
+    name: Option<F>,
+) -> eyre::Result<DynamicPipeline>
+where
+    F: FnOnce() -> String,
+{
     let vert = shader.entry_point("vert_main", ShaderStage::Vertex)?;
     let frag = shader.entry_point("frag_main", ShaderStage::Fragment)?;
     Ok(DynamicPipeline::new(
@@ -819,6 +855,7 @@ impl AppRunner {
         )?);
 
         let win_size = win.inner_size();
+        let debug_counters = DebugCounters::new();
         let swapchain = if win_size.width == 0 || win_size.height == 0 {
             tracing::trace!(
                 "Skipping initial swapchain create because window \
@@ -828,6 +865,7 @@ impl AppRunner {
             );
             None
         } else {
+            let sc_idx = debug_counters.next_swapchain();
             let requested_extent = vk::Extent2D {
                 width: win_size.width,
                 height: win_size.height,
@@ -844,6 +882,7 @@ impl AppRunner {
                 requested_extent,
                 true,
                 None,
+                Some(move || format!("Swapchain {sc_idx}")),
             )?;
             drop(swapchain_create_span);
             Some(Arc::new(swapchain))
@@ -875,7 +914,10 @@ impl AppRunner {
                 &device,
                 &shader,
                 pipeline_color_format,
-                Some("main pipeline"),
+                Some({
+                    let idx = debug_counters.next_pipeline();
+                    move || format!("main pipeline {idx}")
+                }),
             )?)
         };
 
@@ -927,6 +969,7 @@ impl AppRunner {
             command_pool,
             frames,
             current_frame: 0,
+            debug_counters,
         })
     }
 
@@ -939,6 +982,7 @@ impl AppRunner {
         }?);
 
         let win_size = state.win.inner_size();
+        let debug_counters = state.debug_counters;
         let swapchain = if win_size.width == 0 || win_size.height == 0 {
             tracing::trace!(
                 "Skipping swapchain create on resume because window \
@@ -948,6 +992,7 @@ impl AppRunner {
             );
             None
         } else {
+            let sc_idx = debug_counters.next_swapchain();
             Some(Arc::new(Swapchain::new(
                 &state.device,
                 &surface,
@@ -957,6 +1002,7 @@ impl AppRunner {
                 },
                 true,
                 Some(state.pipeline_color_format),
+                Some(move || format!("Swapchain {sc_idx}")),
             )?))
         };
 
@@ -984,7 +1030,10 @@ impl AppRunner {
                             &state.device,
                             &state.shader,
                             new_format,
-                            Some("main pipeline"),
+                            Some({
+                                let idx = debug_counters.next_pipeline();
+                                move || format!("main pipeline {idx}")
+                            }),
                         )?)
                     };
                     (pipeline, new_format)
@@ -1009,6 +1058,7 @@ impl AppRunner {
             command_pool: state.command_pool,
             frames: state.frames,
             current_frame: 0,
+            debug_counters,
         })
     }
 
@@ -1058,6 +1108,7 @@ impl AppRunner {
         )
         .entered();
 
+        let sc_idx = running_state.debug_counters.next_swapchain();
         match Swapchain::new_with_old(
             &running_state.device,
             &running_state._surface,
@@ -1065,6 +1116,7 @@ impl AppRunner {
             running_state.swapchain.as_ref().map(|sc| sc.as_ref()),
             true,
             Some(running_state.pipeline_color_format),
+            Some(move || format!("Swapchain {sc_idx}")),
         ) {
             Ok(swapchain) => {
                 tracing::trace!(
@@ -1091,7 +1143,11 @@ impl AppRunner {
                         &running_state.device,
                         &running_state.shader,
                         new_format,
-                        Some("main pipeline"),
+                        Some({
+                            let idx =
+                                running_state.debug_counters.next_pipeline();
+                            move || format!("main pipeline {idx}")
+                        }),
                     ) {
                         Ok(pipeline) => {
                             // Arc::clone in draw_frame's retained_pipeline
