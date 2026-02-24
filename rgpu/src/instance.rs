@@ -272,7 +272,7 @@ impl Instance {
             })
             .unwrap_or(false);
 
-        let mut enabled_exts: Vec<_> =
+        let mut enabled_ext_ptrs: Vec<_> =
             mandatory_exts.iter().map(|ext| ext.as_ptr()).collect();
         let mut enabled_layers: Vec<*const i8> = Vec::new();
 
@@ -281,7 +281,7 @@ impl Instance {
             && debug_utils_available
             && validation_layer_available
         {
-            enabled_exts.push(debug_utils_ext_name.as_ptr());
+            enabled_ext_ptrs.push(debug_utils_ext_name.as_ptr());
             enabled_layers.push(validation_layer_name.as_ptr());
 
             let message_severity = match log_level {
@@ -330,7 +330,7 @@ impl Instance {
 
         let mut instance_create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
-            .enabled_extension_names(&enabled_exts)
+            .enabled_extension_names(&enabled_ext_ptrs)
             .enabled_layer_names(&enabled_layers);
 
         if let Some(ref mut debug_info) = debug_messenger_create_info {
@@ -372,8 +372,9 @@ impl Instance {
         } else {
             None
         };
-        let surface_instance =
-            Some(ash::khr::surface::Instance::new(&entry, &instance));
+        let surface_instance = enabled_exts
+            .surface
+            .then(|| ash::khr::surface::Instance::new(&entry, &instance));
 
         Ok(Instance {
             entry,
