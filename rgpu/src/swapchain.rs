@@ -3,7 +3,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-use crate::device::{Device, NameObjectError};
+use crate::device::Device;
 use crate::surface::{Surface, SurfaceQueryError};
 
 #[derive(Debug, Error)]
@@ -126,7 +126,6 @@ fn choose_composite_alpha(
 fn create_default_swapchain_image_views<FCreate, FDestroy, FName>(
     images: &[vk::Image],
     format: vk::Format,
-    swapchain_debug_index: u64,
     mut create_image_view: FCreate,
     mut destroy_image_view: FDestroy,
     mut name_image_view: FName,
@@ -164,7 +163,6 @@ where
             }
         };
 
-        let _ = swapchain_debug_index;
         name_image_view(index, image_view);
         image_views.push(image_view);
     }
@@ -236,13 +234,17 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
     /// surface supports it, the swapchain will use that format. Falls back to
     /// the default selection (B8G8R8A8_UNORM + SRGB_NONLINEAR) if not
     /// available.
-    pub fn new(
+    pub fn new<F>(
         parent_device: &Arc<Device>,
         parent_surface: &Arc<Surface<T>>,
         desired_extent: vk::Extent2D,
         create_image_views: bool,
         preferred_format: Option<vk::Format>,
-    ) -> Result<Self, CreateSwapchainError> {
+        debug_name: Option<F>,
+    ) -> Result<Self, CreateSwapchainError>
+    where
+        F: FnOnce() -> String,
+    {
         Self::new_with_old(
             parent_device,
             parent_surface,
@@ -250,6 +252,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
             None,
             create_image_views,
             preferred_format,
+            debug_name,
         )
     }
 
@@ -275,14 +278,18 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
     /// old swapchain is safe for the application's frame lifecycle.
     ///
     /// See [`new`](Self::new) for the semantics of `preferred_format`.
-    pub fn new_with_old(
+    pub fn new_with_old<F>(
         parent_device: &Arc<Device>,
         parent_surface: &Arc<Surface<T>>,
         desired_extent: vk::Extent2D,
         old_swapchain: Option<&Self>,
         create_image_views: bool,
         preferred_format: Option<vk::Format>,
-    ) -> Result<Self, CreateSwapchainError> {
+        debug_name: Option<F>,
+    ) -> Result<Self, CreateSwapchainError>
+    where
+        F: FnOnce() -> String,
+    {
         if !parent_device.has_swapchain_support() {
             return Err(CreateSwapchainError::SwapchainNotEnabled);
         }
@@ -367,20 +374,22 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         let handle = unsafe {
             parent_device.create_raw_swapchain(&swapchain_create_info)
         }?;
-        let swapchain_debug_index = parent_device.next_swapchain_debug_index();
-        // SAFETY: `handle` is a valid swapchain created from `parent_device`.
-        match unsafe {
+        // Wrap in LazyCell: the closure is evaluated at most once,
+        // and only if set_object_name_with actually invokes it
+        // (i.e. only when debug_utils is enabled).
+        let lazy_name = debug_name.map(std::cell::LazyCell::new);
+        // SAFETY: `handle` is a valid swapchain created from
+        // `parent_device`.
+        let name_result = unsafe {
             parent_device.set_object_name_with(handle, || {
-                std::ffi::CString::new(format!(
-                    "Swapchain {swapchain_debug_index}"
-                ))
+                std::ffi::CString::new(
+                    lazy_name.as_deref()?.as_str(),
+                )
                 .ok()
             })
-        } {
-            Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-            Err(e) => {
-                tracing::warn!("Failed to name swapchain {:?}: {e}", handle)
-            }
+        };
+        if let Err(e) = name_result {
+            tracing::warn!("Failed to name swapchain {:?}: {e}", handle);
         }
         // SAFETY: handle was created by this device's swapchain loader
         // and is valid.
@@ -392,21 +401,23 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
             })?;
 
         for (index, image) in images.iter().copied().enumerate() {
-            // SAFETY: image is a valid swapchain image owned by parent_device.
-            match unsafe {
+            // SAFETY: image is a valid swapchain image owned by
+            // parent_device.
+            let name_result = unsafe {
                 parent_device.set_object_name_with(image, || {
+                    let name = lazy_name.as_deref()?;
                     std::ffi::CString::new(format!(
-                        "Swapchain {swapchain_debug_index} Image {}",
+                        "{name} Image {}",
                         index + 1,
                     ))
                     .ok()
                 })
-            } {
-                Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-                Err(e) => tracing::warn!(
+            };
+            if let Err(e) = name_result {
+                tracing::warn!(
                     "Failed to name swapchain image {:?}: {e}",
                     image
-                ),
+                );
             }
         }
 
@@ -415,7 +426,6 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
                 create_default_swapchain_image_views(
                     &images,
                     surface_format.format,
-                    swapchain_debug_index,
                     |create_info| {
                         // SAFETY: create_info references a valid
                         // swapchain image from this device, and uses a
@@ -435,25 +445,25 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
                     |index, image_view| {
                         // SAFETY: image_view is valid and created
                         // from parent_device.
-                        match unsafe {
+                        let name_result = unsafe {
                             parent_device.set_object_name_with(
                                 image_view,
                                 || {
+                                    let name = lazy_name.as_deref()?;
                                     std::ffi::CString::new(format!(
-                                        "Swapchain {swapchain_debug_index} \
-                                     ImageView {}",
+                                        "{name} ImageView {}",
                                         index + 1,
                                     ))
                                     .ok()
                                 },
                             )
-                        } {
-                            Ok(())
-                            | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-                            Err(e) => tracing::warn!(
-                                "Failed to name swapchain image view {:?}: {e}",
+                        };
+                        if let Err(e) = name_result {
+                            tracing::warn!(
+                                "Failed to name swapchain \
+                                 image view {:?}: {e}",
                                 image_view
-                            ),
+                            );
                         }
                     },
                 )
@@ -722,7 +732,6 @@ mod tests {
         let result = create_default_swapchain_image_views(
             &images,
             vk::Format::B8G8R8A8_UNORM,
-            1,
             |_| {
                 let mut call = create_calls.borrow_mut();
                 let ret = match *call {
@@ -756,7 +765,6 @@ mod tests {
         let result = create_default_swapchain_image_views(
             &images,
             vk::Format::B8G8R8A8_UNORM,
-            2,
             |_| {
                 let mut call = create_calls.borrow_mut();
                 let view = views[*call];

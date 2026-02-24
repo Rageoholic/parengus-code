@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ash::vk;
 use thiserror::Error;
 
-use crate::device::{Device, NameObjectError};
+use crate::device::Device;
 
 #[derive(Debug, Error)]
 pub enum CreateShaderModuleError {
@@ -110,11 +110,9 @@ impl ShaderModule {
             .map_err(CreateShaderModuleError::Vulkan)?;
 
         // SAFETY: handle is a valid shader module created from device.
-        match unsafe { device.set_object_name_str(handle, name) } {
-            Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-            Err(e) => {
-                tracing::warn!("Failed to name shader module {:?}: {e}", handle)
-            }
+        let name_result = unsafe { device.set_object_name_str(handle, name) };
+        if let Err(e) = name_result {
+            tracing::warn!("Failed to name shader module {:?}: {e}", handle);
         }
 
         Ok(Self {

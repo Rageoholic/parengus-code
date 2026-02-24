@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ash::vk;
 use thiserror::Error;
 
-use crate::device::{Device, NameObjectError};
+use crate::device::Device;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -77,9 +77,9 @@ impl Fence {
             .map_err(CreateFenceError::Vulkan)?;
 
         // SAFETY: handle is a valid fence created from device.
-        match unsafe { device.set_object_name_str(handle, name) } {
-            Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-            Err(e) => tracing::warn!("Failed to name fence {:?}: {e}", handle),
+        let name_result = unsafe { device.set_object_name_str(handle, name) };
+        if let Err(e) = name_result {
+            tracing::warn!("Failed to name fence {:?}: {e}", handle);
         }
 
         Ok(Self {
@@ -201,11 +201,9 @@ impl Semaphore {
             .map_err(CreateSemaphoreError::Vulkan)?;
 
         // SAFETY: handle is a valid semaphore created from device.
-        match unsafe { device.set_object_name_str(handle, name) } {
-            Ok(()) | Err(NameObjectError::DebugUtilsNotEnabled) => {}
-            Err(e) => {
-                tracing::warn!("Failed to name semaphore {:?}: {e}", handle)
-            }
+        let name_result = unsafe { device.set_object_name_str(handle, name) };
+        if let Err(e) = name_result {
+            tracing::warn!("Failed to name semaphore {:?}: {e}", handle);
         }
 
         Ok(Self {

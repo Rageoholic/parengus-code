@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -35,7 +34,6 @@ pub struct Device {
     debug_utils_device: Option<ash::ext::debug_utils::Device>,
     dynamic_rendering: Option<DynamicRenderingLoader>,
     synchronization2: Synchronization2Loader,
-    swapchain_name_counter: AtomicU64,
     physical_device: vk::PhysicalDevice,
     /// Aliased queues share the same `Arc<Mutex<vk::Queue>>` so that locking
     /// either role serializes on the same underlying resource.
@@ -108,9 +106,6 @@ pub enum DynamicRenderingError {
 
 #[derive(Debug, Error)]
 pub enum NameObjectError {
-    #[error("Debug utils extension is not enabled on this device")]
-    DebugUtilsNotEnabled,
-
     #[error("Invalid Vulkan object name (contains interior NUL): {0}")]
     InvalidName(std::ffi::NulError),
 
@@ -479,7 +474,6 @@ impl Device {
             } else {
                 Synchronization2Loader::Core
             },
-            swapchain_name_counter: AtomicU64::new(0),
             handle: device,
             physical_device,
             graphics_present_queue: (gfx_queue_arc, graphics_present_family),
@@ -660,10 +654,6 @@ impl Device {
     pub fn has_swapchain_support(&self) -> bool {
         self.swapchain_device.is_some()
     }
-
-    pub(crate) fn next_swapchain_debug_index(&self) -> u64 {
-        self.swapchain_name_counter.fetch_add(1, Ordering::Relaxed) + 1
-    }
 }
 
 //Debug naming functionality
@@ -684,10 +674,9 @@ impl Device {
     where
         H: vk::Handle,
     {
-        let debug_utils = self
-            .debug_utils_device
-            .as_ref()
-            .ok_or(NameObjectError::DebugUtilsNotEnabled)?;
+        let Some(debug_utils) = self.debug_utils_device.as_ref() else {
+            return Ok(());
+        };
 
         let Some(name) = name else {
             return Ok(());
@@ -721,7 +710,7 @@ impl Device {
         F: FnOnce() -> Option<CString>,
     {
         if self.debug_utils_device.is_none() {
-            return Err(NameObjectError::DebugUtilsNotEnabled);
+            return Ok(());
         }
 
         let name = name_provider();
