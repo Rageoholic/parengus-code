@@ -40,3 +40,11 @@ For things rustfmt cannot wrap (comments, string literals, `#[derive(...)]`):
 
 Only exceed 80 columns when there is no syntactically valid way to break
 the line (e.g., a single token or URL that is itself longer than 80 chars).
+
+## AI Disclosure
+
+For externally visible project artifacts, explicitly disclose AI assistance.
+
+- Keep a clear AI attribution note in `README.md`.
+- When creating or updating standalone publishable text (issue bodies,
+  release notes, long design docs), include an explicit AI-assistance note.

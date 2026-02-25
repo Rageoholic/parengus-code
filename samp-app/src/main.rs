@@ -33,13 +33,20 @@ use winit::{
 #[derive(
     Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default, clap::ValueEnum,
 )]
+/// Log verbosity level for tracing output.
 enum TracingLogLevel {
+    /// Disable tracing logs.
     Off,
+    /// Very detailed execution logs.
     Trace,
+    /// Informational runtime events.
     Info,
+    /// Debug-level diagnostics.
     Debug,
+    /// Warnings and errors only.
     Warn,
     #[default]
+    /// Errors only.
     Error,
 }
 
@@ -58,20 +65,34 @@ impl From<TracingLogLevel> for LevelFilter {
 }
 
 #[derive(clap::Parser, Debug)]
+#[command(about = "Sample Vulkan app", long_about = None)]
 struct CliArgs {
+    /// Tracing verbosity for stdout/file logging.
     #[arg(short, long, default_value = "error")]
     tracing_log_level: TracingLogLevel,
+
+    /// Vulkan validation/debug callback severity threshold.
     #[arg(short, long)]
     graphics_debug_level: Option<CliVulkanLogLevel>,
+
+    /// Queue-family selection strategy for graphics/present.
     #[arg(long, default_value = "auto")]
     queue_mode: CliQueueMode,
+
+    /// Load debug-info shader binary (`shader.debug.spv`) for RenderDoc.
+    #[arg(long)]
+    shader_debug_info: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+/// Queue-family selection policy.
 enum CliQueueMode {
     #[default]
+    /// Pick the best available mode automatically.
     Auto,
+    /// Prefer one family for graphics and present when possible.
     Unified,
+    /// Use a single queue/family path.
     Single,
 }
 
@@ -86,10 +107,15 @@ impl From<CliQueueMode> for QueueMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+/// Vulkan validation/debug callback severity threshold.
 enum CliVulkanLogLevel {
+    /// Include verbose diagnostics.
     Verbose,
+    /// Include informational messages and above.
     Info,
+    /// Include warnings and errors.
     Warning,
+    /// Include errors only.
     Error,
 }
 
@@ -177,6 +203,7 @@ fn main() -> eyre::Result<()> {
         instance,
         device_config,
         self_dir: self_dir.to_owned(),
+        shader_debug_info: cli_args.shader_debug_info,
     })));
 
     tracing::trace!("Entering main event loop");
@@ -282,6 +309,7 @@ struct InitializingState {
     instance: Arc<Instance>,
     device_config: DeviceConfig,
     self_dir: std::path::PathBuf,
+    shader_debug_info: bool,
 }
 #[derive(Debug)]
 struct DebugCounters {
@@ -894,14 +922,34 @@ impl AppRunner {
         };
 
         let shader_dir = state.self_dir.join("shaders");
+        let shader_default_path = shader_dir.join("shader.spv");
+        let shader_debug_path = shader_dir.join("shader.debug.spv");
+        let shader_path = if state.shader_debug_info {
+            if shader_debug_path.exists() {
+                shader_debug_path
+            } else {
+                tracing::warn!(
+                    path = %shader_debug_path.display(),
+                    "Shader debug info requested but debug shader was not \
+                     found; falling back to non-debug shader"
+                );
+                shader_default_path.clone()
+            }
+        } else {
+            shader_default_path.clone()
+        };
         let shader = {
             let _span = tracing::trace_span!(
                 "shader_load",
-                path = ?shader_dir.join("shader.spv")
+                path = ?shader_path
             )
             .entered();
-            let shader_bytes = std::fs::read(shader_dir.join("shader.spv"))
-                .map_err(|e| eyre::eyre!("Error loading shader.spv: {e}"))?;
+            let shader_bytes = std::fs::read(&shader_path).map_err(|e| {
+                eyre::eyre!(
+                    "Error loading shader {}: {e}",
+                    shader_path.display()
+                )
+            })?;
             ShaderModule::new(&device, &shader_bytes, Some("shader"))?
         };
 
