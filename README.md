@@ -41,6 +41,14 @@ explicit `unsafe {}` blocks, satisfying
 - `slangc` on `PATH` (for shader compilation)
 - Vulkan runtime / drivers
 
+## Setup
+
+After cloning, activate the project's git hooks:
+
+```sh
+git config core.hooksPath .githooks
+```
+
 ## Build and run (debug)
 
 From repository root:

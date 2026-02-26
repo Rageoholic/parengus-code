@@ -2,7 +2,7 @@
 set -e
 
 echo "Running per-package clippy checks..."
-for pkg in rgpu samp-app; do
+for pkg in rgpu-vk samp-app; do
     echo "  Checking $pkg..."
     cargo clippy -p "$pkg" --all-targets -- -D warnings
 done
