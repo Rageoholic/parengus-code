@@ -312,11 +312,6 @@ const MAX_FRAMES_IN_FLIGHT: usize = 2;
 #[derive(Debug)]
 struct FrameSync {
     image_available: Semaphore,
-    /// Signaled by the queue submit when rendering of this frame is complete.
-    /// Waited on by `vkQueuePresentKHR`. Lives here (not keyed by
-    /// swapchain image) so it is not destroyed when the swapchain is
-    /// recreated mid-flight.
-    render_finished: Semaphore,
     in_flight_fence: Fence,
     command_buffer: ResettableCommandBuffer,
     /// Keeps the swapchain alive until this frame slot's fence signals.
@@ -332,6 +327,16 @@ struct FrameSync {
     /// start of the next use of this slot. This prevents a retired pipeline
     /// from being destroyed while in-flight command buffers still reference it.
     retained_pipeline: Option<Arc<DynamicPipeline>>,
+    /// Keeps the render-finished semaphores alive until this frame slot's
+    /// fence signals.
+    ///
+    /// Binary semaphores used for render→present synchronisation must be
+    /// indexed by swapchain image, not by frame-in-flight slot; see
+    /// https://docs.vulkan.org/guide/latest/swapchain_semaphore_reuse.html.
+    /// The `Arc` here ensures the semaphore array outlives any in-flight
+    /// present operation that may still hold a reference after a swapchain
+    /// recreate.
+    retained_render_finished: Option<Arc<Vec<Semaphore>>>,
 }
 
 impl FrameSync {
@@ -344,6 +349,7 @@ impl FrameSync {
     unsafe fn release_retained(&mut self) {
         self.retained_swapchain = None;
         self.retained_pipeline = None;
+        self.retained_render_finished = None;
     }
 }
 
@@ -433,6 +439,10 @@ struct RunningState {
     // `None` means the window/surface is currently zero-sized. We stay in
     // Running and recreate on the next non-zero resize/scale event.
     swapchain: Option<Arc<Swapchain<WinitWindow>>>,
+    /// One render-finished semaphore per swapchain image, indexed by the
+    /// image index from `vkAcquireNextImageKHR`. `None` iff `swapchain`
+    /// is `None`.
+    render_finished_semaphores: Option<Arc<Vec<Semaphore>>>,
     shader: ShaderModule,
     pipeline: Arc<DynamicPipeline>,
     vertex_buffer: Arc<DeviceLocalBuffer>,
@@ -538,6 +548,7 @@ impl ApplicationHandler for AppRunner {
                 device,
                 _surface: _,
                 swapchain: _,
+                render_finished_semaphores: _,
                 shader,
                 pipeline,
                 vertex_buffer,
@@ -675,6 +686,24 @@ enum DrawFrameOutcome {
 }
 
 impl AppRunner {
+    /// Create one binary semaphore per swapchain image for render→present
+    /// synchronisation. Semaphores are named `"render finished img[N]"`.
+    fn make_render_finished_semaphores(
+        device: &Arc<Device>,
+        image_count: usize,
+    ) -> eyre::Result<Arc<Vec<Semaphore>>> {
+        let sems = (0..image_count)
+            .map(|i| {
+                Semaphore::new(
+                    device,
+                    Some(&format!("render finished img[{i}]")),
+                )
+                .map_err(eyre::Report::from)
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        Ok(Arc::new(sems))
+    }
+
     fn draw_frame(state: &mut RunningState) -> DrawFrameOutcome {
         // Skip if the window is currently zero-sized (no swapchain).
         if state.swapchain.is_none() {
@@ -742,8 +771,16 @@ impl AppRunner {
         // Clone the retained reference now while sc is borrowed; sc's
         // borrow ends here.
         let retained = Arc::clone(sc);
+        // Clone the Arc so we can retain it in the frame slot later while
+        // still holding `render_finished` as a raw handle.
+        let retained_rf = Arc::clone(
+            state
+                .render_finished_semaphores
+                .as_ref()
+                .expect("render_finished_semaphores present with swapchain"),
+        );
         let render_finished =
-            state.frames[frame_idx].render_finished.raw_semaphore();
+            retained_rf[image_index as usize].raw_semaphore();
 
         let fence = state.frames[frame_idx].in_flight_fence.raw_fence();
         let pipeline_handle = state.pipeline.raw_pipeline();
@@ -922,6 +959,8 @@ impl AppRunner {
         state.frames[frame_idx].retained_swapchain = Some(retained);
         state.frames[frame_idx].retained_pipeline =
             Some(Arc::clone(&state.pipeline));
+        state.frames[frame_idx].retained_render_finished =
+            Some(retained_rf);
 
         // Present — wait on render_finished.
         let present_info = vk::PresentInfoKHR::default()
@@ -1187,10 +1226,6 @@ impl AppRunner {
                         &device,
                         Some(&format!("image available [{i}]")),
                     )?,
-                    render_finished: Semaphore::new(
-                        &device,
-                        Some(&format!("render finished [{i}]")),
-                    )?,
                     in_flight_fence: Fence::new(
                         &device,
                         true,
@@ -1199,9 +1234,20 @@ impl AppRunner {
                     command_buffer: command_pool.allocate_command_buffer()?,
                     retained_swapchain: None,
                     retained_pipeline: None,
+                    retained_render_finished: None,
                 })
             })
             .collect::<eyre::Result<Vec<_>>>()?;
+
+        let render_finished_semaphores = swapchain
+            .as_ref()
+            .map(|sc| {
+                Self::make_render_finished_semaphores(
+                    &device,
+                    sc.images().len(),
+                )
+            })
+            .transpose()?;
 
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
         let idle_guard =
@@ -1212,6 +1258,7 @@ impl AppRunner {
             device,
             _surface: surface,
             swapchain,
+            render_finished_semaphores,
             shader,
             pipeline,
             vertex_buffer,
@@ -1296,6 +1343,16 @@ impl AppRunner {
                 (state.pipeline, state.pipeline_color_format)
             };
 
+        let render_finished_semaphores = swapchain
+            .as_ref()
+            .map(|sc| {
+                Self::make_render_finished_semaphores(
+                    &state.device,
+                    sc.images().len(),
+                )
+            })
+            .transpose()?;
+
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
         let idle_guard = unsafe {
             RunningStateTransitionGuard::new(Arc::clone(&state.device))
@@ -1306,6 +1363,7 @@ impl AppRunner {
             device: state.device,
             _surface: surface,
             swapchain,
+            render_finished_semaphores,
             shader: state.shader,
             pipeline,
             vertex_buffer: state.vertex_buffer,
@@ -1342,6 +1400,7 @@ impl AppRunner {
                 unsafe { frame.release_retained() };
             }
             running_state.swapchain = None;
+            running_state.render_finished_semaphores = None;
             return true;
         }
 
@@ -1381,7 +1440,24 @@ impl AppRunner {
                     desired_extent.height
                 );
                 let new_format = swapchain.format();
+                let image_count = swapchain.images().len();
                 running_state.swapchain = Some(Arc::new(swapchain));
+                match Self::make_render_finished_semaphores(
+                    &running_state.device,
+                    image_count,
+                ) {
+                    Ok(sems) => {
+                        running_state.render_finished_semaphores = Some(sems);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Error recreating render-finished \
+                             semaphores: {}",
+                            e
+                        );
+                        return false;
+                    }
+                }
 
                 if new_format != running_state.pipeline_color_format {
                     tracing::debug!(
