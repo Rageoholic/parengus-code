@@ -1,0 +1,19 @@
+[package]
+name = "rgpu-vk"
+version = "0.1.0"
+edition = "2024"
+description = "Personal Vulkan RAII wrappers (ash-based); not intended for general use"
+license = "MPL-2.0"
+repository = "https://github.com/Rageoholic/parengus-code"
+readme = "README.md"
+keywords = ["vulkan", "graphics", "gpu", "rendering", "ash"]
+categories = ["rendering::graphics-api"]
+
+[dependencies]
+ash = "0.38"
+ash-window = "0.13"
+bytemuck = "1.25.0"
+gpu-allocator = "0.28.0"
+raw-window-handle = { version = "0.6", features = ["std"] }
+thiserror = "2"
+tracing = "0.1"

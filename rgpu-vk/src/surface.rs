@@ -1,3 +1,13 @@
+//! Window-surface wrapper ([`Surface<T>`]).
+//!
+//! A `Surface<T>` ties a raw `VkSurfaceKHR` to the window/display
+//! handle source `T` that was used to create it via `Arc`, preventing
+//! `T` from being dropped while the surface is still alive. The parent
+//! [`Instance`] is also held via `Arc` for the same reason.
+//!
+//! Surfaces must be explicitly dropped (or recreated) on events that
+//! invalidate them, such as a winit suspend.
+
 use std::sync::Arc;
 
 use ash::vk;
@@ -9,9 +19,9 @@ use crate::instance::Instance;
 #[derive(Debug, Error)]
 pub enum CreateSurfaceError {
     #[error("Couldn't get display handle: {0}")]
-    InvalidDisplayHandle(raw_window_handle::HandleError),
+    InvalidDisplayHandle(crate::RwhHandleError),
     #[error("Couldn't get window handle: {0}")]
-    InvalidWindowHandle(raw_window_handle::HandleError),
+    InvalidWindowHandle(crate::RwhHandleError),
     #[error("Vulkan surface creation failed: {0}")]
     VulkanError(ash::vk::Result),
     #[error(
@@ -37,6 +47,14 @@ pub enum SurfaceQueryError {
     Vulkan(vk::Result),
 }
 
+/// An owned `VkSurfaceKHR` tied to its window/display handle source.
+///
+/// Holds the parent [`Instance`] and source `T` via `Arc` to ensure
+/// both outlive the surface. The raw handle is destroyed by
+/// `vkDestroySurfaceKHR` on drop.
+///
+/// Drop this and all derived swapchains on surface-invalidating
+/// events such as winit `Suspended`.
 pub struct Surface<T: HasWindowHandle + HasDisplayHandle> {
     parent_instance: Arc<Instance>,
     handle: ash::vk::SurfaceKHR,

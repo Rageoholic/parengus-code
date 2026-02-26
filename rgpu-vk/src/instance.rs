@@ -1,8 +1,16 @@
+//! Vulkan instance creation and physical device enumeration.
+//!
+//! The central type is [`Instance`], which wraps an `ash::Instance` and
+//! owns the entry-point loader, an optional debug messenger, and an
+//! optional surface instance extension loader. It exposes physical device
+//! queries and unsafe constructors for surfaces and logical devices.
+//!
+//! [`VkVersion`] is a thin newtype over the packed Vulkan version word.
+
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
 
-use crate::log::VulkanLogLevel;
 use crate::surface::{
     CreateSurfaceError, SurfaceQueryError, SurfaceSupportError,
 };
@@ -12,6 +20,26 @@ use std::{
     str::FromStr,
 };
 
+/// Minimum severity level for Vulkan validation layer messages.
+///
+/// Passed to [`Instance::new`] as `max_log_level`. Messages at or
+/// above the chosen level are forwarded to the [`tracing`] subscriber;
+/// lower-severity messages are suppressed. Variants are ordered
+/// least-to-most severe: `Verbose < Info < Warning < Error`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub enum VulkanLogLevel {
+    Verbose,
+    Info,
+    Warning,
+    Error,
+}
+
+/// A packed Vulkan API version number.
+///
+/// Wraps the 32-bit encoding used by `VkApplicationInfo` and
+/// `vkEnumerateInstanceVersion`. Construct from components with
+/// [`new`](Self::new), or wrap an already-encoded word with
+/// [`from_raw`](Self::from_raw).
 #[derive(Debug, Clone, Copy)]
 pub struct VkVersion(u32);
 
@@ -51,6 +79,15 @@ impl VkVersion {
     }
 }
 
+/// The root Vulkan object.
+///
+/// Owns the `ash::Entry` loader, the `ash::Instance` handle, an
+/// optional debug messenger, and optional surface extension state.
+/// All objects derived from an instance hold an `Arc<Instance>` to
+/// keep it alive.
+///
+/// Construct via [`Instance::new`], which is `unsafe` because it
+/// loads a Vulkan shared library through `libloading`.
 pub struct Instance {
     entry: ash::Entry,
     handle: ash::Instance,
@@ -73,7 +110,7 @@ pub enum InstanceCreationError {
     #[error("Could not load Vulkan: {0}")]
     Loading(ash::LoadingError),
     #[error("Couldn't get display handle from passed value: {0}")]
-    InvalidDisplayHandle(raw_window_handle::HandleError),
+    InvalidDisplayHandle(crate::RwhHandleError),
     #[error("Missing mandatory instance extensions: {0:?}")]
     MissingExtensions(Vec<String>),
     #[error("Unknown Vulkan Error {0}")]
@@ -171,6 +208,12 @@ unsafe extern "system" fn vulkan_debug_callback(
     vk::FALSE
 }
 
+/// Optional instance-level extensions for [`Instance::new`].
+///
+/// Defaults to all `false`. Set `surface` to `true` to request the
+/// platform-specific surface extensions for `VkSurfaceKHR` support.
+/// A `display_handle_source` must also be provided so the required
+/// extension names can be enumerated.
 #[derive(Debug, Default)]
 pub struct InstanceExtensions {
     pub surface: bool,
@@ -421,7 +464,7 @@ impl Instance {
 
     /// Get a vector of handles to available physical devices. These handles are
     /// ONLY valid in the context of this instance.
-    pub fn fetch_physical_devices(
+    pub fn fetch_raw_physical_devices(
         &self,
     ) -> Result<Vec<vk::PhysicalDevice>, FetchPhysicalDeviceError> {
         //SAFETY: Pretty much always fine
@@ -512,6 +555,10 @@ impl Instance {
         }
     }
 
+    /// The Vulkan API version negotiated at instance creation time.
+    ///
+    /// This is the version reported by `vkEnumerateInstanceVersion`,
+    /// not necessarily the version requested by the application.
     pub fn supported_ver(&self) -> VkVersion {
         self.ver
     }

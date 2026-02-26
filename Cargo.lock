@@ -1285,7 +1285,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rgpu"
+name = "rgpu-vk"
 version = "0.1.0"
 dependencies = [
  "ash",
@@ -1355,7 +1355,7 @@ dependencies = [
  "clap",
  "directories",
  "eyre",
- "rgpu",
+ "rgpu-vk",
  "supports-color",
  "tracing",
  "tracing-subscriber",

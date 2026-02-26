@@ -1,3 +1,17 @@
+//! SPIR-V shader module and entry point view.
+//!
+//! [`ShaderModule`] wraps a `VkShaderModule` created from raw SPIR-V
+//! bytes. It handles byte-alignment internally: if the slice is already
+//! `u32`-aligned the bytes are borrowed directly; otherwise they are
+//! copied and reinterpreted as little-endian 32-bit words.
+//!
+//! [`EntryPoint`] is a lightweight borrow-view that pairs a module with
+//! an entry point name and [`ShaderStage`]. Create one via
+//! [`ShaderModule::entry_point`] and pass it to [`DynamicPipelineDesc`]
+//! to compose pipeline stages.
+//!
+//! [`DynamicPipelineDesc`]: crate::pipeline::DynamicPipelineDesc
+
 use std::ffi::CString;
 use std::sync::Arc;
 
@@ -52,6 +66,15 @@ impl From<ShaderStage> for vk::ShaderStageFlags {
     }
 }
 
+/// An owned wrapper around a `VkShaderModule`.
+///
+/// Created from raw SPIR-V bytes via [`new`](Self::new). Call
+/// [`entry_point`](Self::entry_point) to get an [`EntryPoint`] view
+/// for composing into pipeline stages.
+///
+/// It is safe to drop a `ShaderModule` after a pipeline that uses it
+/// has been created; Vulkan no longer needs the module object once
+/// pipeline compilation is complete.
 pub struct ShaderModule {
     parent: Arc<Device>,
     handle: vk::ShaderModule,

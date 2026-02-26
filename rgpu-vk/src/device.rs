@@ -1,3 +1,21 @@
+//! Logical device wrapper ([`Device`]).
+//!
+//! `Device` wraps a `VkDevice` and centralises all per-device state:
+//! a `gpu-allocator` allocator (behind a `Mutex`), extension loaders
+//! for swapchain, dynamic rendering, synchronization2, and debug utils,
+//! plus the graphics/present queue and its family index.
+//!
+//! Physical device selection uses a priority-based fold: discrete GPUs
+//! outrank integrated GPUs, and only devices that satisfy all required
+//! extensions and queue families are considered.
+//! [`Device::create_compatible`] wraps this selection and returns the
+//! highest-priority match.
+//!
+//! All raw Vulkan operations on the device handle are surfaced as
+//! `unsafe fn` methods prefixed with `raw_` (e.g. `create_raw_buffer`).
+//! Higher-level wrappers in sibling modules call these rather than
+//! accessing `ash::Device` directly.
+
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -33,6 +51,16 @@ enum Synchronization2Loader {
     Extension(ash::khr::synchronization2::Device),
 }
 
+/// A logical Vulkan device and its associated per-device state.
+///
+/// Wraps an `ash::Device`, a `gpu-allocator` allocator (behind a
+/// `Mutex`), extension loaders for swapchain / dynamic rendering /
+/// synchronization2 / debug utils, and the graphics+present queue.
+///
+/// Constructed via [`Device::create_compatible`], which selects the
+/// best physical device by priority (discrete > integrated). Raw
+/// Vulkan operations are exposed as `unsafe fn` methods prefixed
+/// with `raw_`.
 #[allow(dead_code)]
 pub struct Device {
     parent: Arc<Instance>,
@@ -147,6 +175,16 @@ pub struct DeviceConfig {
 }
 
 impl Device {
+    /// Create a logical device compatible with `surf`.
+    ///
+    /// Selects the highest-priority physical device that satisfies all
+    /// requirements in `config` and can present to `surf`.
+    ///
+    /// The name `create_compatible` is intentional: the API does not yet
+    /// expose physical devices as a first-class concept, so callers
+    /// cannot select one themselves. This name signals that the
+    /// selection is automatic and may change in a future API revision
+    /// once physical-device enumeration is surfaced.
     pub fn create_compatible<T: HasDisplayHandle + HasWindowHandle>(
         instance: &Arc<Instance>,
         surf: &Surface<T>,
@@ -163,7 +201,7 @@ impl Device {
         // Score: (dedicated_queue_count, device_type_priority)
         // compared lexicographically — dedicated queues matter most,
         // then device type breaks ties.
-        let physical_devices = instance.fetch_physical_devices()?;
+        let physical_devices = instance.fetch_raw_physical_devices()?;
         let device_type_priority = |dt: vk::PhysicalDeviceType| -> u32 {
             match dt {
                 vk::PhysicalDeviceType::DISCRETE_GPU => 3,

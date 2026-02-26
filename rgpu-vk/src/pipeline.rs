@@ -1,7 +1,20 @@
+//! Graphics pipeline and layout wrappers for dynamic rendering.
+//!
+//! [`DynamicPipeline`] is a graphics pipeline that requires no
+//! `VkRenderPass` object. It is built for use with
+//! `VK_KHR_dynamic_rendering` (Vulkan 1.3 core). Render pass information
+//! is instead provided at draw time via `vkCmdBeginRendering`.
+//!
+//! [`PipelineLayout`] wraps a `VkPipelineLayout` and can be shared
+//! across multiple pipelines via `Arc`. When no layout is provided in
+//! [`DynamicPipelineDesc`], an empty one is created internally.
+
 use std::sync::Arc;
 
 use ash::vk;
 use thiserror::Error;
+
+pub use vk::{CullModeFlags, FrontFace, VertexInputRate};
 
 use crate::device::Device;
 use crate::shader::EntryPoint;
@@ -72,6 +85,7 @@ pub enum CreateDynamicPipelineError {
     PipelineCreation(vk::Result),
 }
 
+/// Describes one vertex buffer binding slot for a [`DynamicPipeline`].
 #[derive(Debug, Clone, Copy)]
 pub struct VertexBindingDesc {
     pub binding: u32,
@@ -89,6 +103,7 @@ impl From<VertexBindingDesc> for vk::VertexInputBindingDescription {
     }
 }
 
+/// Describes one vertex attribute consumed by the vertex shader.
 #[derive(Debug, Clone, Copy)]
 pub struct VertexAttributeDesc {
     pub location: u32,

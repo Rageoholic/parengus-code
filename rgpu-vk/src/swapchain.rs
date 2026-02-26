@@ -1,3 +1,16 @@
+//! Swapchain wrapper ([`Swapchain<T>`]).
+//!
+//! A `Swapchain<T>` manages a `VkSwapchainKHR` and, optionally, a set
+//! of `VkImageView`s for its images. Surface format, present mode,
+//! extent, and image count are chosen automatically from the surface's
+//! reported capabilities. Prefer MAILBOX present mode when available,
+//! falling back to FIFO.
+//!
+//! For resize and suspension events, drop the existing swapchain (after
+//! GPU synchronisation) and construct a new one, or use
+//! [`new_with_old`](Swapchain::new_with_old) to allow driver-level
+//! resource reuse.
+
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::sync::{Arc, Mutex};
@@ -170,6 +183,15 @@ where
     Ok(image_views)
 }
 
+/// An owned `VkSwapchainKHR` together with its images and views.
+///
+/// Holds `Arc` references to the parent [`Device`] and [`Surface<T>`]
+/// to ensure they outlive the swapchain. Optionally owns one
+/// `VkImageView` per image when `create_image_views` is `true`.
+///
+/// Recreate (drop then re-construct, or use
+/// [`new_with_old`](Self::new_with_old)) when the surface is resized
+/// or invalidated.
 pub struct Swapchain<T: HasDisplayHandle + HasWindowHandle> {
     parent_device: Arc<Device>,
     _parent_surface: Arc<Surface<T>>,
@@ -539,6 +561,11 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         &self.images
     }
 
+    /// The image views for this swapchain's images, if they were created.
+    ///
+    /// Returns `None` when `create_image_views` was `false` at
+    /// construction time. Each view corresponds to the image at the
+    /// same index in [`images`](Self::images).
     pub fn image_views(&self) -> Option<&[vk::ImageView]> {
         self.image_views.as_deref()
     }

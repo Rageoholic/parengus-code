@@ -1,3 +1,18 @@
+//! GPU buffer types and the [`BufferHandle`] trait.
+//!
+//! Two concrete buffer wrappers are provided:
+//!
+//! - [`HostVisibleBuffer`] — CPU-writable (`CpuToGpu`) memory, suitable
+//!   for staging or small per-frame uploads. Write data with
+//!   [`write_pod`](HostVisibleBuffer::write_pod).
+//! - [`DeviceLocalBuffer`] — GPU-only memory, highest bandwidth.
+//!   Populate via a one-time copy submission using
+//!   [`upload_from_host_visible`](DeviceLocalBuffer::upload_from_host_visible).
+//!
+//! Both types own their allocation and destroy it on drop.
+//! [`BufferHandle`] is a thin trait for passing either type (or raw
+//! `vk::Buffer` references) to command recording helpers.
+
 use std::sync::Arc;
 
 use ash::vk;
@@ -8,6 +23,12 @@ use thiserror::Error;
 use crate::command::CommandBufferHandle;
 use crate::device::Device;
 
+/// Trait for types that expose a raw `VkBuffer` handle.
+///
+/// Implemented by [`HostVisibleBuffer`] and [`DeviceLocalBuffer`].
+/// Blanket impls cover `&T` and `&mut T`, so both owned wrappers and
+/// borrows of them satisfy the bound. Allows recording helpers (e.g.
+/// `bind_vertex_buffer`) to be generic over concrete buffer types.
 pub trait BufferHandle {
     fn raw_buffer(&self) -> vk::Buffer;
 }
@@ -196,6 +217,11 @@ impl Drop for AllocatedBuffer {
     }
 }
 
+/// A CPU-writable GPU buffer backed by `CpuToGpu` memory.
+///
+/// Suitable for staging uploads or small per-frame data. Write data
+/// with [`write_pod`](Self::write_pod), which copies bytes into the
+/// mapped region and flushes non-coherent memory ranges as needed.
 pub struct HostVisibleBuffer {
     inner: AllocatedBuffer,
 }
@@ -310,6 +336,11 @@ impl BufferHandle for HostVisibleBuffer {
     }
 }
 
+/// A GPU-only buffer backed by `GpuOnly` memory.
+///
+/// Provides the highest memory bandwidth but cannot be written by the
+/// CPU directly. Populate from a [`HostVisibleBuffer`] using
+/// [`upload_from_host_visible`](Self::upload_from_host_visible).
 pub struct DeviceLocalBuffer {
     inner: AllocatedBuffer,
 }

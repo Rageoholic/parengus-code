@@ -1,3 +1,14 @@
+//! GPU synchronisation primitives: [`Fence`] and [`Semaphore`].
+//!
+//! [`Fence`] is a CPU–GPU synchronisation object. The canonical
+//! render-loop pattern is to create fences in the signaled state and
+//! call [`wait_and_reset`](Fence::wait_and_reset) at the start of each
+//! frame to block until the previous frame's GPU work completes.
+//!
+//! [`Semaphore`] is a GPU–GPU synchronisation object used to order
+//! operations across queue submissions, typically to sequence swapchain
+//! image acquisition and presentation with rendering work.
+
 use std::sync::Arc;
 
 use ash::vk;

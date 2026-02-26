@@ -10,15 +10,15 @@ use std::{
 
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
-use rgpu::{
-    ash::vk::{self, CullModeFlags, FrontFace},
+use rgpu_vk::{
+    ash::vk,
     buffer::{DeviceLocalBuffer, HostVisibleBuffer},
     command::{ResettableCommandBuffer, ResettableCommandPool},
     device::{Device, DeviceConfig, QueueMode},
     instance::{Instance, InstanceExtensions},
     pipeline::{
-        DynamicPipeline, DynamicPipelineDesc, VertexAttributeDesc,
-        VertexBindingDesc,
+        CullModeFlags, DynamicPipeline, DynamicPipelineDesc, FrontFace,
+        VertexAttributeDesc, VertexBindingDesc, VertexInputRate,
     },
     shader::{ShaderModule, ShaderStage},
     surface::Surface,
@@ -26,7 +26,10 @@ use rgpu::{
     sync::{Fence, Semaphore},
 };
 use tracing_subscriber::{
-    Layer, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
+    Layer,
+    filter::{LevelFilter, Targets},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
 };
 use vek::{Vec2, Vec3};
 use winit::{
@@ -148,25 +151,61 @@ impl From<CliQueueMode> for QueueMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 /// Vulkan validation/debug callback severity threshold.
 enum CliVulkanLogLevel {
-    /// Include verbose diagnostics.
-    Verbose,
+    /// Include verbose diagnostics (maps to Vulkan VERBOSE).
+    Trace,
     /// Include informational messages and above.
     Info,
     /// Include warnings and errors.
-    Warning,
+    Warn,
     /// Include errors only.
     Error,
 }
 
-impl From<CliVulkanLogLevel> for rgpu::log::VulkanLogLevel {
+impl From<CliVulkanLogLevel> for rgpu_vk::instance::VulkanLogLevel {
     fn from(value: CliVulkanLogLevel) -> Self {
         match value {
-            CliVulkanLogLevel::Verbose => rgpu::log::VulkanLogLevel::Verbose,
-            CliVulkanLogLevel::Info => rgpu::log::VulkanLogLevel::Info,
-            CliVulkanLogLevel::Warning => rgpu::log::VulkanLogLevel::Warning,
-            CliVulkanLogLevel::Error => rgpu::log::VulkanLogLevel::Error,
+            CliVulkanLogLevel::Trace => {
+                rgpu_vk::instance::VulkanLogLevel::Verbose
+            }
+            CliVulkanLogLevel::Info => rgpu_vk::instance::VulkanLogLevel::Info,
+            CliVulkanLogLevel::Warn => {
+                rgpu_vk::instance::VulkanLogLevel::Warning
+            }
+            CliVulkanLogLevel::Error => {
+                rgpu_vk::instance::VulkanLogLevel::Error
+            }
         }
     }
+}
+
+/// Build a [`Targets`] filter combining the general tracing level and
+/// the optional graphics debug level.
+///
+/// The default target uses `tracing_level`. When `gfx_level` maps to
+/// a more permissive [`LevelFilter`] than the default, an `"rgpu_vk"`
+/// target override is added so Vulkan messages are visible without
+/// requiring a matching `-t` flag.
+fn subscriber_filter(
+    tracing_level: TracingLogLevel,
+    gfx_level: Option<CliVulkanLogLevel>,
+) -> Targets {
+    let base = LevelFilter::from(tracing_level);
+    let mut targets = Targets::new().with_default(base);
+    if let Some(gfx) = gfx_level {
+        let gfx_filter = match gfx {
+            CliVulkanLogLevel::Trace => LevelFilter::TRACE,
+            CliVulkanLogLevel::Info => LevelFilter::INFO,
+            CliVulkanLogLevel::Warn => LevelFilter::WARN,
+            CliVulkanLogLevel::Error => LevelFilter::ERROR,
+        };
+        // LevelFilter::max returns the more permissive level
+        // (TRACE > ERROR in tracing's ordering).
+        let effective = base.max(gfx_filter);
+        if effective != base {
+            targets = targets.with_target("rgpu_vk", effective);
+        }
+    }
+    targets
 }
 
 fn main() -> eyre::Result<()> {
@@ -191,7 +230,10 @@ fn main() -> eyre::Result<()> {
 
     let cli_args = CliArgs::parse();
 
-    if cli_args.tracing_log_level != TracingLogLevel::Off {
+    let needs_subscriber = cli_args.tracing_log_level != TracingLogLevel::Off
+        || cli_args.graphics_debug_level.is_some();
+
+    if needs_subscriber {
         fs::create_dir_all(&log_dir)?;
 
         let mut log_file_path = log_dir.clone();
@@ -207,12 +249,13 @@ fn main() -> eyre::Result<()> {
                 && supports_color::on(supports_color::Stream::Stdout).is_some(),
         );
 
+        let filter = subscriber_filter(
+            cli_args.tracing_log_level,
+            cli_args.graphics_debug_level,
+        );
         tracing_subscriber::registry()
-            .with(
-                stdout_log
-                    .with_filter(LevelFilter::from(cli_args.tracing_log_level))
-                    .and_then(file_log),
-            )
+            .with(stdout_log.with_filter(filter.clone()))
+            .with(file_log.with_filter(filter))
             .init();
 
         tracing::debug!("log_file_path: {}", log_file_path.display());
@@ -227,7 +270,7 @@ fn main() -> eyre::Result<()> {
     // an Arc ensures it stays alive at least as long as any derived
     // object does.
     let instance = Arc::new(unsafe {
-        rgpu::instance::Instance::new(
+        rgpu_vk::instance::Instance::new(
             "samp-app",
             cli_args.graphics_debug_level.map(Into::into),
             Some(&event_loop),
@@ -916,7 +959,7 @@ where
     let vertex_bindings = [VertexBindingDesc {
         binding: 0,
         stride: size_of::<Vertex>() as u32,
-        input_rate: vk::VertexInputRate::VERTEX,
+        input_rate: VertexInputRate::VERTEX,
     }];
     let vertex_attributes = [
         VertexAttributeDesc {
@@ -1277,7 +1320,7 @@ impl AppRunner {
 
     fn recreate_swapchain_if_needed(
         running_state: &mut RunningState,
-        desired_extent: rgpu::ash::vk::Extent2D,
+        desired_extent: rgpu_vk::ash::vk::Extent2D,
     ) -> bool {
         if desired_extent.width == 0 || desired_extent.height == 0 {
             let _span = tracing::trace_span!(
@@ -1392,15 +1435,15 @@ impl AppRunner {
     fn desired_extent_for_event(
         win: &WinitWindow,
         window_event: &WindowEvent,
-    ) -> Option<rgpu::ash::vk::Extent2D> {
+    ) -> Option<rgpu_vk::ash::vk::Extent2D> {
         match window_event {
-            WindowEvent::Resized(size) => Some(rgpu::ash::vk::Extent2D {
+            WindowEvent::Resized(size) => Some(rgpu_vk::ash::vk::Extent2D {
                 width: size.width,
                 height: size.height,
             }),
             WindowEvent::ScaleFactorChanged { .. } => {
                 let size = win.inner_size();
-                Some(rgpu::ash::vk::Extent2D {
+                Some(rgpu_vk::ash::vk::Extent2D {
                     width: size.width,
                     height: size.height,
                 })

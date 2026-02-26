@@ -2,8 +2,38 @@
 
 Rust workspace for Vulkan experiments.
 
-- `rgpu`: Vulkan wrapper library (uses `ash`)
+- `rgpu-vk`: Vulkan wrapper library (uses `ash`)
 - `samp-app`: sample app using `winit`
+
+## rgpu-vk overview
+
+`rgpu-vk` is a set of thin RAII wrappers around Vulkan objects. Each
+wrapper holds its parent via `Arc` so parents cannot be destroyed
+while children are alive.
+
+Object hierarchy:
+
+```
+Instance
+├── Surface<T>
+│   └── Swapchain<T>
+└── Device
+    ├── HostVisibleBuffer / DeviceLocalBuffer
+    ├── ShaderModule → EntryPoint → DynamicPipeline
+    ├── ResettableCommandPool → ResettableCommandBuffer
+    └── Fence / Semaphore
+```
+
+**Naming conventions**
+
+| prefix | meaning |
+|--------|---------|
+| `raw_*` | accepts or returns a raw `ash::vk` handle |
+| `ash_*` | returns the `ash` wrapper object |
+
+All unsafe operations inside `unsafe fn` bodies are wrapped in
+explicit `unsafe {}` blocks, satisfying
+`#![deny(unsafe_op_in_unsafe_fn)]`.
 
 ## Prerequisites
 
@@ -49,10 +79,10 @@ If `shader.debug.spv` is missing, the app falls back to `shader.spv`.
 ## Useful checks
 
 ```sh
-cargo check -p rgpu
+cargo check -p rgpu-vk
 cargo check -p samp-app
 cargo test --workspace
-cargo clippy -p rgpu --all-targets -- -D warnings
+cargo clippy -p rgpu-vk --all-targets -- -D warnings
 cargo clippy -p samp-app --all-targets -- -D warnings
 ```
 

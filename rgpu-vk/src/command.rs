@@ -1,3 +1,18 @@
+//! Command pool and command buffer wrappers.
+//!
+//! [`ResettableCommandPool`] allocates individually-resettable primary
+//! command buffers. It is `!Sync` by design: Vulkan requires external
+//! synchronisation for pool-level operations, and the `!Sync` bound
+//! enforces single-thread access structurally.
+//!
+//! [`ResettableCommandBuffer`] holds a reference to the pool's inner
+//! `Arc` so the pool cannot be destroyed while buffers are alive. On
+//! drop, the raw handle is returned to the pool's channel for recycling.
+//!
+//! The [`CommandBufferHandle`] trait allows recording helpers in this
+//! module to accept either `ResettableCommandBuffer` or raw handle
+//! wrappers through a single interface.
+
 use std::{
     marker::PhantomData,
     sync::{Arc, mpsc},
@@ -9,6 +24,13 @@ use thiserror::Error;
 use crate::buffer::BufferHandle;
 use crate::device::{Device, DynamicRenderingError};
 
+/// Trait for types that expose a raw `VkCommandBuffer` handle.
+///
+/// Implemented by [`ResettableCommandBuffer`]. Blanket impls cover
+/// `&T` and `&mut T`. Allows helpers in [`buffer`] and here to be
+/// generic over command buffer wrapper types.
+///
+/// [`buffer`]: crate::buffer
 pub trait CommandBufferHandle {
     fn raw_command_buffer(&self) -> vk::CommandBuffer;
 }
@@ -240,7 +262,7 @@ impl ResettableCommandPool {
 ///
 /// On drop, the raw handle is sent back to the pool's return channel for
 /// recycling. If the pool has already been dropped the send is silently
-/// discarded; `vkDestroyCommandPool` handles cleanup via [`CommandPoolShared`].
+/// discarded; `vkDestroyCommandPool` handles cleanup via the shared pool.
 pub struct ResettableCommandBuffer {
     /// Keeps the pool alive until this buffer is dropped.
     _pool: Arc<CommandPoolShared>,
