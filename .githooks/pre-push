@@ -1,0 +1,14 @@
+#!/bin/bash
+set -e
+
+protected_branch="main"
+
+while read local_ref local_sha remote_ref remote_sha; do
+    if [[ "$remote_ref" == "refs/heads/$protected_branch" ]]; then
+        echo "Direct push to '$protected_branch' is not allowed."
+        echo "Open a PR or use --no-verify to bypass."
+        exit 1
+    fi
+done
+
+exit 0

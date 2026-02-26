@@ -1,5 +1,13 @@
 # Project Instructions
 
+## Repo Initialization
+
+After cloning, activate the project's git hooks:
+
+```
+git config core.hooksPath .githooks
+```
+
 ## Structure
 - Cargo workspace with `resolver = "3"`, `edition = "2024"`
 - Members: `rgpu` (Vulkan wrapper lib using ash),
