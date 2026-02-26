@@ -4,16 +4,22 @@
 use std::{
     cell::Cell,
     fs::{self, File},
+    mem::size_of,
     sync::Arc,
 };
 
+use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use rgpu::{
     ash::vk,
+    buffer::{DeviceLocalBuffer, HostVisibleBuffer},
     command::{ResettableCommandBuffer, ResettableCommandPool},
     device::{Device, DeviceConfig, QueueMode},
     instance::{Instance, InstanceExtensions},
-    pipeline::{DynamicPipeline, DynamicPipelineDesc},
+    pipeline::{
+        DynamicPipeline, DynamicPipelineDesc, VertexAttributeDesc,
+        VertexBindingDesc,
+    },
     shader::{ShaderModule, ShaderStage},
     surface::Surface,
     swapchain::Swapchain,
@@ -22,6 +28,7 @@ use rgpu::{
 use tracing_subscriber::{
     Layer, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
 };
+use vek::{Vec2, Vec3};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -29,6 +36,34 @@ use winit::{
     event_loop::ControlFlow,
     window::{Window as WinitWindow, WindowAttributes},
 };
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct Vertex {
+    position: Vec2<f32>,
+    color: Vec3<f32>,
+}
+
+const RECT_VERTICES: [Vertex; 4] = [
+    Vertex {
+        position: Vec2::new(-0.5, -0.5),
+        color: Vec3::new(0.0, 0.0, 1.0),
+    },
+    Vertex {
+        position: Vec2::new(0.5, -0.5),
+        color: Vec3::new(0.0, 1.0, 1.0),
+    },
+    Vertex {
+        position: Vec2::new(0.5, 0.5),
+        color: Vec3::new(1.0, 1.0, 1.0),
+    },
+    Vertex {
+        position: Vec2::new(-0.5, 0.5),
+        color: Vec3::new(1.0, 0.0, 1.0),
+    },
+];
+
+const RECT_INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
 
 #[derive(
     Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default, clap::ValueEnum,
@@ -350,6 +385,8 @@ struct RunningState {
     swapchain: Option<Arc<Swapchain<WinitWindow>>>,
     shader: ShaderModule,
     pipeline: Arc<DynamicPipeline>,
+    vertex_buffer: Arc<DeviceLocalBuffer>,
+    index_buffer: Arc<DeviceLocalBuffer>,
     pipeline_color_format: vk::Format,
     command_pool: ResettableCommandPool,
     frames: Vec<FrameSync>,
@@ -366,6 +403,8 @@ impl std::fmt::Debug for RunningState {
             .field("swapchain", &self.swapchain)
             .field("shader", &self.shader)
             .field("pipeline", &self.pipeline)
+            .field("vertex_buffer", &self.vertex_buffer)
+            .field("index_buffer", &self.index_buffer)
             .field("pipeline_color_format", &self.pipeline_color_format)
             .field("command_pool", &self.command_pool)
             .field("frames", &self.frames)
@@ -381,6 +420,8 @@ struct SuspendedState {
     device: Arc<Device>,
     shader: ShaderModule,
     pipeline: Arc<DynamicPipeline>,
+    vertex_buffer: Arc<DeviceLocalBuffer>,
+    index_buffer: Arc<DeviceLocalBuffer>,
     pipeline_color_format: vk::Format,
     command_pool: ResettableCommandPool,
     frames: Vec<FrameSync>,
@@ -449,6 +490,8 @@ impl ApplicationHandler for AppRunner {
                 swapchain: _,
                 shader,
                 pipeline,
+                vertex_buffer,
+                index_buffer,
                 pipeline_color_format,
                 command_pool,
                 mut frames,
@@ -478,6 +521,8 @@ impl ApplicationHandler for AppRunner {
                 device,
                 shader,
                 pipeline,
+                vertex_buffer,
+                index_buffer,
                 pipeline_color_format,
                 command_pool,
                 frames,
@@ -616,9 +661,9 @@ impl AppRunner {
             .swapchain
             .as_ref()
             .expect("swapchain present: checked above");
-        let swapchain_raw = sc.raw_handle();
+        let swapchain_raw = sc.raw_swapchain();
         let image_available =
-            state.frames[frame_idx].image_available.raw_handle();
+            state.frames[frame_idx].image_available.raw_semaphore();
 
         // Acquire the next presentable image.
         //
@@ -648,10 +693,10 @@ impl AppRunner {
         // borrow ends here.
         let retained = Arc::clone(sc);
         let render_finished =
-            state.frames[frame_idx].render_finished.raw_handle();
+            state.frames[frame_idx].render_finished.raw_semaphore();
 
-        let fence = state.frames[frame_idx].in_flight_fence.raw_handle();
-        let pipeline_handle = state.pipeline.raw_handle();
+        let fence = state.frames[frame_idx].in_flight_fence.raw_fence();
+        let pipeline_handle = state.pipeline.raw_pipeline();
         let frame_cmd = &mut state.frames[frame_idx].command_buffer;
 
         // Reset and re-record the command buffer for this frame slot.
@@ -723,6 +768,9 @@ impl AppRunner {
         // SAFETY: inside a dynamic render pass with a compatible
         // color attachment.
         unsafe { frame_cmd.bind_graphics_pipeline(pipeline_handle) };
+        // SAFETY: inside render pass recording; buffer is valid and bound to
+        // host-visible memory for the app lifetime.
+        unsafe { frame_cmd.bind_vertex_buffer(0, &*state.vertex_buffer, 0) };
 
         let viewport = vk::Viewport {
             x: 0.0,
@@ -742,10 +790,21 @@ impl AppRunner {
         // SAFETY: pipeline declares VK_DYNAMIC_STATE_SCISSOR.
         unsafe { frame_cmd.set_scissor(std::slice::from_ref(&scissor)) };
 
-        // 3 vertices hard-coded in the shader; 1 instance.
+        // SAFETY: inside render pass recording; buffer is valid.
+        unsafe {
+            frame_cmd.bind_index_buffer(
+                &*state.index_buffer,
+                0,
+                vk::IndexType::UINT16,
+            )
+        };
+
+        // Draw a rectangle using the index buffer.
         // SAFETY: all required dynamic state has been set;
-        // render pass is active.
-        unsafe { frame_cmd.draw(3, 1, 0, 0) };
+        // render pass is active; index buffer is bound.
+        unsafe {
+            frame_cmd.draw_indexed(RECT_INDICES.len() as u32, 1, 0, 0, 0)
+        };
 
         // SAFETY: inside a dynamic render pass.
         if let Err(e) = unsafe { frame_cmd.end_rendering() } {
@@ -776,7 +835,7 @@ impl AppRunner {
             ));
         }
 
-        let cmd_handle = frame_cmd.raw_handle();
+        let cmd_handle = frame_cmd.raw_command_buffer();
         // frame_cmd borrow ends here; subsequent accesses are on
         // different fields.
 
@@ -847,11 +906,32 @@ where
 {
     let vert = shader.entry_point("vert_main", ShaderStage::Vertex)?;
     let frag = shader.entry_point("frag_main", ShaderStage::Fragment)?;
+    let vertex_bindings = [VertexBindingDesc {
+        binding: 0,
+        stride: size_of::<Vertex>() as u32,
+        input_rate: vk::VertexInputRate::VERTEX,
+    }];
+    let vertex_attributes = [
+        VertexAttributeDesc {
+            location: 0,
+            binding: 0,
+            format: vk::Format::R32G32_SFLOAT,
+            offset: std::mem::offset_of!(Vertex, position) as u32,
+        },
+        VertexAttributeDesc {
+            location: 1,
+            binding: 0,
+            format: vk::Format::R32G32B32_SFLOAT,
+            offset: std::mem::offset_of!(Vertex, color) as u32,
+        },
+    ];
     Ok(DynamicPipeline::new(
         device,
         &DynamicPipelineDesc {
             stages: &[vert, frag],
             color_attachment_formats: &[color_format],
+            vertex_bindings: &vertex_bindings,
+            vertex_attributes: &vertex_attributes,
             ..Default::default()
         },
         name,
@@ -886,6 +966,70 @@ impl AppRunner {
             &surface,
             state.device_config,
         )?);
+
+        let vertex_buffer_size =
+            (RECT_VERTICES.len() * size_of::<Vertex>()) as vk::DeviceSize;
+        let mut staging_vertex_buffer = HostVisibleBuffer::new(
+            &device,
+            vertex_buffer_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            Some("rect staging vertex buffer"),
+        )?;
+        staging_vertex_buffer.write_pod(&RECT_VERTICES)?;
+
+        let mut vertex_buffer = DeviceLocalBuffer::new(
+            &device,
+            vertex_buffer_size,
+            vk::BufferUsageFlags::VERTEX_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            Some("rect vertex buffer"),
+        )?;
+
+        let index_buffer_size =
+            (RECT_INDICES.len() * size_of::<u16>()) as vk::DeviceSize;
+        let mut staging_index_buffer = HostVisibleBuffer::new(
+            &device,
+            index_buffer_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            Some("rect staging index buffer"),
+        )?;
+        staging_index_buffer.write_pod(&RECT_INDICES)?;
+
+        let mut index_buffer = DeviceLocalBuffer::new(
+            &device,
+            index_buffer_size,
+            vk::BufferUsageFlags::INDEX_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            Some("rect index buffer"),
+        )?;
+
+        let upload_command_pool = ResettableCommandPool::new(
+            &device,
+            device.graphics_present_queue_family(),
+            Some("upload command pool"),
+        )?;
+        let mut upload_command_buffer =
+            upload_command_pool.allocate_command_buffer()?;
+        // SAFETY: upload_command_pool is used on this thread only during
+        // initialization, and `None` fence path waits for device idle before
+        // returning, so source/destination buffers outlive GPU access.
+        unsafe {
+            vertex_buffer.upload_from_host_visible(
+                &mut upload_command_buffer,
+                &staging_vertex_buffer,
+                None,
+            )
+        }?;
+        // SAFETY: Same contract as vertex buffer upload above.
+        unsafe {
+            index_buffer.upload_from_host_visible(
+                &mut upload_command_buffer,
+                &staging_index_buffer,
+                None,
+            )
+        }?;
+        let vertex_buffer = Arc::new(vertex_buffer);
+        let index_buffer = Arc::new(index_buffer);
 
         let win_size = win.inner_size();
         let debug_counters = DebugCounters::new();
@@ -1018,6 +1162,8 @@ impl AppRunner {
             swapchain,
             shader,
             pipeline,
+            vertex_buffer,
+            index_buffer,
             pipeline_color_format,
             command_pool,
             frames,
@@ -1034,7 +1180,7 @@ impl AppRunner {
         // slots' retained_swapchain Arcs are cleared only after
         // device.wait_idle() in the next suspended() call.
         let surface = Arc::new(unsafe {
-            Surface::new(state.device.get_parent(), Arc::clone(&state.win))
+            Surface::new(state.device.parent(), Arc::clone(&state.win))
         }?);
 
         let win_size = state.win.inner_size();
@@ -1110,6 +1256,8 @@ impl AppRunner {
             swapchain,
             shader: state.shader,
             pipeline,
+            vertex_buffer: state.vertex_buffer,
+            index_buffer: state.index_buffer,
             pipeline_color_format,
             command_pool: state.command_pool,
             frames: state.frames,

@@ -6,7 +6,30 @@ use std::{
 use ash::vk;
 use thiserror::Error;
 
+use crate::buffer::BufferHandle;
 use crate::device::{Device, DynamicRenderingError};
+
+pub trait CommandBufferHandle {
+    fn raw_command_buffer(&self) -> vk::CommandBuffer;
+}
+
+impl<T> CommandBufferHandle for &T
+where
+    T: CommandBufferHandle + ?Sized,
+{
+    fn raw_command_buffer(&self) -> vk::CommandBuffer {
+        (*self).raw_command_buffer()
+    }
+}
+
+impl<T> CommandBufferHandle for &mut T
+where
+    T: CommandBufferHandle + ?Sized,
+{
+    fn raw_command_buffer(&self) -> vk::CommandBuffer {
+        (**self).raw_command_buffer()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -197,11 +220,11 @@ impl ResettableCommandPool {
         })
     }
 
-    pub fn raw_handle(&self) -> vk::CommandPool {
+    pub fn raw_command_pool(&self) -> vk::CommandPool {
         self.shared.pool
     }
 
-    pub fn get_parent(&self) -> &Arc<Device> {
+    pub fn parent(&self) -> &Arc<Device> {
         &self.shared.parent
     }
 }
@@ -342,6 +365,115 @@ impl ResettableCommandBuffer {
         }
     }
 
+    /// Bind vertex buffers for subsequent draw commands.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state. `buffers` and `offsets`
+    /// must have equal length. All buffers must be valid handles created from
+    /// the same device as this command buffer.
+    pub unsafe fn bind_raw_vertex_buffers(
+        &mut self,
+        first_binding: u32,
+        buffers: &[vk::Buffer],
+        offsets: &[vk::DeviceSize],
+    ) {
+        // SAFETY: Caller guarantees recording state and buffer validity.
+        unsafe {
+            self.parent.cmd_bind_vertex_buffers(
+                self.handle,
+                first_binding,
+                buffers,
+                offsets,
+            )
+        }
+    }
+
+    /// Bind vertex buffers for subsequent draw commands.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state. `buffers` and `offsets`
+    /// must have equal length. All buffers must be valid handles created from
+    /// the same device as this command buffer.
+    pub unsafe fn bind_vertex_buffers<B>(
+        &mut self,
+        first_binding: u32,
+        buffers: &[B],
+        offsets: &[vk::DeviceSize],
+    ) where
+        B: BufferHandle,
+    {
+        let raw_buffers: Vec<vk::Buffer> =
+            buffers.iter().map(|b| b.raw_buffer()).collect();
+        // SAFETY: Caller guarantees recording state and buffer validity.
+        unsafe {
+            self.bind_raw_vertex_buffers(first_binding, &raw_buffers, offsets)
+        }
+    }
+
+    /// Bind heterogeneous vertex buffers for subsequent draw commands.
+    ///
+    /// This overload accepts mixed wrapper types through trait objects.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state. `buffers` and `offsets`
+    /// must have equal length. All buffers must be valid handles created from
+    /// the same device as this command buffer.
+    pub unsafe fn bind_heterogenous_vertex_buffers(
+        &mut self,
+        first_binding: u32,
+        buffers: &[&dyn BufferHandle],
+        offsets: &[vk::DeviceSize],
+    ) {
+        let raw_buffers: Vec<vk::Buffer> =
+            buffers.iter().map(|b| b.raw_buffer()).collect();
+        // SAFETY: Caller guarantees recording state and buffer validity.
+        unsafe {
+            self.bind_raw_vertex_buffers(first_binding, &raw_buffers, offsets)
+        }
+    }
+
+    /// Bind a single vertex buffer for subsequent draw commands.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state. `buffer` must be a valid
+    /// handle created from the same device as this command buffer.
+    pub unsafe fn bind_vertex_buffer<B>(
+        &mut self,
+        binding: u32,
+        buffer: B,
+        offset: vk::DeviceSize,
+    ) where
+        B: BufferHandle,
+    {
+        let buffers = [buffer];
+        let offsets = [offset];
+        // SAFETY: Caller guarantees recording state and buffer validity.
+        unsafe { self.bind_vertex_buffers(binding, &buffers, &offsets) }
+    }
+
+    /// Record a buffer-to-buffer copy.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state. `src_buffer` and
+    /// `dst_buffer` must be valid handles created from the same device as
+    /// this command buffer. Regions must be valid and in-bounds.
+    pub unsafe fn copy_buffer(
+        &mut self,
+        src_buffer: vk::Buffer,
+        dst_buffer: vk::Buffer,
+        regions: &[vk::BufferCopy],
+    ) {
+        // SAFETY: Caller guarantees recording state and copy validity.
+        unsafe {
+            self.parent.cmd_copy_buffer(
+                self.handle,
+                src_buffer,
+                dst_buffer,
+                regions,
+            )
+        }
+    }
+
     /// Set the viewport dynamically.
     ///
     /// # Safety
@@ -389,12 +521,71 @@ impl ResettableCommandBuffer {
         }
     }
 
-    pub fn raw_handle(&self) -> vk::CommandBuffer {
+    /// Bind an index buffer for subsequent indexed draw commands.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state. `buffer` must be a
+    /// valid index buffer created from the same device as this command
+    /// buffer, with `INDEX_BUFFER` usage.
+    pub unsafe fn bind_index_buffer<B>(
+        &mut self,
+        buffer: B,
+        offset: vk::DeviceSize,
+        index_type: vk::IndexType,
+    ) where
+        B: BufferHandle,
+    {
+        // SAFETY: Caller guarantees recording state and buffer validity.
+        unsafe {
+            self.parent.cmd_bind_index_buffer(
+                self.handle,
+                buffer.raw_buffer(),
+                offset,
+                index_type,
+            )
+        }
+    }
+
+    /// Record an indexed draw call.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state inside an active render
+    /// pass, with a compatible graphics pipeline bound, all required
+    /// dynamic state set, and a valid index buffer bound.
+    pub unsafe fn draw_indexed(
+        &mut self,
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) {
+        // SAFETY: Caller guarantees render pass, pipeline, and
+        // index buffer state validity.
+        unsafe {
+            self.parent.cmd_draw_indexed(
+                self.handle,
+                index_count,
+                instance_count,
+                first_index,
+                vertex_offset,
+                first_instance,
+            )
+        }
+    }
+
+    pub fn raw_command_buffer(&self) -> vk::CommandBuffer {
         self.handle
     }
 
-    pub fn get_parent(&self) -> &Arc<Device> {
+    pub fn parent(&self) -> &Arc<Device> {
         &self.parent
+    }
+}
+
+impl CommandBufferHandle for ResettableCommandBuffer {
+    fn raw_command_buffer(&self) -> vk::CommandBuffer {
+        self.handle
     }
 }
 

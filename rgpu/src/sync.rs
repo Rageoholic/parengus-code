@@ -125,7 +125,7 @@ impl Fence {
     /// # Safety
     /// No other thread may re-submit this fence's raw handle between the wait
     /// returning and the reset completing. The `&mut` receiver prevents
-    /// same-thread re-submission via `raw_handle`, but cross-thread raw handle
+    /// same-thread re-submission via `raw_fence`, but cross-thread raw-handle
     /// usage is still the caller's responsibility.
     pub unsafe fn wait_and_reset(
         &mut self,
@@ -133,7 +133,7 @@ impl Fence {
     ) -> Result<(), WaitFenceError> {
         self.wait(timeout_ns)?;
         // SAFETY: wait() succeeded so the fence is signaled and not pending.
-        // &mut self prevents any same-thread re-submission of raw_handle()
+        // &mut self prevents any same-thread re-submission of raw_fence()
         // between the wait and reset.
         unsafe { self.reset() }.map_err(WaitFenceError::Vulkan)
     }
@@ -144,7 +144,7 @@ impl Fence {
         unsafe { self.parent.get_raw_fence_status(self.handle) }
     }
 
-    pub fn raw_handle(&self) -> vk::Fence {
+    pub fn raw_fence(&self) -> vk::Fence {
         self.handle
     }
 
@@ -212,7 +212,7 @@ impl Semaphore {
         })
     }
 
-    pub fn raw_handle(&self) -> vk::Semaphore {
+    pub fn raw_semaphore(&self) -> vk::Semaphore {
         self.handle
     }
 

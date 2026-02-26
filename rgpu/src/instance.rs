@@ -226,7 +226,7 @@ impl Instance {
             let ash_window_exts = ash_window::enumerate_required_extensions(
                 display_handle_source
                     .display_handle()
-                    .map_err(|e| Error::InvalidDisplayHandle(e))?
+                    .map_err(Error::InvalidDisplayHandle)?
                     .as_raw(),
             )?;
 
@@ -462,6 +462,21 @@ impl Instance {
         }
     }
 
+    /// Get memory properties of a physical device.
+    ///
+    /// # Safety
+    /// `physical_device` must be a valid handle derived from this instance.
+    pub unsafe fn get_raw_physical_device_memory_properties(
+        &self,
+        physical_device: vk::PhysicalDevice,
+    ) -> vk::PhysicalDeviceMemoryProperties {
+        // SAFETY: physical_device was derived from this instance.
+        unsafe {
+            self.handle
+                .get_physical_device_memory_properties(physical_device)
+        }
+    }
+
     /// Create a logical device from a physical device.
     ///
     /// # Safety
@@ -497,12 +512,16 @@ impl Instance {
         }
     }
 
-    pub fn get_supported_ver(&self) -> VkVersion {
+    pub fn supported_ver(&self) -> VkVersion {
         self.ver
     }
 
-    pub fn raw_handle(&self) -> vk::Instance {
+    pub fn raw_instance(&self) -> vk::Instance {
         self.handle.handle()
+    }
+
+    pub fn ash_instance(&self) -> &ash::Instance {
+        &self.handle
     }
 }
 
@@ -546,7 +565,7 @@ pub enum DestroyRawSurfaceError {
     ExtensionNotLoaded,
 }
 
-//Extensions related to surface functionality
+// Extensions related to surface functionality
 impl Instance {
     /// Check if a queue family on a physical device supports presenting to
     /// a surface.
@@ -670,23 +689,23 @@ impl Instance {
                     &self.handle,
                     source
                         .display_handle()
-                        .map_err(|e| Error::InvalidDisplayHandle(e))?
+                        .map_err(Error::InvalidDisplayHandle)?
                         .as_raw(),
                     source
                         .window_handle()
-                        .map_err(|e| Error::InvalidWindowHandle(e))?
+                        .map_err(Error::InvalidWindowHandle)?
                         .as_raw(),
                     None,
                 )
             }
-            .map_err(|e| Error::VulkanError(e))
+            .map_err(Error::VulkanError)
         } else {
             Err(Error::MissingExtension)
         }
     }
 }
 
-//Device extension loader creation functionality
+// Device extension loader creation functionality
 impl Instance {
     pub fn create_swapchain_loader(
         &self,

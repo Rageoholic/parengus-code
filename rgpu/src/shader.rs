@@ -141,7 +141,7 @@ impl ShaderModule {
         })
     }
 
-    pub fn raw_handle(&self) -> vk::ShaderModule {
+    pub fn raw_shader_module(&self) -> vk::ShaderModule {
         self.handle
     }
 
@@ -183,7 +183,7 @@ impl<'a> EntryPoint<'a> {
     ) -> vk::PipelineShaderStageCreateInfo<'_> {
         vk::PipelineShaderStageCreateInfo::default()
             .stage(self.stage.into())
-            .module(self.module.raw_handle())
+            .module(self.module.raw_shader_module())
             .name(&self.name)
     }
 

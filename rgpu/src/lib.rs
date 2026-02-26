@@ -1,11 +1,11 @@
+//! `rgpu` naming conventions:
+//! - `raw_*` accessors return the Vulkan handle type from `ash::vk`.
+//! - `ash_*` accessors return the corresponding `ash` wrapper object.
+
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::undocumented_unsafe_blocks)]
-#![allow(
-    clippy::redundant_closure,
-    reason = "This error sucks and I hate it cause it just ends up making \
-              refactoring annoying"
-)]
 
+pub mod buffer;
 pub mod command;
 pub mod device;
 pub mod instance;

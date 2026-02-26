@@ -302,8 +302,8 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         }
 
         if !std::sync::Arc::ptr_eq(
-            parent_surface.get_parent(),
-            parent_device.get_parent(),
+            parent_surface.parent(),
+            parent_device.parent(),
         ) {
             return Err(CreateSwapchainError::MismatchedParams);
         }
@@ -320,7 +320,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
             return Err(CreateSwapchainError::MismatchedParams);
         }
 
-        let physical_device = parent_device.get_physical_device();
+        let physical_device = parent_device.physical_device();
         let present_queue_family =
             parent_device.graphics_present_queue_family();
 
@@ -350,7 +350,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         let queue_family_indices = [present_queue_family];
 
         let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
-            .surface(parent_surface.raw_handle())
+            .surface(parent_surface.raw_surface())
             .min_image_count(image_count)
             .image_format(surface_format.format)
             .image_color_space(surface_format.color_space)
@@ -382,10 +382,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         // `parent_device`.
         let name_result = unsafe {
             parent_device.set_object_name_with(handle, || {
-                std::ffi::CString::new(
-                    lazy_name.as_deref()?.as_str(),
-                )
-                .ok()
+                std::ffi::CString::new(lazy_name.as_deref()?.as_str()).ok()
             })
         };
         if let Err(e) = name_result {
@@ -530,7 +527,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         self.format
     }
 
-    pub fn raw_handle(&self) -> vk::SwapchainKHR {
+    pub fn raw_swapchain(&self) -> vk::SwapchainKHR {
         self.handle
     }
 

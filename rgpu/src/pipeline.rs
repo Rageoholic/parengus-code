@@ -42,7 +42,7 @@ impl PipelineLayout {
         })
     }
 
-    pub fn raw_handle(&self) -> vk::PipelineLayout {
+    pub fn raw_pipeline_layout(&self) -> vk::PipelineLayout {
         self.handle
     }
 }
@@ -70,6 +70,42 @@ pub enum CreateDynamicPipelineError {
 
     #[error("Vulkan error creating graphics pipeline: {0}")]
     PipelineCreation(vk::Result),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VertexBindingDesc {
+    pub binding: u32,
+    pub stride: u32,
+    pub input_rate: vk::VertexInputRate,
+}
+
+impl From<VertexBindingDesc> for vk::VertexInputBindingDescription {
+    fn from(value: VertexBindingDesc) -> Self {
+        vk::VertexInputBindingDescription {
+            binding: value.binding,
+            stride: value.stride,
+            input_rate: value.input_rate,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VertexAttributeDesc {
+    pub location: u32,
+    pub binding: u32,
+    pub format: vk::Format,
+    pub offset: u32,
+}
+
+impl From<VertexAttributeDesc> for vk::VertexInputAttributeDescription {
+    fn from(value: VertexAttributeDesc) -> Self {
+        vk::VertexInputAttributeDescription {
+            location: value.location,
+            binding: value.binding,
+            format: value.format,
+            offset: value.offset,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +139,12 @@ pub struct DynamicPipelineDesc<'a> {
     /// Format of the depth attachment. `None` means no depth attachment.
     pub depth_attachment_format: Option<vk::Format>,
 
+    /// Vertex buffer binding declarations.
+    pub vertex_bindings: &'a [VertexBindingDesc],
+
+    /// Vertex attribute declarations consumed by the vertex shader.
+    pub vertex_attributes: &'a [VertexAttributeDesc],
+
     /// Pipeline layout to use.
     ///
     /// When `None` an empty layout (no descriptor sets, no push constants) is
@@ -126,6 +168,8 @@ impl Default for DynamicPipelineDesc<'_> {
             stages: &[],
             color_attachment_formats: &[],
             depth_attachment_format: None,
+            vertex_bindings: &[],
+            vertex_attributes: &[],
             layout: None,
             polygon_mode: vk::PolygonMode::FILL,
             cull_mode: vk::CullModeFlags::NONE,
@@ -145,8 +189,8 @@ impl Default for DynamicPipelineDesc<'_> {
 /// set up by the caller before issuing draw calls.
 ///
 /// Fixed pipeline state applied during construction:
-/// - Vertex input: no vertex buffers (drive vertices from push constants or
-///   buffer device address)
+/// - Vertex input: configurable via `vertex_bindings` and
+///   `vertex_attributes`
 /// - Input assembly: `TRIANGLE_LIST`
 /// - Viewport/scissor: fully dynamic (`VK_DYNAMIC_STATE_VIEWPORT` +
 ///   `VK_DYNAMIC_STATE_SCISSOR`)
@@ -203,8 +247,24 @@ impl DynamicPipeline {
                 .map(|ep| ep.as_pipeline_stage_create_info())
                 .collect();
 
+        let vertex_bindings: Vec<vk::VertexInputBindingDescription> = desc
+            .vertex_bindings
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect();
+
+        let vertex_attributes: Vec<vk::VertexInputAttributeDescription> = desc
+            .vertex_attributes
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect();
+
         let vertex_input_state =
-            vk::PipelineVertexInputStateCreateInfo::default();
+            vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&vertex_bindings)
+                .vertex_attribute_descriptions(&vertex_attributes);
 
         let input_assembly_state =
             vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -268,7 +328,7 @@ impl DynamicPipeline {
             .depth_stencil_state(&depth_stencil_state)
             .color_blend_state(&color_blend_state)
             .dynamic_state(&dynamic_state)
-            .layout(layout.raw_handle())
+            .layout(layout.raw_pipeline_layout())
             .push_next(&mut rendering_create_info);
 
         // SAFETY: create_info references valid shader stages, a valid pipeline
@@ -295,7 +355,7 @@ impl DynamicPipeline {
         })
     }
 
-    pub fn raw_handle(&self) -> vk::Pipeline {
+    pub fn raw_pipeline(&self) -> vk::Pipeline {
         self.handle
     }
 
