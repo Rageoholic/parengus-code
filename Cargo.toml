@@ -1,3 +1,4 @@
 [workspace]
-members = ["rgpu", "samp-app"]
+members = ["rgpu", "samp-app", "xtask"]
+default-members = ["rgpu", "samp-app"]
 resolver = "3"

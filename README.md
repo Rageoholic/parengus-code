@@ -15,45 +15,40 @@ Rust workspace for Vulkan experiments.
 
 From repository root:
 
-```powershell
-cargo build -p samp-app
-./samp-app/copy-samp-app-exe-debug.ps1
-./samp-app/compile-samp-app-shaders-debug.ps1
+```sh
+cargo xtask build
 ```
 
-Then run:
+This builds the sample app, compiles shaders, and copies the
+executable and debug info to the `out/` directory.
 
-```powershell
-./out/samp-app/debug/samp-app.exe
-```
+Then run the binary from `out/samp-app/debug/`.
 
-If you have local VS Code tasks configured, you can also run the equivalent
-editor task flow. (`.vscode` is gitignored in this repo.)
+If you have local VS Code tasks configured, you can also run the
+equivalent editor task flow. (`.vscode` is gitignored in this repo.)
 
 ## Shader outputs
 
-`./samp-app/compile-samp-app-shaders-debug.ps1` compiles both shader variants:
+`cargo xtask compile-shaders` compiles both shader variants:
 
 - `shader.spv` (default)
 - `shader.debug.spv` (compiled with debug info)
 
-Outputs are written to:
-
-- `out/samp-app/debug/shaders`
+Outputs are written to `out/samp-app/debug/shaders`.
 
 ## RenderDoc / shader debug info
 
-To load debug-info shaders at runtime, run:
+To load debug-info shaders at runtime, pass `--shader-debug-info`:
 
-```powershell
-./out/samp-app/debug/samp-app.exe --shader-debug-info
+```sh
+./out/samp-app/debug/samp-app --shader-debug-info
 ```
 
 If `shader.debug.spv` is missing, the app falls back to `shader.spv`.
 
 ## Useful checks
 
-```powershell
+```sh
 cargo check -p rgpu
 cargo check -p samp-app
 cargo test --workspace
