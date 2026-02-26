@@ -10,6 +10,7 @@ directories = "6.0.0"
 eyre = "0.6.12"
 rgpu = { version = "0.1.0", path = "../rgpu" }
 tracing = "0.1.44"
+supports-color = "3"
 tracing-subscriber = "0.3.22"
 vek = { version = "0.17.2", features = ["bytemuck"] }
 winit = "0.30.12"

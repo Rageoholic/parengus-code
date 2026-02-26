@@ -11,7 +11,7 @@ use std::{
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use rgpu::{
-    ash::vk,
+    ash::vk::{self, CullModeFlags, FrontFace},
     buffer::{DeviceLocalBuffer, HostVisibleBuffer},
     command::{ResettableCommandBuffer, ResettableCommandPool},
     device::{Device, DeviceConfig, QueueMode},
@@ -50,12 +50,12 @@ const RECT_VERTICES: [Vertex; 4] = [
         color: Vec3::new(0.0, 0.0, 1.0),
     },
     Vertex {
-        position: Vec2::new(0.5, -0.5),
-        color: Vec3::new(0.0, 1.0, 1.0),
-    },
-    Vertex {
         position: Vec2::new(0.5, 0.5),
         color: Vec3::new(1.0, 1.0, 1.0),
+    },
+    Vertex {
+        position: Vec2::new(0.5, -0.5),
+        color: Vec3::new(0.0, 1.0, 1.0),
     },
     Vertex {
         position: Vec2::new(-0.5, 0.5),
@@ -63,7 +63,7 @@ const RECT_VERTICES: [Vertex; 4] = [
     },
 ];
 
-const RECT_INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
+const RECT_INDICES: [u16; 6] = [0, 1, 2, 0, 3, 1];
 
 #[derive(
     Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default, clap::ValueEnum,
@@ -117,6 +117,10 @@ struct CliArgs {
     /// Load debug-info shader binary (`shader.debug.spv`) for RenderDoc.
     #[arg(long)]
     shader_debug_info: bool,
+
+    /// Disable ANSI color codes in stdout log output.
+    #[arg(long)]
+    no_color: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -198,7 +202,10 @@ fn main() -> eyre::Result<()> {
             .with_writer(log_file)
             .with_ansi(false);
 
-        let stdout_log = tracing_subscriber::fmt::layer().pretty();
+        let stdout_log = tracing_subscriber::fmt::layer().pretty().with_ansi(
+            !cli_args.no_color
+                && supports_color::on(supports_color::Stream::Stdout).is_some(),
+        );
 
         tracing_subscriber::registry()
             .with(
@@ -932,6 +939,8 @@ where
             color_attachment_formats: &[color_format],
             vertex_bindings: &vertex_bindings,
             vertex_attributes: &vertex_attributes,
+            cull_mode: CullModeFlags::BACK,
+            front_face: FrontFace::COUNTER_CLOCKWISE,
             ..Default::default()
         },
         name,
