@@ -132,7 +132,7 @@ enum CliQueueMode {
     #[default]
     /// Pick the best available mode automatically.
     Auto,
-    /// Prefer one family for graphics and present when possible.
+    /// Prefer one family for all queues when possible
     Unified,
     /// Use a single queue/family path.
     Single,
@@ -779,8 +779,7 @@ impl AppRunner {
                 .as_ref()
                 .expect("render_finished_semaphores present with swapchain"),
         );
-        let render_finished =
-            retained_rf[image_index as usize].raw_semaphore();
+        let render_finished = retained_rf[image_index as usize].raw_semaphore();
 
         let fence = state.frames[frame_idx].in_flight_fence.raw_fence();
         let pipeline_handle = state.pipeline.raw_pipeline();
@@ -959,8 +958,7 @@ impl AppRunner {
         state.frames[frame_idx].retained_swapchain = Some(retained);
         state.frames[frame_idx].retained_pipeline =
             Some(Arc::clone(&state.pipeline));
-        state.frames[frame_idx].retained_render_finished =
-            Some(retained_rf);
+        state.frames[frame_idx].retained_render_finished = Some(retained_rf);
 
         // Present — wait on render_finished.
         let present_info = vk::PresentInfoKHR::default()
