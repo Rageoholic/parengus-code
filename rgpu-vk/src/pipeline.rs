@@ -16,8 +16,29 @@ use thiserror::Error;
 
 pub use vk::{CullModeFlags, FrontFace, VertexInputRate};
 
+use crate::descriptor::DescriptorSetLayout;
 use crate::device::Device;
 use crate::shader::EntryPoint;
+
+// ---------------------------------------------------------------------------
+// PipelineLayoutDesc
+// ---------------------------------------------------------------------------
+
+/// Describes the full signature of a [`PipelineLayout`]: descriptor set
+/// layouts and push constant ranges.
+///
+/// # Defaults (via [`Default`])
+/// | field | default |
+/// |---|---|
+/// | `set_layouts` | `&[]` |
+/// | `push_constant_ranges` | `&[]` |
+#[derive(Default)]
+pub struct PipelineLayoutDesc<'a> {
+    /// Descriptor set layouts, in set-index order.
+    pub set_layouts: &'a [&'a DescriptorSetLayout],
+    /// Push constant ranges accessible by the pipeline stages.
+    pub push_constant_ranges: &'a [vk::PushConstantRange],
+}
 
 // ---------------------------------------------------------------------------
 // PipelineLayout
@@ -41,18 +62,36 @@ impl std::fmt::Debug for PipelineLayout {
 }
 
 impl PipelineLayout {
-    /// Create an empty pipeline layout with no descriptor sets and no push
-    /// constant ranges.
-    pub fn new_empty(device: &Arc<Device>) -> Result<Self, vk::Result> {
-        let create_info = vk::PipelineLayoutCreateInfo::default();
-        // SAFETY: create_info is default-initialised; it imposes no additional
-        // validity requirements on the device.
+    /// Create a pipeline layout from a [`PipelineLayoutDesc`].
+    ///
+    /// Use [`PipelineLayoutDesc::default`] for an empty layout (no
+    /// descriptor sets, no push constants).
+    pub fn new(
+        device: &Arc<Device>,
+        desc: &PipelineLayoutDesc<'_>,
+    ) -> Result<Self, vk::Result> {
+        let raw_set_layouts: Vec<vk::DescriptorSetLayout> = desc
+            .set_layouts
+            .iter()
+            .map(|l| l.raw_descriptor_set_layout())
+            .collect();
+        let create_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&raw_set_layouts)
+            .push_constant_ranges(desc.push_constant_ranges);
+        // SAFETY: create_info references valid set layouts and push
+        // constant ranges for the duration of this call.
         let handle =
             unsafe { device.create_raw_pipeline_layout(&create_info) }?;
         Ok(Self {
             parent: Arc::clone(device),
             handle,
         })
+    }
+
+    /// Create an empty pipeline layout with no descriptor sets and no push
+    /// constant ranges.
+    pub fn new_empty(device: &Arc<Device>) -> Result<Self, vk::Result> {
+        Self::new(device, &PipelineLayoutDesc::default())
     }
 
     pub fn raw_pipeline_layout(&self) -> vk::PipelineLayout {

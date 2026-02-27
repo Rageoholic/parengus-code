@@ -3,9 +3,11 @@
 
 use std::{
     cell::Cell,
+    f32::consts::PI as PI32,
     fs::{self, File},
     mem::size_of,
     sync::Arc,
+    time::Instant,
 };
 
 use bytemuck::{Pod, Zeroable};
@@ -14,11 +16,16 @@ use rgpu_vk::{
     ash::vk,
     buffer::{DeviceLocalBuffer, HostVisibleBuffer},
     command::{ResettableCommandBuffer, ResettableCommandPool},
+    descriptor::{
+        DescriptorBindingDesc, DescriptorPool, DescriptorSet,
+        DescriptorSetLayout,
+    },
     device::{Device, DeviceConfig, QueueMode},
     instance::{Instance, InstanceExtensions},
     pipeline::{
         CullModeFlags, DynamicPipeline, DynamicPipelineDesc, FrontFace,
-        VertexAttributeDesc, VertexBindingDesc, VertexInputRate,
+        PipelineLayout, PipelineLayoutDesc, VertexAttributeDesc,
+        VertexBindingDesc, VertexInputRate,
     },
     shader::{ShaderModule, ShaderStage},
     surface::Surface,
@@ -31,7 +38,7 @@ use tracing_subscriber::{
     layer::SubscriberExt,
     util::SubscriberInitExt,
 };
-use vek::{Vec2, Vec3};
+use vek::{Mat4, Vec2, Vec3};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -45,6 +52,12 @@ use winit::{
 struct Vertex {
     position: Vec2<f32>,
     color: Vec3<f32>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct Ubo {
+    model: Mat4<f32>,
 }
 
 const RECT_VERTICES: [Vertex; 4] = [
@@ -314,29 +327,12 @@ struct FrameSync {
     image_available: Semaphore,
     in_flight_fence: Fence,
     command_buffer: ResettableCommandBuffer,
-    /// Keeps the swapchain alive until this frame slot's fence signals.
-    ///
-    /// Set to the current swapchain after each submit and cleared at the
-    /// start of the next use of this slot (after `wait_and_reset`). This
-    /// prevents a retired swapchain from being destroyed while the
-    /// presentation engine may still hold references to its images.
-    retained_swapchain: Option<Arc<Swapchain<WinitWindow>>>,
     /// Keeps the pipeline alive until this frame slot's fence signals.
     ///
     /// Set to the current pipeline after each submit and cleared at the
     /// start of the next use of this slot. This prevents a retired pipeline
     /// from being destroyed while in-flight command buffers still reference it.
     retained_pipeline: Option<Arc<DynamicPipeline>>,
-    /// Keeps the render-finished semaphores alive until this frame slot's
-    /// fence signals.
-    ///
-    /// Binary semaphores used for render→present synchronisation must be
-    /// indexed by swapchain image, not by frame-in-flight slot; see
-    /// https://docs.vulkan.org/guide/latest/swapchain_semaphore_reuse.html.
-    /// The `Arc` here ensures the semaphore array outlives any in-flight
-    /// present operation that may still hold a reference after a swapchain
-    /// recreate.
-    retained_render_finished: Option<Arc<Vec<Semaphore>>>,
 }
 
 impl FrameSync {
@@ -347,9 +343,7 @@ impl FrameSync {
     /// must ensure either this slot's fence has signaled, or `vkDeviceWaitIdle`
     /// has returned successfully, before calling this function.
     unsafe fn release_retained(&mut self) {
-        self.retained_swapchain = None;
         self.retained_pipeline = None;
-        self.retained_render_finished = None;
     }
 }
 
@@ -452,6 +446,19 @@ struct RunningState {
     frames: Vec<FrameSync>,
     current_frame: usize,
     debug_counters: DebugCounters,
+    descriptor_set_layout: Arc<DescriptorSetLayout>,
+    /// Shared pipeline layout referencing `descriptor_set_layout`.
+    /// Reused when rebuilding the pipeline after a format change.
+    pipeline_layout: Arc<PipelineLayout>,
+    descriptor_pool: DescriptorPool,
+    /// One host-visible UBO buffer per frame in flight.
+    ubo_buffers: Vec<HostVisibleBuffer>,
+    /// One descriptor set per frame in flight, each pointing at the
+    /// matching entry in `ubo_buffers`.
+    descriptor_sets: Vec<DescriptorSet>,
+    /// Wall-clock time at which the app entered the Running state;
+    /// used to drive the rotation animation.
+    start_time: Instant,
 }
 
 impl std::fmt::Debug for RunningState {
@@ -470,6 +477,8 @@ impl std::fmt::Debug for RunningState {
             .field("frames", &self.frames)
             .field("current_frame", &self.current_frame)
             .field("debug_counters", &self.debug_counters)
+            .field("descriptor_set_layout", &self.descriptor_set_layout)
+            .field("descriptor_pool", &self.descriptor_pool)
             .finish_non_exhaustive()
     }
 }
@@ -486,6 +495,12 @@ struct SuspendedState {
     command_pool: ResettableCommandPool,
     frames: Vec<FrameSync>,
     debug_counters: DebugCounters,
+    descriptor_set_layout: Arc<DescriptorSetLayout>,
+    pipeline_layout: Arc<PipelineLayout>,
+    descriptor_pool: DescriptorPool,
+    ubo_buffers: Vec<HostVisibleBuffer>,
+    descriptor_sets: Vec<DescriptorSet>,
+    start_time: Instant,
 }
 #[derive(Debug)]
 struct ExitingState {}
@@ -558,6 +573,12 @@ impl ApplicationHandler for AppRunner {
                 mut frames,
                 current_frame: _,
                 debug_counters,
+                descriptor_set_layout,
+                pipeline_layout,
+                descriptor_pool,
+                ubo_buffers,
+                descriptor_sets,
+                start_time,
             } = running_state;
 
             if let Err(e) = device.wait_idle() {
@@ -588,6 +609,12 @@ impl ApplicationHandler for AppRunner {
                 command_pool,
                 frames,
                 debug_counters,
+                descriptor_set_layout,
+                pipeline_layout,
+                descriptor_pool,
+                ubo_buffers,
+                descriptor_sets,
+                start_time,
             });
         }
     }
@@ -768,19 +795,24 @@ impl AppRunner {
         let image_view = sc
             .image_views()
             .expect("image views were created with the swapchain")[i];
-        // Clone the retained reference now while sc is borrowed; sc's
-        // borrow ends here.
-        let retained = Arc::clone(sc);
-        // Clone the Arc so we can retain it in the frame slot later while
-        // still holding `render_finished` as a raw handle.
-        let retained_rf = Arc::clone(
-            state
-                .render_finished_semaphores
-                .as_ref()
-                .expect("render_finished_semaphores present with swapchain"),
-        );
-        let render_finished =
-            retained_rf[image_index as usize].raw_semaphore();
+        let render_finished = state
+            .render_finished_semaphores
+            .as_ref()
+            .expect("render_finished_semaphores present with swapchain")
+            [i]
+            .raw_semaphore();
+
+        let elapsed = state.start_time.elapsed().as_secs_f32();
+        let aspect = extent.width as f32 / extent.height as f32;
+        let ubo = Ubo {
+            model: Mat4::<f32>::scaling_3d(Vec3::new(1.0 / aspect, 1.0, 1.0))
+                * Mat4::rotation_z(elapsed * PI32 * 2.0 / 5.0),
+        };
+        if let Err(e) =
+            state.ubo_buffers[frame_idx].write_pod(std::slice::from_ref(&ubo))
+        {
+            return DrawFrameOutcome::Fatal(format!("UBO write failed: {e}"));
+        }
 
         let fence = state.frames[frame_idx].in_flight_fence.raw_fence();
         let pipeline_handle = state.pipeline.raw_pipeline();
@@ -855,6 +887,16 @@ impl AppRunner {
         // SAFETY: inside a dynamic render pass with a compatible
         // color attachment.
         unsafe { frame_cmd.bind_graphics_pipeline(pipeline_handle) };
+        // SAFETY: recording state; pipeline_layout is compatible with the
+        // bound pipeline; descriptor set is valid and its buffer remains
+        // alive for the duration of this frame's GPU work.
+        unsafe {
+            frame_cmd.bind_descriptor_sets(
+                &state.pipeline_layout,
+                0,
+                &[&state.descriptor_sets[frame_idx]],
+            )
+        };
         // SAFETY: inside render pass recording; buffer is valid and bound to
         // host-visible memory for the app lifetime.
         unsafe { frame_cmd.bind_vertex_buffer(0, &*state.vertex_buffer, 0) };
@@ -954,13 +996,12 @@ impl AppRunner {
             ));
         }
 
-        // Retain references until this slot's fence signals, preventing the
-        // presentation engine / GPU from accessing destroyed resources.
-        state.frames[frame_idx].retained_swapchain = Some(retained);
+        // Retain pipeline until this slot's fence signals (guarantees
+        // render commands referencing it are done). The swapchain is kept
+        // alive by running_state.swapchain; it is only replaced after
+        // wait_idle, so no fence-based retain is needed for it.
         state.frames[frame_idx].retained_pipeline =
             Some(Arc::clone(&state.pipeline));
-        state.frames[frame_idx].retained_render_finished =
-            Some(retained_rf);
 
         // Present — wait on render_finished.
         let present_info = vk::PresentInfoKHR::default()
@@ -988,6 +1029,7 @@ fn build_pipeline<F>(
     device: &Arc<Device>,
     shader: &ShaderModule,
     color_format: vk::Format,
+    layout: Option<Arc<PipelineLayout>>,
     name: Option<F>,
 ) -> eyre::Result<DynamicPipeline>
 where
@@ -1021,6 +1063,7 @@ where
             color_attachment_formats: &[color_format],
             vertex_bindings: &vertex_bindings,
             vertex_attributes: &vertex_attributes,
+            layout,
             cull_mode: CullModeFlags::BACK,
             front_face: FrontFace::COUNTER_CLOCKWISE,
             ..Default::default()
@@ -1044,10 +1087,10 @@ impl AppRunner {
         // SAFETY: Surface must be destroyed only after all swapchains
         // derived from it are destroyed and no GPU work accesses their
         // images. Swapchain holds Arc<Surface>, so the surface outlives
-        // the swapchain. Frame slots hold Arc<Swapchain> via
-        // retained_swapchain, which is cleared only after
-        // device.wait_idle() in the suspended() handler — so the
-        // surface is not freed while GPU work is pending.
+        // the swapchain. Swapchain replacement always calls wait_idle
+        // first, and RunningState drop calls wait_idle via
+        // _idle_guard — so the surface is never freed while GPU work
+        // is pending.
         let surface = Arc::new(unsafe {
             Surface::new(&state.instance, Arc::clone(&win))
         }?);
@@ -1192,6 +1235,24 @@ impl AppRunner {
             .as_ref()
             .map(|sc| sc.format())
             .unwrap_or(vk::Format::B8G8R8A8_UNORM);
+
+        let descriptor_set_layout = Arc::new(DescriptorSetLayout::new(
+            &device,
+            &[DescriptorBindingDesc {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                count: 1,
+                stage_flags: vk::ShaderStageFlags::VERTEX,
+            }],
+        )?);
+        let pipeline_layout = Arc::new(PipelineLayout::new(
+            &device,
+            &PipelineLayoutDesc {
+                set_layouts: &[&descriptor_set_layout],
+                ..Default::default()
+            },
+        )?);
+
         let pipeline = {
             let _span = tracing::trace_span!(
                 "pipeline_create",
@@ -1202,6 +1263,7 @@ impl AppRunner {
                 &device,
                 &shader,
                 pipeline_color_format,
+                Some(Arc::clone(&pipeline_layout)),
                 Some({
                     let idx = debug_counters.next_pipeline();
                     move || format!("main pipeline {idx}")
@@ -1232,9 +1294,7 @@ impl AppRunner {
                         Some(&format!("in flight [{i}]")),
                     )?,
                     command_buffer: command_pool.allocate_command_buffer()?,
-                    retained_swapchain: None,
                     retained_pipeline: None,
-                    retained_render_finished: None,
                 })
             })
             .collect::<eyre::Result<Vec<_>>>()?;
@@ -1248,6 +1308,38 @@ impl AppRunner {
                 )
             })
             .transpose()?;
+
+        let ubo_size = size_of::<Ubo>() as vk::DeviceSize;
+        let ubo_buffers = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|i| {
+                HostVisibleBuffer::new(
+                    &device,
+                    ubo_size,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    Some(&format!("ubo [{i}]")),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let descriptor_pool = DescriptorPool::new(
+            &device,
+            MAX_FRAMES_IN_FLIGHT as u32,
+            &[vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+            }],
+        )?;
+
+        let layouts: Vec<&DescriptorSetLayout> = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|_| descriptor_set_layout.as_ref())
+            .collect();
+        let descriptor_sets = descriptor_pool.allocate_sets(&layouts)?;
+        for (set, buf) in descriptor_sets.iter().zip(ubo_buffers.iter()) {
+            // SAFETY: buf is a valid UNIFORM_BUFFER from device with
+            // size ubo_size; it remains alive for the lifetime of the
+            // descriptor set (both live in RunningState/SuspendedState).
+            unsafe { set.write_uniform_buffer(&device, 0, buf, ubo_size) };
+        }
 
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
         let idle_guard =
@@ -1268,16 +1360,21 @@ impl AppRunner {
             frames,
             current_frame: 0,
             debug_counters,
+            descriptor_set_layout,
+            pipeline_layout,
+            descriptor_pool,
+            ubo_buffers,
+            descriptor_sets,
+            start_time: Instant::now(),
         })
     }
 
     fn suspended_to_running(
         state: SuspendedState,
     ) -> eyre::Result<RunningState> {
-        // SAFETY: Same contract as initializing_to_running: the surface
-        // outlives all derived swapchains via Arc<Surface>, and frame
-        // slots' retained_swapchain Arcs are cleared only after
-        // device.wait_idle() in the next suspended() call.
+        // SAFETY: The surface outlives all derived swapchains via
+        // Arc<Surface>. Frame slots' retained_pipeline Arcs are cleared
+        // after device.wait_idle() in the next suspended() call.
         let surface = Arc::new(unsafe {
             Surface::new(state.device.parent(), Arc::clone(&state.win))
         }?);
@@ -1331,6 +1428,7 @@ impl AppRunner {
                             &state.device,
                             &state.shader,
                             new_format,
+                            Some(Arc::clone(&state.pipeline_layout)),
                             Some({
                                 let idx = debug_counters.next_pipeline();
                                 move || format!("main pipeline {idx}")
@@ -1373,6 +1471,12 @@ impl AppRunner {
             frames: state.frames,
             current_frame: 0,
             debug_counters,
+            descriptor_set_layout: state.descriptor_set_layout,
+            pipeline_layout: state.pipeline_layout,
+            descriptor_pool: state.descriptor_pool,
+            ubo_buffers: state.ubo_buffers,
+            descriptor_sets: state.descriptor_sets,
+            start_time: state.start_time,
         })
     }
 
@@ -1389,14 +1493,15 @@ impl AppRunner {
             .entered();
             if let Err(e) = running_state.device.wait_idle() {
                 tracing::error!(
-                    "Error while waiting for device idle on zero extent: {}",
+                    "Error while waiting for device idle on zero \
+                     extent: {}",
                     e
                 );
                 return false;
             }
             for frame in &mut running_state.frames {
-                // SAFETY: wait_idle() succeeded above; no GPU work is in
-                // flight.
+                // SAFETY: wait_idle() succeeded above; no GPU work is
+                // in flight.
                 unsafe { frame.release_retained() };
             }
             running_state.swapchain = None;
@@ -1423,12 +1528,27 @@ impl AppRunner {
         )
         .entered();
 
+        // Wait for all GPU work to complete before replacing the
+        // swapchain. This ensures the old swapchain and its semaphores
+        // can be safely destroyed once the new ones are in place.
+        if let Err(e) = running_state.device.wait_idle() {
+            tracing::error!(
+                "Error waiting for device idle before swapchain \
+                 recreation: {}",
+                e
+            );
+            return false;
+        }
+        for frame in &mut running_state.frames {
+            // SAFETY: wait_idle() succeeded above.
+            unsafe { frame.release_retained() };
+        }
+
         let sc_idx = running_state.debug_counters.next_swapchain();
-        match Swapchain::new_with_old(
+        match Swapchain::new(
             &running_state.device,
             &running_state._surface,
             desired_extent,
-            running_state.swapchain.as_ref().map(|sc| sc.as_ref()),
             true,
             Some(running_state.pipeline_color_format),
             Some(move || format!("Swapchain {sc_idx}")),
@@ -1440,11 +1560,12 @@ impl AppRunner {
                     desired_extent.height
                 );
                 let new_format = swapchain.format();
-                let image_count = swapchain.images().len();
+                let new_image_count = swapchain.images().len();
                 running_state.swapchain = Some(Arc::new(swapchain));
+
                 match Self::make_render_finished_semaphores(
                     &running_state.device,
-                    image_count,
+                    new_image_count,
                 ) {
                     Ok(sems) => {
                         running_state.render_finished_semaphores = Some(sems);
@@ -1475,6 +1596,7 @@ impl AppRunner {
                         &running_state.device,
                         &running_state.shader,
                         new_format,
+                        Some(Arc::clone(&running_state.pipeline_layout)),
                         Some({
                             let idx =
                                 running_state.debug_counters.next_pipeline();

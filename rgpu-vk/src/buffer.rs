@@ -222,16 +222,9 @@ impl Drop for AllocatedBuffer {
 /// Suitable for staging uploads or small per-frame data. Write data
 /// with [`write_pod`](Self::write_pod), which copies bytes into the
 /// mapped region and flushes non-coherent memory ranges as needed.
+#[derive(Debug)]
 pub struct HostVisibleBuffer {
     inner: AllocatedBuffer,
-}
-
-impl std::fmt::Debug for HostVisibleBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostVisibleBuffer")
-            .field("inner", &self.inner)
-            .finish_non_exhaustive()
-    }
 }
 
 impl HostVisibleBuffer {
@@ -341,16 +334,9 @@ impl BufferHandle for HostVisibleBuffer {
 /// Provides the highest memory bandwidth but cannot be written by the
 /// CPU directly. Populate from a [`HostVisibleBuffer`] using
 /// [`upload_from_host_visible`](Self::upload_from_host_visible).
+#[derive(Debug)]
 pub struct DeviceLocalBuffer {
     inner: AllocatedBuffer,
-}
-
-impl std::fmt::Debug for DeviceLocalBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeviceLocalBuffer")
-            .field("inner", &self.inner)
-            .finish_non_exhaustive()
-    }
 }
 
 impl DeviceLocalBuffer {

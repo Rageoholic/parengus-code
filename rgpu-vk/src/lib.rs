@@ -11,6 +11,8 @@
 //! │   └── Swapchain<T>
 //! └── Device
 //!     ├── HostVisibleBuffer / DeviceLocalBuffer
+//!     ├── DescriptorSetLayout → DescriptorPool → DescriptorSet
+//!     ├── PipelineLayout (with DescriptorSetLayout refs)
 //!     ├── ShaderModule → EntryPoint → DynamicPipeline
 //!     ├── ResettableCommandPool → ResettableCommandBuffer
 //!     └── Fence / Semaphore
@@ -31,6 +33,7 @@
 
 pub mod buffer;
 pub mod command;
+pub mod descriptor;
 pub mod device;
 pub mod instance;
 pub mod pipeline;
