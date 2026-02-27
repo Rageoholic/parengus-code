@@ -1642,6 +1642,130 @@ impl Device {
     }
 }
 
+// Descriptor set functionality
+impl Device {
+    /// # Safety
+    /// `create_info` must be valid and reference only objects
+    /// derived from this device.
+    pub unsafe fn create_raw_descriptor_set_layout(
+        &self,
+        create_info: &vk::DescriptorSetLayoutCreateInfo<'_>,
+    ) -> Result<vk::DescriptorSetLayout, vk::Result> {
+        // SAFETY: Caller guarantees create_info validity.
+        unsafe {
+            self.handle
+                .create_descriptor_set_layout(create_info, None)
+        }
+    }
+
+    /// # Safety
+    /// `layout` must be a valid handle created from this device
+    /// and not yet destroyed. No descriptor pool that used this
+    /// layout may still exist.
+    pub unsafe fn destroy_raw_descriptor_set_layout(
+        &self,
+        layout: vk::DescriptorSetLayout,
+    ) {
+        // SAFETY: Caller guarantees layout provenance and ordering.
+        unsafe {
+            self.handle
+                .destroy_descriptor_set_layout(layout, None)
+        };
+    }
+
+    /// # Safety
+    /// `create_info` must be valid and reference only objects
+    /// derived from this device.
+    pub unsafe fn create_raw_descriptor_pool(
+        &self,
+        create_info: &vk::DescriptorPoolCreateInfo<'_>,
+    ) -> Result<vk::DescriptorPool, vk::Result> {
+        // SAFETY: Caller guarantees create_info validity.
+        unsafe {
+            self.handle.create_descriptor_pool(create_info, None)
+        }
+    }
+
+    /// # Safety
+    /// `pool` must be a valid handle created from this device and
+    /// not yet destroyed. All descriptor sets allocated from it
+    /// must not be referenced by any pending GPU work.
+    pub unsafe fn destroy_raw_descriptor_pool(
+        &self,
+        pool: vk::DescriptorPool,
+    ) {
+        // SAFETY: Caller guarantees pool provenance and ordering.
+        unsafe {
+            self.handle.destroy_descriptor_pool(pool, None)
+        };
+    }
+
+    /// # Safety
+    /// `alloc_info.descriptor_pool` must be a valid pool created
+    /// from this device with sufficient capacity. All layouts in
+    /// `alloc_info` must be valid handles derived from this device.
+    pub unsafe fn allocate_raw_descriptor_sets(
+        &self,
+        alloc_info: &vk::DescriptorSetAllocateInfo<'_>,
+    ) -> Result<Vec<vk::DescriptorSet>, vk::Result> {
+        // SAFETY: Caller guarantees alloc_info validity.
+        unsafe { self.handle.allocate_descriptor_sets(alloc_info) }
+    }
+
+    /// Write or copy descriptor set updates.
+    ///
+    /// # Safety
+    /// All handles in `descriptor_writes` and `descriptor_copies`
+    /// must be valid and derived from this device. Buffer and image
+    /// references in `descriptor_writes` must remain valid for as
+    /// long as the descriptor set is bound in a submitted command
+    /// buffer.
+    pub unsafe fn update_raw_descriptor_sets(
+        &self,
+        descriptor_writes: &[vk::WriteDescriptorSet<'_>],
+        descriptor_copies: &[vk::CopyDescriptorSet<'_>],
+    ) {
+        // SAFETY: Caller guarantees write/copy validity.
+        unsafe {
+            self.handle.update_descriptor_sets(
+                descriptor_writes,
+                descriptor_copies,
+            )
+        }
+    }
+
+    /// Bind descriptor sets for subsequent draw/dispatch commands.
+    ///
+    /// # Safety
+    /// - `command_buffer` must be in the recording state.
+    /// - `layout` must be compatible with the pipeline to be used.
+    /// - All handles in `descriptor_sets` must be valid and derived
+    ///   from this device.
+    /// - `dynamic_offsets` must match the number of dynamic
+    ///   descriptors in the bound sets.
+    pub unsafe fn cmd_bind_descriptor_sets(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        layout: vk::PipelineLayout,
+        first_set: u32,
+        descriptor_sets: &[vk::DescriptorSet],
+        dynamic_offsets: &[u32],
+    ) {
+        // SAFETY: Caller guarantees command buffer state, layout
+        // compatibility, and descriptor set validity.
+        unsafe {
+            self.handle.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                first_set,
+                descriptor_sets,
+                dynamic_offsets,
+            )
+        }
+    }
+}
+
 impl From<FetchPhysicalDeviceError> for CreateCompatibleError {
     fn from(value: FetchPhysicalDeviceError) -> Self {
         match value {

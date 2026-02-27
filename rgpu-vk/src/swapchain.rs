@@ -6,10 +6,11 @@
 //! reported capabilities. Prefer MAILBOX present mode when available,
 //! falling back to FIFO.
 //!
-//! For resize and suspension events, drop the existing swapchain (after
-//! GPU synchronisation) and construct a new one, or use
-//! [`new_with_old`](Swapchain::new_with_old) to allow driver-level
-//! resource reuse.
+//! For resize and suspension events, call `vkDeviceWaitIdle`, drop the
+//! existing swapchain, and construct a new one via [`new`](Swapchain::new).
+//! Alternatively, use [`new_with_old`](Swapchain::new_with_old) as a
+//! driver hint for resource reuse; see that method's documentation for
+//! the synchronisation constraints this imposes.
 
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -249,8 +250,12 @@ impl<T: HasDisplayHandle + HasWindowHandle> std::fmt::Debug for Swapchain<T> {
 impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
     /// Create a swapchain using no previous swapchain handle.
     ///
-    /// For resize/recreation paths, prefer `new_with_old` so drivers can
-    /// optimize resource reuse.
+    /// Suitable for any creation context. The simplest correct recreation
+    /// pattern is to call `vkDeviceWaitIdle` before replacing the old
+    /// swapchain, then call this function. Use [`new_with_old`](Self::new_with_old)
+    /// only when you want driver-level resource reuse as a performance hint
+    /// and are comfortable managing the associated present-lifecycle
+    /// synchronisation yourself.
     ///
     /// `preferred_format` is a hint for surface format selection. When the
     /// surface supports it, the swapchain will use that format. Falls back to
@@ -294,10 +299,30 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
     /// recreation optimization.
     ///
     /// `old_swapchain`, when provided, must originate from the same
-    /// `parent_device` and `parent_surface`.
+    /// `parent_device` and `parent_surface`. Setting it is a driver hint
+    /// that enables resource reuse and avoids visual gaps during resize.
     ///
-    /// The caller is responsible for synchronizing GPU usage so replacing the
-    /// old swapchain is safe for the application's frame lifecycle.
+    /// # Synchronisation responsibility
+    ///
+    /// The Vulkan spec does **not** guarantee that image indices in the new
+    /// swapchain correspond to the same indices in the old swapchain. Any
+    /// approach that releases per-image resources (semaphores, backing
+    /// buffers, etc.) when the new swapchain acquires index `i` — on the
+    /// assumption that the old swapchain's present for index `i` is now
+    /// done — is unsound. The safe alternatives are:
+    ///
+    /// - **Simple**: call `vkDeviceWaitIdle` before replacing the swapchain
+    ///   (so all presents have completed), then use [`new`](Self::new).
+    /// - **Precise**: enable `VK_KHR_swapchain_maintenance1` and attach a
+    ///   `VkSwapchainPresentFenceInfoEXT` to each present, giving you a
+    ///   per-present fence you can poll to know exactly when resources are
+    ///   safe to release without stalling.
+    ///
+    /// Note that combining `vkDeviceWaitIdle` with `new_with_old` is
+    /// counterproductive. The stall already guarantees all presents are
+    /// done, so `oldSwapchain`'s main benefit — keeping display scanout
+    /// running during the transition to avoid a visual gap — is moot.
+    /// You've paid the worst cost and gained nothing over [`new`](Self::new).
     ///
     /// See [`new`](Self::new) for the semantics of `preferred_format`.
     pub fn new_with_old<F>(

@@ -1,3 +1,11 @@
+struct Ubo
+{
+    column_major float4x4 model;
+};
+
+[[vk::binding(0, 0)]]
+ConstantBuffer<Ubo> ubo;
+
 struct VertexInput
 {
     [[vk::location(0)]]
@@ -17,7 +25,10 @@ struct VertexOutput
 VertexOutput vert_main(VertexInput input)
 {
     VertexOutput output;
-    output.sv_position = float4(input.position, 0.0, 1.0);
+    output.sv_position = mul(
+        ubo.model,
+        float4(input.position, 0.0, 1.0)
+    );
     output.color = input.color;
     return output;
 }

@@ -22,7 +22,9 @@ use ash::vk;
 use thiserror::Error;
 
 use crate::buffer::BufferHandle;
+use crate::descriptor::DescriptorSet;
 use crate::device::{Device, DynamicRenderingError};
+use crate::pipeline::PipelineLayout;
 
 /// Trait for types that expose a raw `VkCommandBuffer` handle.
 ///
@@ -592,6 +594,36 @@ impl ResettableCommandBuffer {
                 first_index,
                 vertex_offset,
                 first_instance,
+            )
+        }
+    }
+
+    /// Bind descriptor sets for subsequent draw commands.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state. `layout` must be
+    /// compatible with the pipeline that will be used for drawing.
+    /// All sets in `descriptor_sets` must be valid and allocated from
+    /// a pool derived from the same device as this command buffer.
+    pub unsafe fn bind_descriptor_sets(
+        &self,
+        layout: &PipelineLayout,
+        first_set: u32,
+        descriptor_sets: &[&DescriptorSet],
+    ) {
+        let raw_sets: Vec<vk::DescriptorSet> = descriptor_sets
+            .iter()
+            .map(|s| s.raw_descriptor_set())
+            .collect();
+        // SAFETY: Caller guarantees recording state, layout
+        // compatibility, and descriptor set validity.
+        unsafe {
+            self.parent.cmd_bind_descriptor_sets(
+                self.handle,
+                layout.raw_pipeline_layout(),
+                first_set,
+                &raw_sets,
+                &[],
             )
         }
     }
