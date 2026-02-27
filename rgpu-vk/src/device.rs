@@ -89,6 +89,7 @@ pub struct Device {
     dynamic_rendering: Option<DynamicRenderingLoader>,
     synchronization2: Synchronization2Loader,
     physical_device: vk::PhysicalDevice,
+    memory_budget: bool,
     /// Aliased queues share the same `Arc<Mutex<vk::Queue>>` so that locking
     /// either role serializes on the same underlying resource.
     graphics_present_queue: (Arc<Mutex<vk::Queue>>, u32),
@@ -240,6 +241,9 @@ impl Device {
             /// True when VK_KHR_shader_non_semantic_info should be
             /// enabled (available on this pre-1.3 device).
             enable_shader_non_semantic: bool,
+            /// True when VK_EXT_memory_budget is supported and
+            /// should be enabled.
+            enable_memory_budget: bool,
         }
 
         let mut candidates: Vec<DeviceCandidate> = Vec::new();
@@ -320,6 +324,12 @@ impl Device {
             let enable_shader_non_semantic =
                 is_pre_1_3 && has_ext(ash::khr::shader_non_semantic_info::NAME);
 
+            // VK_EXT_memory_budget: optional device extension.
+            // Enables accurate heap-usage/budget queries via
+            // vkGetPhysicalDeviceMemoryProperties2.
+            let enable_memory_budget =
+                has_ext(ash::ext::memory_budget::NAME);
+
             // VK_KHR_dynamic_rendering: core in 1.3; required extension
             // on older devices when dynamic rendering is requested —
             // hard filter.
@@ -385,6 +395,7 @@ impl Device {
                 use_sync2_ext,
                 use_dr_ext,
                 enable_shader_non_semantic,
+                enable_memory_budget,
             });
         }
 
@@ -498,6 +509,9 @@ impl Device {
         }
         if best.enable_shader_non_semantic {
             mandatory_exts.push(ash::khr::shader_non_semantic_info::NAME);
+        }
+        if best.enable_memory_budget {
+            mandatory_exts.push(ash::ext::memory_budget::NAME);
         }
         if use_sync2_ext {
             mandatory_exts.push(ash::khr::synchronization2::NAME);
@@ -613,6 +627,7 @@ impl Device {
             },
             handle: device,
             physical_device,
+            memory_budget: best.enable_memory_budget,
             graphics_present_queue: (gfx_queue_arc, graphics_present_family),
             transfer_queue: (transfer_queue_arc, transfer_family),
             compute_queue: (compute_queue_arc, compute_family),
@@ -625,6 +640,15 @@ impl Device {
 
     pub fn physical_device(&self) -> vk::PhysicalDevice {
         self.physical_device
+    }
+
+    /// Returns `true` if `VK_EXT_memory_budget` was enabled on this
+    /// device. When true, callers may chain
+    /// `vk::PhysicalDeviceMemoryBudgetPropertiesEXT` into
+    /// `vkGetPhysicalDeviceMemoryProperties2` to obtain accurate
+    /// per-heap usage and budget figures.
+    pub fn has_memory_budget(&self) -> bool {
+        self.memory_budget
     }
 
     pub fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {

@@ -1,5 +1,5 @@
 /target
 /out
 /.vscode
-/.claude
+/.claude/*.local.*
 tmpclaude-*
