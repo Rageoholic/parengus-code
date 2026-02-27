@@ -17,11 +17,11 @@ use std::sync::Arc;
 
 use ash::vk;
 use bytemuck::Pod;
-use gpu_allocator::{AllocationError, MemoryLocation, vulkan::Allocation};
+use gpu_allocator::{AllocationError, vulkan::Allocation};
 use thiserror::Error;
 
 use crate::command::CommandBufferHandle;
-use crate::device::Device;
+use crate::device::{Device, MemoryUsage};
 
 /// Trait for types that expose a raw `VkBuffer` handle.
 ///
@@ -133,7 +133,7 @@ impl AllocatedBuffer {
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
         name: Option<&str>,
-        location: MemoryLocation,
+        memory_usage: MemoryUsage,
     ) -> Result<Self, CreateBufferError> {
         let create_info = vk::BufferCreateInfo::default()
             .size(size)
@@ -154,7 +154,7 @@ impl AllocatedBuffer {
         let reqs = unsafe { device.get_raw_buffer_memory_requirements(handle) };
         let allocation_name = name.unwrap_or("buffer");
         let allocation = device
-            .allocate_memory(allocation_name, reqs, location, true)
+            .allocate_memory(allocation_name, reqs, memory_usage, true)
             .map_err(|e| {
                 // SAFETY: handle was created from this device and is not bound
                 // to memory yet.
@@ -240,7 +240,7 @@ impl HostVisibleBuffer {
                 size,
                 usage,
                 name,
-                MemoryLocation::CpuToGpu,
+                MemoryUsage::CpuToGpu,
             )?,
         })
     }
@@ -352,7 +352,7 @@ impl DeviceLocalBuffer {
                 size,
                 usage,
                 name,
-                MemoryLocation::GpuOnly,
+                MemoryUsage::GpuOnly,
             )?,
         })
     }
