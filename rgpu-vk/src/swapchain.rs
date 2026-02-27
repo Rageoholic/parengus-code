@@ -433,7 +433,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
             })
         };
         if let Err(e) = name_result {
-            tracing::warn!("Failed to name swapchain {:?}: {e}", handle);
+            tracing::warn!("Failed to name swapchain {handle:?}: {e}");
         }
         // SAFETY: handle was created by this device's swapchain loader
         // and is valid.

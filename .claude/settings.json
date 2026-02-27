@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo clippy*)",
+      "Bash(cargo check*)",
+      "Bash(cargo build*)",
+      "Bash(cargo xtask*)",
+      "Bash(rg*)",
+      "Bash(git log*)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git show*)",
+      "Bash(cat*)",
+      "Bash(ls*)",
+      "Bash(grep*)",
+      "Bash(cargo tree*)",
+      "Bash(cargo metadata*)",
+      "Bash(head*)",
+      "Bash(tail*)",
+      "Bash(wc*)",
+      "Bash(find*)",
+      "Bash(tree*)",
+      "Bash(which*)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:doc.rust-lang.org)",
+      "WebFetch(domain:registry.khronos.org)",
+      "WebFetch(domain:khronos.org)"
+    ]
+  }
+}
