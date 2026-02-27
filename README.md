@@ -86,6 +86,9 @@ If `shader.debug.spv` is missing, the app falls back to `shader.spv`.
 
 ## Useful checks
 
+The project targets zero clippy warnings; CI enforces `-D warnings`
+per package.
+
 ```sh
 cargo check -p rgpu-vk
 cargo check -p samp-app

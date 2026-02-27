@@ -51,6 +51,22 @@ enum Synchronization2Loader {
     Extension(ash::khr::synchronization2::Device),
 }
 
+/// Describes how an allocation will be accessed by CPU and GPU.
+///
+/// Passed to [`Device::allocate_memory`] to select the best-matching
+/// Vulkan memory type and determine whether atom-size padding is
+/// required for non-coherent flush alignment.
+#[derive(Copy, Clone, Debug)]
+pub enum MemoryUsage {
+    /// GPU-only storage. Highest bandwidth; not CPU-mappable.
+    GpuOnly,
+    /// CPU-writable, GPU-readable. For staging buffers and
+    /// per-frame uploads.
+    CpuToGpu,
+    /// GPU-writable, CPU-readable. For readback.
+    GpuToCpu,
+}
+
 /// A logical Vulkan device and its associated per-device state.
 ///
 /// Wraps an `ash::Device`, a `gpu-allocator` allocator (behind a
@@ -623,26 +639,96 @@ impl Device {
         self.properties.limits.non_coherent_atom_size
     }
 
+    /// Score a memory type for a given usage; returns `None` if the
+    /// type is incompatible.  Higher scores are more preferred.
+    fn score_memory_type(
+        flags: vk::MemoryPropertyFlags,
+        usage: MemoryUsage,
+    ) -> Option<u32> {
+        use vk::MemoryPropertyFlags as F;
+        let device_local = flags.contains(F::DEVICE_LOCAL);
+        let host_visible = flags.contains(F::HOST_VISIBLE);
+        let host_cached = flags.contains(F::HOST_CACHED);
+        match usage {
+            MemoryUsage::GpuOnly => {
+                // Prefer pure VRAM; penalise HOST_VISIBLE (unified).
+                device_local.then_some(if host_visible { 1 } else { 2 })
+            }
+            MemoryUsage::CpuToGpu => {
+                // Prefer DEVICE_LOCAL (ReBAR / unified memory).
+                host_visible.then_some(if device_local { 2 } else { 1 })
+            }
+            MemoryUsage::GpuToCpu => {
+                // Prefer HOST_CACHED for efficient CPU reads.
+                host_visible.then_some(if host_cached { 2 } else { 1 })
+            }
+        }
+    }
+
+    /// Select the best Vulkan memory type index for `requirements`
+    /// and `usage`.  Among types with equal score the lowest index
+    /// wins, matching Vulkan's convention that earlier types in the
+    /// list are more preferred within the same heap.
+    fn select_memory_type(
+        &self,
+        requirements: vk::MemoryRequirements,
+        usage: MemoryUsage,
+    ) -> Option<u32> {
+        self.memory_properties.memory_types
+            [..self.memory_properties.memory_type_count as usize]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| requirements.memory_type_bits & (1 << i) != 0)
+            .filter_map(|(i, ty)| {
+                Self::score_memory_type(ty.property_flags, usage)
+                    .map(|s| (i as u32, s))
+            })
+            .max_by(|(i1, s1), (i2, s2)| s1.cmp(s2).then(i2.cmp(i1)))
+            .map(|(i, _)| i)
+    }
+
     /// Allocate device memory for the given requirements.
     ///
-    /// `requirements.size` and `requirements.alignment` are both
-    /// rounded up to `VkPhysicalDeviceLimits::nonCoherentAtomSize`
-    /// before allocation. This guarantees that every allocation's
-    /// offset and size are atom-multiples, so callers can construct
-    /// valid `VkMappedMemoryRange` structs without additional
-    /// alignment arithmetic.
+    /// Selects the best-matching Vulkan memory type for `usage`,
+    /// narrows `requirements.memory_type_bits` to that type, then
+    /// rounds `size` and `alignment` up to
+    /// `VkPhysicalDeviceLimits::nonCoherentAtomSize` only when the
+    /// chosen type is HOST_VISIBLE but not HOST_COHERENT.
     pub fn allocate_memory(
         &self,
         name: &str,
         requirements: vk::MemoryRequirements,
-        location: MemoryLocation,
+        usage: MemoryUsage,
         linear: bool,
     ) -> Result<Allocation, AllocationError> {
         let atom = self.properties.limits.non_coherent_atom_size;
-        let requirements = vk::MemoryRequirements {
-            size: requirements.size.div_ceil(atom) * atom,
-            alignment: requirements.alignment.max(atom),
-            ..requirements
+        let requirements =
+            if let Some(idx) = self.select_memory_type(requirements, usage) {
+                use vk::MemoryPropertyFlags as F;
+                let flags = self.memory_properties.memory_types[idx as usize]
+                    .property_flags;
+                let non_coherent_visible = flags.contains(F::HOST_VISIBLE)
+                    && !flags.contains(F::HOST_COHERENT);
+                let (size, alignment) = if non_coherent_visible {
+                    (
+                        requirements.size.div_ceil(atom) * atom,
+                        requirements.alignment.max(atom),
+                    )
+                } else {
+                    (requirements.size, requirements.alignment)
+                };
+                vk::MemoryRequirements {
+                    size,
+                    alignment,
+                    memory_type_bits: 1 << idx,
+                }
+            } else {
+                requirements
+            };
+        let location = match usage {
+            MemoryUsage::GpuOnly => MemoryLocation::GpuOnly,
+            MemoryUsage::CpuToGpu => MemoryLocation::CpuToGpu,
+            MemoryUsage::GpuToCpu => MemoryLocation::GpuToCpu,
         };
         let allocator = self
             .allocator
@@ -1652,10 +1738,7 @@ impl Device {
         create_info: &vk::DescriptorSetLayoutCreateInfo<'_>,
     ) -> Result<vk::DescriptorSetLayout, vk::Result> {
         // SAFETY: Caller guarantees create_info validity.
-        unsafe {
-            self.handle
-                .create_descriptor_set_layout(create_info, None)
-        }
+        unsafe { self.handle.create_descriptor_set_layout(create_info, None) }
     }
 
     /// # Safety
@@ -1667,10 +1750,7 @@ impl Device {
         layout: vk::DescriptorSetLayout,
     ) {
         // SAFETY: Caller guarantees layout provenance and ordering.
-        unsafe {
-            self.handle
-                .destroy_descriptor_set_layout(layout, None)
-        };
+        unsafe { self.handle.destroy_descriptor_set_layout(layout, None) };
     }
 
     /// # Safety
@@ -1681,23 +1761,16 @@ impl Device {
         create_info: &vk::DescriptorPoolCreateInfo<'_>,
     ) -> Result<vk::DescriptorPool, vk::Result> {
         // SAFETY: Caller guarantees create_info validity.
-        unsafe {
-            self.handle.create_descriptor_pool(create_info, None)
-        }
+        unsafe { self.handle.create_descriptor_pool(create_info, None) }
     }
 
     /// # Safety
     /// `pool` must be a valid handle created from this device and
     /// not yet destroyed. All descriptor sets allocated from it
     /// must not be referenced by any pending GPU work.
-    pub unsafe fn destroy_raw_descriptor_pool(
-        &self,
-        pool: vk::DescriptorPool,
-    ) {
+    pub unsafe fn destroy_raw_descriptor_pool(&self, pool: vk::DescriptorPool) {
         // SAFETY: Caller guarantees pool provenance and ordering.
-        unsafe {
-            self.handle.destroy_descriptor_pool(pool, None)
-        };
+        unsafe { self.handle.destroy_descriptor_pool(pool, None) };
     }
 
     /// # Safety
@@ -1727,10 +1800,8 @@ impl Device {
     ) {
         // SAFETY: Caller guarantees write/copy validity.
         unsafe {
-            self.handle.update_descriptor_sets(
-                descriptor_writes,
-                descriptor_copies,
-            )
+            self.handle
+                .update_descriptor_sets(descriptor_writes, descriptor_copies)
         }
     }
 

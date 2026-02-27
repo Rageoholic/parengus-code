@@ -27,6 +27,13 @@ git config core.hooksPath .githooks
 - `Surface<T>` holds `Arc<Instance>` and `Arc<T>` for lifetime safety.
 - Device selection uses a priority-based fold over physical devices.
 
+## Verification
+
+Always use `cargo clippy` (not just `cargo check`) to verify code after
+writing it. CI runs clippy with `-D warnings` per package; rust-analyzer
+surfaces clippy diagnostics in the editor but Claude Code cannot observe
+them, so running clippy in the shell is the only reliable check.
+
 ## Feature Unification Gotcha
 Workspace feature unification can hide missing features. Always verify
 individual crates with `cargo check -p <crate>` rather than relying on
