@@ -213,6 +213,42 @@ impl DescriptorSet {
         self.handle
     }
 
+    /// Update this descriptor set's binding with a combined image sampler.
+    ///
+    /// # Safety
+    /// - `image_view` must be a valid `VkImageView` created from `device`.
+    /// - `sampler` must be a valid `VkSampler` created from `device`.
+    /// - `image_layout` must be the layout the image will be in when
+    ///   shaders access it (typically `SHADER_READ_ONLY_OPTIMAL`).
+    /// - Both handles must remain valid for as long as this descriptor
+    ///   set is bound in any submitted command buffer.
+    pub unsafe fn write_combined_image_sampler(
+        &self,
+        device: &Arc<Device>,
+        binding: u32,
+        image_view: vk::ImageView,
+        sampler: vk::Sampler,
+        image_layout: vk::ImageLayout,
+    ) {
+        let image_info = vk::DescriptorImageInfo::default()
+            .image_view(image_view)
+            .sampler(sampler)
+            .image_layout(image_layout);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.handle)
+            .dst_binding(binding)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&image_info));
+        // SAFETY: Caller guarantees device, image_view, sampler, and
+        // image_layout validity.
+        unsafe {
+            device.update_raw_descriptor_sets(
+                std::slice::from_ref(&write),
+                &[],
+            )
+        }
+    }
+
     /// Update this descriptor set's binding with a uniform buffer.
     ///
     /// # Safety

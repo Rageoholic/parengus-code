@@ -22,12 +22,14 @@ use rgpu_vk::{
         DescriptorSetLayout,
     },
     device::{Device, DeviceConfig, QueueMode},
+    image::{DeviceLocalImage, ImageView},
     instance::{Instance, InstanceExtensions},
     pipeline::{
         CullModeFlags, DynamicPipeline, DynamicPipelineDesc, FrontFace,
         PipelineLayout, PipelineLayoutDesc, VertexAttributeDesc,
         VertexBindingDesc, VertexInputRate,
     },
+    sampler::Sampler,
     shader::{ShaderModule, ShaderStage},
     surface::Surface,
     swapchain::Swapchain,
@@ -52,7 +54,7 @@ use winit::{
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct Vertex {
     position: Vec2<f32>,
-    color: Vec3<f32>,
+    tex_coord: Vec2<f32>,
 }
 
 #[repr(C)]
@@ -64,19 +66,19 @@ struct Ubo {
 const RECT_VERTICES: [Vertex; 4] = [
     Vertex {
         position: Vec2::new(-0.5, -0.5),
-        color: Vec3::new(0.0, 0.0, 1.0),
+        tex_coord: Vec2::new(0.0, 0.0),
     },
     Vertex {
         position: Vec2::new(0.5, 0.5),
-        color: Vec3::new(1.0, 1.0, 1.0),
+        tex_coord: Vec2::new(1.0, 1.0),
     },
     Vertex {
         position: Vec2::new(0.5, -0.5),
-        color: Vec3::new(0.0, 1.0, 1.0),
+        tex_coord: Vec2::new(1.0, 0.0),
     },
     Vertex {
         position: Vec2::new(-0.5, 0.5),
-        color: Vec3::new(1.0, 0.0, 1.0),
+        tex_coord: Vec2::new(0.0, 1.0),
     },
 ];
 
@@ -475,6 +477,9 @@ struct RunningState {
     /// used to drive the rotation animation.
     start_time: Instant,
     asset_map: AssetMap,
+    texture: DeviceLocalImage,
+    texture_view: ImageView,
+    sampler: Sampler,
 }
 
 impl std::fmt::Debug for RunningState {
@@ -518,6 +523,9 @@ struct SuspendedState {
     descriptor_sets: Vec<DescriptorSet>,
     start_time: Instant,
     asset_map: AssetMap,
+    texture: DeviceLocalImage,
+    texture_view: ImageView,
+    sampler: Sampler,
 }
 #[derive(Debug)]
 struct ExitingState {}
@@ -597,6 +605,9 @@ impl ApplicationHandler for AppRunner {
                 descriptor_sets,
                 start_time,
                 asset_map,
+                texture,
+                texture_view,
+                sampler,
             } = running_state;
 
             if let Err(e) = device.wait_idle() {
@@ -634,6 +645,9 @@ impl ApplicationHandler for AppRunner {
                 descriptor_sets,
                 start_time,
                 asset_map,
+                texture,
+                texture_view,
+                sampler,
             });
         }
     }
@@ -1066,8 +1080,8 @@ where
         VertexAttributeDesc {
             location: 1,
             binding: 0,
-            format: vk::Format::R32G32B32_SFLOAT,
-            offset: std::mem::offset_of!(Vertex, color) as u32,
+            format: vk::Format::R32G32_SFLOAT,
+            offset: std::mem::offset_of!(Vertex, tex_coord) as u32,
         },
     ];
     Ok(DynamicPipeline::new(
@@ -1252,12 +1266,20 @@ impl AppRunner {
 
         let descriptor_set_layout = Arc::new(DescriptorSetLayout::new(
             &device,
-            &[DescriptorBindingDesc {
-                binding: 0,
-                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-                count: 1,
-                stage_flags: vk::ShaderStageFlags::VERTEX,
-            }],
+            &[
+                DescriptorBindingDesc {
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                    count: 1,
+                    stage_flags: vk::ShaderStageFlags::VERTEX,
+                },
+                DescriptorBindingDesc {
+                    binding: 1,
+                    descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    count: 1,
+                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                },
+            ],
         )?);
         let pipeline_layout = Arc::new(PipelineLayout::new(
             &device,
@@ -1338,10 +1360,16 @@ impl AppRunner {
         let descriptor_pool = DescriptorPool::new(
             &device,
             MAX_FRAMES_IN_FLIGHT as u32,
-            &[vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
-            }],
+            &[
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::UNIFORM_BUFFER,
+                    descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+                },
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+                },
+            ],
         )?;
 
         let layouts: Vec<&DescriptorSetLayout> = (0..MAX_FRAMES_IN_FLIGHT)
@@ -1363,6 +1391,79 @@ impl AppRunner {
             })?,
         )?;
         tracing::debug!(asset_map = ?asset_map.map, "Loaded asset map");
+
+        let tex_filename = asset_map
+            .map
+            .get("statue-tex")
+            .ok_or_else(|| eyre::eyre!("asset 'statue-tex' not in map"))?;
+        let tex_path = state.self_dir.join("assets").join(tex_filename);
+        let tex_img = image::open(&tex_path)
+            .map_err(|e| {
+                eyre::eyre!(
+                    "Failed to open texture {}: {e}",
+                    tex_path.display()
+                )
+            })?
+            .into_rgba8();
+        let (tex_width, tex_height) = tex_img.dimensions();
+        let tex_bytes = tex_img.into_raw();
+        let tex_staging_size = tex_bytes.len() as vk::DeviceSize;
+
+        let mut tex_staging = HostVisibleBuffer::new(
+            &device,
+            tex_staging_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            Some("statue-tex staging"),
+        )?;
+        tex_staging.write_pod(tex_bytes.as_slice())?;
+
+        let texture = rgpu_vk::image::DeviceLocalImage::new(
+            &device,
+            tex_width,
+            tex_height,
+            vk::Format::R8G8B8A8_SRGB,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            Some("statue-tex"),
+        )?;
+        // SAFETY: upload_command_pool is used on this thread only during
+        // initialisation and the None fence path waits for device idle
+        // before returning, so staging/image buffers outlive GPU access.
+        unsafe {
+            texture.upload_from_host_visible(
+                &mut upload_command_buffer,
+                &tex_staging,
+                None,
+            )
+        }?;
+
+        let texture_view = rgpu_vk::image::ImageView::new(
+            &device,
+            &texture,
+            Some("statue-tex view"),
+        )?;
+
+        let sampler = rgpu_vk::sampler::Sampler::new(
+            &device,
+            vk::Filter::LINEAR,
+            vk::Filter::LINEAR,
+            vk::SamplerAddressMode::REPEAT,
+            Some("statue-tex sampler"),
+        )?;
+
+        for set in &descriptor_sets {
+            // SAFETY: texture_view and sampler are valid handles from device
+            // and remain alive for the lifetime of the descriptor set (both
+            // live in RunningState/SuspendedState).
+            unsafe {
+                set.write_combined_image_sampler(
+                    &device,
+                    1,
+                    texture_view.raw_image_view(),
+                    sampler.raw_sampler(),
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                )
+            };
+        }
 
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
         let idle_guard =
@@ -1390,6 +1491,9 @@ impl AppRunner {
             descriptor_sets,
             start_time: Instant::now(),
             asset_map,
+            texture,
+            texture_view,
+            sampler,
         })
     }
 
@@ -1502,6 +1606,9 @@ impl AppRunner {
             descriptor_sets: state.descriptor_sets,
             start_time: state.start_time,
             asset_map: state.asset_map,
+            texture: state.texture,
+            texture_view: state.texture_view,
+            sampler: state.sampler,
         })
     }
 
