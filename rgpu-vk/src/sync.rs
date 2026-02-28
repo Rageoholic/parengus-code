@@ -32,6 +32,17 @@ pub enum WaitFenceError {
     Timeout,
     #[error("Vulkan error waiting for fence: {0}")]
     Vulkan(vk::Result),
+    #[error("Asked to wait for fence but fence was never marked as submitted")]
+    NotSubmitted,
+}
+
+#[derive(Debug, Error)]
+pub enum MarkSubmittedError {
+    #[error(
+        "This fence is already marked as submitted but was marked \
+         submitted again"
+    )]
+    AlreadySubmitted,
 }
 
 #[derive(Debug, Error)]
@@ -44,6 +55,12 @@ pub enum CreateSemaphoreError {
 // Fence
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, PartialEq, Eq)]
+enum FenceStatus {
+    Submitted,
+    Ready,
+}
+
 /// An owned binary fence used for CPU–GPU synchronisation.
 ///
 /// Use [`wait`](Self::wait) to block the CPU until the GPU signals the fence,
@@ -52,12 +69,14 @@ pub enum CreateSemaphoreError {
 pub struct Fence {
     parent: Arc<Device>,
     handle: vk::Fence,
+    status: FenceStatus,
 }
 
 impl std::fmt::Debug for Fence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Fence")
             .field("handle", &self.handle)
+            .field("status", &self.status)
             .finish_non_exhaustive()
     }
 }
@@ -96,25 +115,59 @@ impl Fence {
         Ok(Self {
             parent: Arc::clone(device),
             handle,
+            status: if signaled {
+                FenceStatus::Submitted
+            } else {
+                FenceStatus::Ready
+            },
         })
+    }
+
+    pub fn wait_nonblocking(&self) -> Result<bool, WaitFenceError> {
+        match self.wait(0) {
+            Ok(_) => Ok(true),
+            Err(WaitFenceError::Timeout) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn wait_and_reset_nonblocking(
+        &mut self,
+    ) -> Result<bool, WaitFenceError> {
+        let signaled = self.wait_nonblocking()?;
+        if signaled {
+            // SAFETY: wait_nonblocking returned true, so the fence is
+            // signaled and no longer pending on the GPU. &mut self
+            // prevents same-thread re-submission via raw_fence() between
+            // the wait and the reset.
+            unsafe { self.reset() }.map_err(WaitFenceError::Vulkan)?;
+        }
+        Ok(signaled)
     }
 
     /// Block until the fence is signaled or `timeout_ns` nanoseconds elapse.
     ///
     /// Pass `u64::MAX` to wait indefinitely.
     pub fn wait(&self, timeout_ns: u64) -> Result<(), WaitFenceError> {
-        // SAFETY: handle is a valid fence created from parent.
-        unsafe {
-            self.parent
-                .wait_for_raw_fences(&[self.handle], true, timeout_ns)
-        }
-        .map_err(|e| {
-            if e == vk::Result::TIMEOUT {
-                WaitFenceError::Timeout
-            } else {
-                WaitFenceError::Vulkan(e)
+        if self.status == FenceStatus::Submitted {
+            // SAFETY: handle is a valid fence created from parent.
+            unsafe {
+                self.parent.wait_for_raw_fences(
+                    &[self.handle],
+                    true,
+                    timeout_ns,
+                )
             }
-        })
+            .map_err(|e| {
+                if e == vk::Result::TIMEOUT {
+                    WaitFenceError::Timeout
+                } else {
+                    WaitFenceError::Vulkan(e)
+                }
+            })
+        } else {
+            Err(WaitFenceError::NotSubmitted)
+        }
     }
 
     /// Reset the fence to the unsignaled state.
@@ -123,8 +176,11 @@ impl Fence {
     /// The fence must not be currently pending on any queue submission
     /// (i.e. the GPU must have already signaled it, or it was never submitted).
     pub unsafe fn reset(&mut self) -> Result<(), vk::Result> {
+        debug_assert!(self.status == FenceStatus::Submitted);
         // SAFETY: Caller guarantees the fence is not pending.
-        unsafe { self.parent.reset_raw_fences(&[self.handle]) }
+        unsafe { self.parent.reset_raw_fences(&[self.handle]) }?;
+        self.status = FenceStatus::Ready;
+        Ok(())
     }
 
     /// Wait for the fence to be signaled and then immediately reset it.
@@ -149,18 +205,39 @@ impl Fence {
         unsafe { self.reset() }.map_err(WaitFenceError::Vulkan)
     }
 
-    /// Returns `true` if the fence is currently in the signaled state.
-    pub fn is_signaled(&self) -> Result<bool, vk::Result> {
-        // SAFETY: handle is a valid fence created from parent.
-        unsafe { self.parent.get_raw_fence_status(self.handle) }
+    /// This marks the fence as submitted, so that it can properly be waited.
+    ///
+    /// # Safety
+    /// The fence must actually be submitted to some operation that will signal
+    /// it when the operation is completed, such as vkQueueSubmit. It is
+    /// undefined behavior if this operation is called while the underlying
+    /// VkFence is not submitted
+    pub unsafe fn mark_submitted(&mut self) -> Result<(), MarkSubmittedError> {
+        if self.status == FenceStatus::Ready {
+            self.status = FenceStatus::Submitted;
+            Ok(())
+        } else {
+            Err(MarkSubmittedError::AlreadySubmitted)
+        }
     }
 
     pub fn raw_fence(&self) -> vk::Fence {
         self.handle
     }
 
-    pub fn get_parent(&self) -> &Arc<Device> {
+    pub fn parent(&self) -> &Arc<Device> {
         &self.parent
+    }
+
+    /// Is the fence in an unsignaled state where we can submit it to something
+    /// like vkQueueSubmit
+    pub fn is_ready(&self) -> bool {
+        self.status == FenceStatus::Ready
+    }
+
+    /// Is the fence in a submitted state where we can wait on it and reset it
+    pub fn is_submitted(&self) -> bool {
+        self.status == FenceStatus::Submitted
     }
 }
 

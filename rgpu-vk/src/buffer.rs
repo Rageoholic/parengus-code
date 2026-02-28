@@ -482,7 +482,7 @@ impl DeviceLocalBuffer {
 
         // SAFETY: command buffer is executable and references valid resources.
         unsafe {
-            self.parent().graphics_present_queue_submit2(
+            self.parent().graphics_present_queue_submit2_raw_fence(
                 std::slice::from_ref(&upload_submit),
                 submit_fence,
             )
