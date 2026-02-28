@@ -134,11 +134,15 @@ impl Fence {
     pub fn wait_and_reset_nonblocking(
         &mut self,
     ) -> Result<bool, WaitFenceError> {
-        let wait_res = self.wait_nonblocking()?;
-        // SAFETY: wait succeeded so the fence is signaled and not pending. &mut
-        // prevents multiple resubmission between wait and submit.
-        unsafe { self.reset() }.map_err(WaitFenceError::Vulkan)?;
-        Ok(wait_res)
+        let signaled = self.wait_nonblocking()?;
+        if signaled {
+            // SAFETY: wait_nonblocking returned true, so the fence is
+            // signaled and no longer pending on the GPU. &mut self
+            // prevents same-thread re-submission via raw_fence() between
+            // the wait and the reset.
+            unsafe { self.reset() }.map_err(WaitFenceError::Vulkan)?;
+        }
+        Ok(signaled)
     }
 
     /// Block until the fence is signaled or `timeout_ns` nanoseconds elapse.
