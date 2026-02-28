@@ -119,12 +119,16 @@ impl From<TracingLogLevel> for LevelFilter {
 #[command(about = "Sample Vulkan app", long_about = None)]
 struct CliArgs {
     /// Tracing verbosity for stdout/file logging.
-    #[arg(short, long, default_value = "error")]
+    #[arg(long, default_value = "error")]
     tracing_log_level: TracingLogLevel,
 
     /// Vulkan validation/debug callback severity threshold.
-    #[arg(short, long)]
+    #[arg(long)]
     graphics_debug_level: Option<CliVulkanLogLevel>,
+
+    /// rgpu_vk tracing verbosity; defaults to --tracing-log-level.
+    #[arg(long)]
+    rgpu_log_level: Option<TracingLogLevel>,
 
     /// Queue-family selection strategy for graphics/present.
     #[arg(long, default_value = "auto")]
@@ -191,19 +195,27 @@ impl From<CliVulkanLogLevel> for rgpu_vk::instance::VulkanLogLevel {
     }
 }
 
-/// Build a [`Targets`] filter combining the general tracing level and
-/// the optional graphics debug level.
+/// Build a [`Targets`] filter combining the global tracing level,
+/// an optional `rgpu_vk`-specific override, and an optional
+/// Vulkan debug-utils-specific override.
 ///
-/// The default target uses `tracing_level`. When `gfx_level` maps to
-/// a more permissive [`LevelFilter`] than the default, an `"rgpu_vk"`
-/// target override is added so Vulkan messages are visible without
-/// requiring a matching `-t` flag.
+/// The default target uses `tracing_level`. When `rgpu_level` differs
+/// from the default, an `"rgpu_vk"` target override is added. When
+/// `gfx_level` maps to a more permissive filter than the effective
+/// `rgpu_vk` level, a `"rgpu_vk::instance::debug_utils"` override is
+/// added so Vulkan callback messages are not suppressed by the broader
+/// `rgpu_vk` filter.
 fn subscriber_filter(
     tracing_level: TracingLogLevel,
+    rgpu_level: Option<TracingLogLevel>,
     gfx_level: Option<CliVulkanLogLevel>,
 ) -> Targets {
     let base = LevelFilter::from(tracing_level);
+    let rgpu_filter = rgpu_level.map(LevelFilter::from).unwrap_or(base);
     let mut targets = Targets::new().with_default(base);
+    if rgpu_filter != base {
+        targets = targets.with_target("rgpu_vk", rgpu_filter);
+    }
     if let Some(gfx) = gfx_level {
         let gfx_filter = match gfx {
             CliVulkanLogLevel::Trace => LevelFilter::TRACE,
@@ -211,11 +223,9 @@ fn subscriber_filter(
             CliVulkanLogLevel::Warn => LevelFilter::WARN,
             CliVulkanLogLevel::Error => LevelFilter::ERROR,
         };
-        // LevelFilter::max returns the more permissive level
-        // (TRACE > ERROR in tracing's ordering).
-        let effective = base.max(gfx_filter);
-        if effective != base {
-            targets = targets.with_target("rgpu_vk", effective);
+        if gfx_filter > rgpu_filter {
+            targets = targets
+                .with_target("rgpu_vk::instance::debug_utils", gfx_filter);
         }
     }
     targets
@@ -244,7 +254,10 @@ fn main() -> eyre::Result<()> {
     let cli_args = CliArgs::parse();
 
     let needs_subscriber = cli_args.tracing_log_level != TracingLogLevel::Off
-        || cli_args.graphics_debug_level.is_some();
+        || cli_args.graphics_debug_level.is_some()
+        || cli_args
+            .rgpu_log_level
+            .is_some_and(|l| l != TracingLogLevel::Off);
 
     if needs_subscriber {
         fs::create_dir_all(&log_dir)?;
@@ -264,6 +277,7 @@ fn main() -> eyre::Result<()> {
 
         let filter = subscriber_filter(
             cli_args.tracing_log_level,
+            cli_args.rgpu_log_level,
             cli_args.graphics_debug_level,
         );
         tracing_subscriber::registry()
