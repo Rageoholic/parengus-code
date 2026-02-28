@@ -165,7 +165,7 @@ unsafe extern "system" fn vulkan_debug_callback(
     match message_severity {
         vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => {
             tracing::trace!(
-                target: "rvk-debug-messenger",
+                target: "rgpu_vk::instance::debug_utils",
                 "[{}] {}",
                 type_str,
                 message
@@ -173,7 +173,7 @@ unsafe extern "system" fn vulkan_debug_callback(
         }
         vk::DebugUtilsMessageSeverityFlagsEXT::INFO => {
             tracing::info!(
-                target: "rvk-debug-messenger",
+                target: "rgpu_vk::instance::debug_utils",
                 "[{}] {}",
                 type_str,
                 message
@@ -181,7 +181,7 @@ unsafe extern "system" fn vulkan_debug_callback(
         }
         vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
             tracing::warn!(
-                target: "rvk-debug-messenger",
+                target: "rgpu_vk::instance::debug_utils",
                 "[{}] {}",
                 type_str,
                 message
@@ -189,7 +189,7 @@ unsafe extern "system" fn vulkan_debug_callback(
         }
         vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => {
             tracing::error!(
-                target: "rvk-debug-messenger",
+                target: "rgpu_vk::instance::debug_utils",
                 "[{}] {}",
                 type_str,
                 message
@@ -197,7 +197,7 @@ unsafe extern "system" fn vulkan_debug_callback(
         }
         _ => {
             tracing::debug!(
-                target: "rvk-debug-messenger",
+                target: "rgpu_vk::instance::debug_utils",
                 "[{}] {}",
                 type_str,
                 message
