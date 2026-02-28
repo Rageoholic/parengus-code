@@ -1,0 +1,12 @@
+[[asset]]
+name = "statue-tex"
+file = "statue-tex.png"
+source = "https://pixabay.com/photos/statue-sculpture-figure-1275469/"
+author = "Undocumented on Pixabay"
+license = "Pixabay Content License https://pixabay.com/service/terms/"
+type = "image"
+notes = """
+Modified by vulkan-tutorial \
+(https://docs.vulkan.org/tutorial/latest/06_Texture_mapping/00_Images.html) \
+to be 512x512. Incorrectly marked CC0 on the tutorial\
+"""

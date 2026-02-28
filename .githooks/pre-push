@@ -1,14 +1,26 @@
 #!/bin/bash
 set -e
 
+command -v git-lfs >/dev/null 2>&1 || {
+    echo >&2 "git-lfs not found; install it or remove the LFS \
+configuration from this repo."
+    exit 2
+}
+
+# Buffer stdin so both consumers can read it.
+stdin=$(cat)
+
+# Upload LFS objects before the push proceeds.
+echo "$stdin" | git lfs pre-push "$@"
+
 protected_branch="main"
 
-while read local_ref local_sha remote_ref remote_sha; do
+while read -r local_ref local_sha remote_ref remote_sha; do
     if [[ "$remote_ref" == "refs/heads/$protected_branch" ]]; then
         echo "Direct push to '$protected_branch' is not allowed."
         echo "Open a PR or use --no-verify to bypass."
         exit 1
     fi
-done
+done <<< "$stdin"
 
 exit 0
