@@ -10,6 +10,7 @@ use std::{
     time::Instant,
 };
 
+use asset_pipeline::AssetMap;
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use rgpu_vk::{
@@ -459,6 +460,7 @@ struct RunningState {
     /// Wall-clock time at which the app entered the Running state;
     /// used to drive the rotation animation.
     start_time: Instant,
+    asset_map: AssetMap,
 }
 
 impl std::fmt::Debug for RunningState {
@@ -501,6 +503,7 @@ struct SuspendedState {
     ubo_buffers: Vec<HostVisibleBuffer>,
     descriptor_sets: Vec<DescriptorSet>,
     start_time: Instant,
+    asset_map: AssetMap,
 }
 #[derive(Debug)]
 struct ExitingState {}
@@ -579,6 +582,7 @@ impl ApplicationHandler for AppRunner {
                 ubo_buffers,
                 descriptor_sets,
                 start_time,
+                asset_map,
             } = running_state;
 
             if let Err(e) = device.wait_idle() {
@@ -615,6 +619,7 @@ impl ApplicationHandler for AppRunner {
                 ubo_buffers,
                 descriptor_sets,
                 start_time,
+                asset_map,
             });
         }
     }
@@ -1341,6 +1346,15 @@ impl AppRunner {
             unsafe { set.write_uniform_buffer(&device, 0, buf, ubo_size) };
         }
 
+        let asset_map_path =
+            state.self_dir.join("assets").join("asset_map.toml");
+        let asset_map: AssetMap = toml::from_str(
+            &std::fs::read_to_string(&asset_map_path).map_err(|e| {
+                eyre::eyre!("Failed to read {}: {e}", asset_map_path.display())
+            })?,
+        )?;
+        tracing::debug!(asset_map = ?asset_map.map, "Loaded asset map");
+
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
         let idle_guard =
             unsafe { RunningStateTransitionGuard::new(Arc::clone(&device)) };
@@ -1366,6 +1380,7 @@ impl AppRunner {
             ubo_buffers,
             descriptor_sets,
             start_time: Instant::now(),
+            asset_map,
         })
     }
 
@@ -1477,6 +1492,7 @@ impl AppRunner {
             ubo_buffers: state.ubo_buffers,
             descriptor_sets: state.descriptor_sets,
             start_time: state.start_time,
+            asset_map: state.asset_map,
         })
     }
 

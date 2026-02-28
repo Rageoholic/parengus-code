@@ -1,3 +1,5 @@
+mod assets;
+
 use std::{
     env,
     ffi::OsStr,
@@ -65,8 +67,18 @@ fn all_tasks() -> Vec<Task> {
             run: copy_exe,
         },
         Task {
+            name: "copy-assets",
+            deps: &[],
+            run: copy_assets,
+        },
+        Task {
             name: "build",
-            deps: &["cargo-build", "compile-shaders", "copy-exe"],
+            deps: &[
+                "cargo-build",
+                "compile-shaders",
+                "copy-exe",
+                "copy-assets",
+            ],
             run: noop,
         },
     ]
@@ -283,4 +295,18 @@ fn copy_exe() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn copy_assets() -> Result<()> {
+    let root = workspace_root();
+    assets::copy_assets(
+        &root.join("assets").join("manifest.toml"),
+        &root.join("samp-app").join("src").join("assets.toml"),
+        &root.join("assets"),
+        &root
+            .join("out")
+            .join("samp-app")
+            .join("debug")
+            .join("assets"),
+    )
 }
