@@ -738,21 +738,22 @@ impl AppRunner {
         }
 
         let frame_idx = state.current_frame;
+        let frame_objs = &mut state.frames[frame_idx];
 
-        // Wait until this frame slot's previous GPU work is done, then
-        // reset the fence for reuse. This also guarantees image_available
-        // is unsignaled and the command buffer is no longer in use.
-        //
-        // SAFETY: fence was submitted with GPU work for this frame slot;
-        // the wait ensures all that work has completed.
-        if let Err(e) = unsafe {
-            state.frames[frame_idx]
-                .in_flight_fence
-                .wait_and_reset(u64::MAX)
-        } {
-            return DrawFrameOutcome::Fatal(format!(
-                "Fence wait/reset failed: {e}"
-            ));
+        if frame_objs.in_flight_fence.is_submitted() {
+            // Wait until this frame slot's previous GPU work is done, then
+            // reset the fence for reuse. This also guarantees image_available
+            // is unsignaled and the command buffer is no longer in use.
+            //
+            // SAFETY: fence was submitted with GPU work for this frame slot;
+            // the wait ensures all that work has completed.
+            let fence_result =
+                unsafe { frame_objs.in_flight_fence.wait_and_reset(u64::MAX) };
+            if let Err(e) = fence_result {
+                return DrawFrameOutcome::Fatal(format!(
+                    "Fence wait/reset failed: {e}"
+                ));
+            }
         }
 
         // GPU work for this slot is done; release retained references.
@@ -760,7 +761,7 @@ impl AppRunner {
         // have cleared.
         // SAFETY: wait_and_reset() succeeded above; this slot's GPU work
         // is complete.
-        unsafe { state.frames[frame_idx].release_retained() };
+        unsafe { frame_objs.release_retained() };
 
         // SAFETY: is_none() is checked at the top of this function.
         let sc = state
@@ -768,8 +769,7 @@ impl AppRunner {
             .as_ref()
             .expect("swapchain present: checked above");
         let swapchain_raw = sc.raw_swapchain();
-        let image_available =
-            state.frames[frame_idx].image_available.raw_semaphore();
+        let image_available = frame_objs.image_available.raw_semaphore();
 
         // Acquire the next presentable image.
         //
@@ -798,8 +798,7 @@ impl AppRunner {
         let render_finished = state
             .render_finished_semaphores
             .as_ref()
-            .expect("render_finished_semaphores present with swapchain")
-            [i]
+            .expect("render_finished_semaphores present with swapchain")[i]
             .raw_semaphore();
 
         let elapsed = state.start_time.elapsed().as_secs_f32();
@@ -814,9 +813,8 @@ impl AppRunner {
             return DrawFrameOutcome::Fatal(format!("UBO write failed: {e}"));
         }
 
-        let fence = state.frames[frame_idx].in_flight_fence.raw_fence();
         let pipeline_handle = state.pipeline.raw_pipeline();
-        let frame_cmd = &mut state.frames[frame_idx].command_buffer;
+        let frame_cmd = &mut frame_objs.command_buffer;
 
         // Reset and re-record the command buffer for this frame slot.
         //
@@ -988,7 +986,7 @@ impl AppRunner {
         if let Err(e) = unsafe {
             state.device.graphics_present_queue_submit2(
                 std::slice::from_ref(&submit),
-                fence,
+                Some(&mut frame_objs.in_flight_fence),
             )
         } {
             return DrawFrameOutcome::Fatal(format!(
@@ -1000,8 +998,7 @@ impl AppRunner {
         // render commands referencing it are done). The swapchain is kept
         // alive by running_state.swapchain; it is only replaced after
         // wait_idle, so no fence-based retain is needed for it.
-        state.frames[frame_idx].retained_pipeline =
-            Some(Arc::clone(&state.pipeline));
+        frame_objs.retained_pipeline = Some(Arc::clone(&state.pipeline));
 
         // Present — wait on render_finished.
         let present_info = vk::PresentInfoKHR::default()
@@ -1277,10 +1274,10 @@ impl AppRunner {
             Some("graphics command pool"),
         )?;
 
-        // Start each fence signaled so the first frame's
-        // wait_and_reset returns immediately.
-        // Each frame slot owns its command buffer so the CPU can encode
-        // frame N while the GPU executes frame N-1 without contention.
+        // Start each fence unsignaled; is_submitted() will be false on
+        // the first frame so we skip the wait and go straight to
+        // recording. Each frame slot owns its command buffer so the CPU
+        // can encode frame N while the GPU executes frame N-1.
         let frames = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|i| -> eyre::Result<FrameSync> {
                 Ok(FrameSync {
@@ -1290,7 +1287,7 @@ impl AppRunner {
                     )?,
                     in_flight_fence: Fence::new(
                         &device,
-                        true,
+                        false,
                         Some(&format!("in flight [{i}]")),
                     )?,
                     command_buffer: command_pool.allocate_command_buffer()?,
@@ -1520,6 +1517,8 @@ impl AppRunner {
             );
             return true;
         }
+
+        running_state.swapchain.take();
 
         let _span = tracing::trace_span!(
             "swapchain_recreate",

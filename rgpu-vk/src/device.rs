@@ -31,6 +31,7 @@ use gpu_allocator::{
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
 
+use crate::sync;
 use crate::{
     instance::{FetchPhysicalDeviceError, Instance},
     surface::{Surface, SurfaceSupportError},
@@ -171,6 +172,18 @@ pub enum NameObjectError {
 
     #[error("Vulkan error setting object name: {0}")]
     Vulkan(vk::Result),
+}
+
+#[derive(Debug, Error)]
+pub enum QueueSubmitError {
+    #[error("Could not submit to the actual Vulkan queue: {0}")]
+    SubmissionFailed(vk::Result),
+    #[error(
+        "Fence was not marked as ready, likely meaning reset was not called"
+    )]
+    FenceNotReady,
+    #[error("The fence passed was from a different device")]
+    MismatchedObjects,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -327,8 +340,7 @@ impl Device {
             // VK_EXT_memory_budget: optional device extension.
             // Enables accurate heap-usage/budget queries via
             // vkGetPhysicalDeviceMemoryProperties2.
-            let enable_memory_budget =
-                has_ext(ash::ext::memory_budget::NAME);
+            let enable_memory_budget = has_ext(ash::ext::memory_budget::NAME);
 
             // VK_KHR_dynamic_rendering: core in 1.3; required extension
             // on older devices when dynamic rendering is requested —
@@ -1225,7 +1237,7 @@ impl Device {
     /// Command buffers must be in the executable state. Wait semaphores must be
     /// signaled. Signal semaphores must be unsignaled. `fence`, when not null,
     /// must be an unsignaled fence created from this device.
-    pub unsafe fn graphics_present_queue_submit2(
+    pub unsafe fn graphics_present_queue_submit2_raw_fence(
         &self,
         submits: &[vk::SubmitInfo2<'_>],
         fence: vk::Fence,
@@ -1246,6 +1258,53 @@ impl Device {
             Synchronization2Loader::Extension(loader) => unsafe {
                 loader.queue_submit2(*queue, submits, fence)
             },
+        }
+    }
+
+    /// Submit work to the graphics/present queue using the synchronization2
+    /// API.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled.
+    pub unsafe fn graphics_present_queue_submit2(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(false) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| f.parent().raw_device() != self.raw_device())
+            .unwrap_or(true)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            // SAFETY: All handles in submits are valid and derived from this
+            // device by our own safety contract. Command buffers are in the
+            // executable state by our own safety contract. Wait semaphores are
+            // signaled by our own safety contract. raw_fence is known to have
+            // been derived from this device and is in the unsignaled state
+            unsafe {
+                self.graphics_present_queue_submit2_raw_fence(
+                    submits, raw_fence,
+                )
+            }
+            .map_err(QueueSubmitError::SubmissionFailed)?;
+
+            if let Some(f) = fence {
+                // SAFETY: This fence has just been submitted to the queue via
+                // Self::graphics_present_queue_submit2_raw_fence.
+                _ = unsafe { f.mark_submitted() }
+            }
+
+            Ok(())
         }
     }
 }
