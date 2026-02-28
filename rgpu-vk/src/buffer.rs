@@ -379,6 +379,8 @@ impl DeviceLocalBuffer {
     ///   execution of the submitted copy has completed.
     /// - If `fence` is `Some`, the caller must ensure it is unsignaled and
     ///   later wait/reset it before reusing resources referenced by the copy.
+    /// - `src` must be created with vk::BufferUsageFlags::TRANSFER_SRC and
+    ///   `self` must be created with vk::BufferusageFlags::TRANSFER_DST
     pub unsafe fn upload_from_host_visible(
         &mut self,
         command_buffer: &mut impl CommandBufferHandle,
@@ -393,7 +395,8 @@ impl DeviceLocalBuffer {
             });
         }
 
-        // SAFETY: forwards to region helper with full-buffer offsets and size.
+        // SAFETY: This functions preconditions carry through. Offset of 0 is
+        // definitionally in bounds
         unsafe {
             self.upload_from_host_visible_region(
                 command_buffer,
@@ -416,6 +419,8 @@ impl DeviceLocalBuffer {
     ///   execution of the submitted copy has completed.
     /// - If `fence` is `Some`, the caller must ensure it is unsignaled and
     ///   later wait/reset it before reusing resources referenced by the copy.
+    /// - `src` must be created with vk::BufferUsageFlags::TRANSFER_SRC and
+    ///   `self` must be created with vk::BufferusageFlags::TRANSFER_DST
     pub unsafe fn upload_from_host_visible_region(
         &mut self,
         command_buffer: &mut impl CommandBufferHandle,

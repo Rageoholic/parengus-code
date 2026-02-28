@@ -125,16 +125,16 @@ impl Drop for Instance {
         if let Some((debug_messenger, debug_utils_instance)) =
             self.debug_messenger.take()
         {
-            //SAFETY: last use of this debug messenger. We made this debug
-            //messenger from this instance. debug_utils_instance is derived from
-            //this instance
+            // SAFETY: last use of this debug messenger. We made this debug
+            // messenger from this instance. debug_utils_instance is derived from
+            // this instance
             unsafe {
                 debug_utils_instance
                     .destroy_debug_utils_messenger(debug_messenger, None)
             };
         }
-        //SAFETY: We are in drop so this is the last use of instance. Any given
-        //derived object should be gone
+        // SAFETY: We are in drop so this is the last use of instance. Any given
+        // derived object should be gone
         unsafe { self.handle.destroy_instance(None) };
     }
 }
@@ -151,7 +151,7 @@ unsafe extern "system" fn vulkan_debug_callback(
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
     _p_user_data: *mut std::ffi::c_void,
 ) -> vk::Bool32 {
-    //SAFETY: Vulkan guarantees p_callback_data is valid
+    // SAFETY: Vulkan guarantees p_callback_data is valid
     let message = unsafe { CStr::from_ptr((*p_callback_data).p_message) }
         .to_string_lossy();
 
@@ -239,9 +239,9 @@ impl Instance {
             Ok(cstr) => cstr,
             Err(_) => Err(Error::InvalidAppName)?,
         };
-        //SAFETY: We pass on the burden of the safety from loading dlls to the
-        //caller. As for Entry, we ensure all other vulkan objects are dropped
-        //before Entry is dropped (handled in the Drop impl of Instance)
+        // SAFETY: We pass on the burden of the safety from loading dlls to the
+        // caller. As for Entry, we ensure all other vulkan objects are dropped
+        // before Entry is dropped (handled in the Drop impl of Instance)
         let entry = unsafe { ash::Entry::load() }.map_err(Error::Loading)?;
 
         // SAFETY: entry is a live Vulkan entry (loaded on line 202);
@@ -276,10 +276,10 @@ impl Instance {
             mandatory_exts.extend(
                 ash_window_exts
                     .iter()
-                    //SAFETY: ash_window promises to hand us null
-                    //terminated C strings in its API. This isn't
-                    //enforced anywhere through any safety means
-                    //but it is documented
+                    // SAFETY: ash_window promises to hand us null
+                    // terminated C strings in its API. This isn't
+                    // enforced anywhere through any safety means
+                    // but it is documented
                     .map(|ext_cstr_ptr| unsafe {
                         CStr::from_ptr(*ext_cstr_ptr)
                     }),
@@ -391,18 +391,19 @@ impl Instance {
             instance_create_info = instance_create_info.push_next(debug_info);
         }
 
-        //SAFETY: We made a valid instance_create_info
+        // SAFETY: We made a valid instance_create_info
         let instance =
             unsafe { entry.create_instance(&instance_create_info, None) }?;
 
         let debug_messenger = if let Some(mut debug_messenger_create_info) =
             debug_messenger_create_info
         {
-            //Defensive coding stuff
+            // Defensive coding stuff
             debug_messenger_create_info.p_next = std::ptr::null();
             let debug_utils_instance =
                 ash::ext::debug_utils::Instance::new(&entry, &instance);
-            //SAFETY: Valid CI
+            // SAFETY: debug_messenger_create_info is valid because p_next was
+            // just nulled out and we built it from valid components
             match unsafe {
                 debug_utils_instance.create_debug_utils_messenger(
                     &debug_messenger_create_info,
@@ -420,6 +421,10 @@ impl Instance {
                          WTF? Continuing without one but here be \
                          dragons. Actual error: {e}"
                     );
+                    // SAFETY: Since the instance hasn't been returned and this
+                    // is an error path, we know for a fact that it hasn't been
+                    // made visible in a way that could cause problems
+                    unsafe { instance.destroy_instance(None) };
                     None
                 }
             }
@@ -467,7 +472,8 @@ impl Instance {
     pub fn fetch_raw_physical_devices(
         &self,
     ) -> Result<Vec<vk::PhysicalDevice>, FetchPhysicalDeviceError> {
-        //SAFETY: Pretty much always fine
+        // SAFETY: self.handle is live and enumerate_physical_devices has no
+        // other preconditions
         match unsafe { self.handle.enumerate_physical_devices() } {
             Ok(v) => Ok(v),
             Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
@@ -486,7 +492,7 @@ impl Instance {
         &self,
         physical_device: vk::PhysicalDevice,
     ) -> vk::PhysicalDeviceProperties {
-        //SAFETY: physical_device was derived from this instance
+        // SAFETY: physical_device was derived from this instance
         unsafe { self.handle.get_physical_device_properties(physical_device) }
     }
 
@@ -498,7 +504,7 @@ impl Instance {
         &self,
         physical_device: vk::PhysicalDevice,
     ) -> Vec<vk::QueueFamilyProperties> {
-        //SAFETY: physical_device was derived from this instance
+        // SAFETY: physical_device was derived from this instance
         unsafe {
             self.handle
                 .get_physical_device_queue_family_properties(physical_device)
@@ -532,8 +538,8 @@ impl Instance {
         physical_device: vk::PhysicalDevice,
         create_info: &vk::DeviceCreateInfo<'_>,
     ) -> Result<ash::Device, vk::Result> {
-        //SAFETY: physical_device was derived from this instance,
-        //create_info is valid
+        // SAFETY: physical_device was derived from this instance,
+        // create_info is valid
         unsafe {
             self.handle
                 .create_device(physical_device, create_info, None)
@@ -548,7 +554,7 @@ impl Instance {
         &self,
         physical_device: vk::PhysicalDevice,
     ) -> Result<Vec<vk::ExtensionProperties>, vk::Result> {
-        //SAFETY: physical_device was derived from this instance
+        // SAFETY: physical_device was derived from this instance
         unsafe {
             self.handle
                 .enumerate_device_extension_properties(physical_device)
@@ -627,8 +633,8 @@ impl Instance {
         surface: vk::SurfaceKHR,
     ) -> Result<bool, SurfaceSupportError> {
         if let Some(ref surface_instance) = self.surface_instance {
-            //SAFETY: physical_device and surface were derived from
-            //this instance
+            // SAFETY: physical_device and surface were derived from
+            // this instance
             unsafe {
                 surface_instance.get_physical_device_surface_support(
                     physical_device,
@@ -714,7 +720,7 @@ impl Instance {
         }
     }
 
-    ///Create a raw VkSurfaceKHR.
+    /// Create a raw VkSurfaceKHR.
     ///
     /// # Safety
     /// The returned surface must be destroyed before source is dropped, or when
@@ -729,7 +735,9 @@ impl Instance {
     ) -> Result<vk::SurfaceKHR, CreateSurfaceError> {
         use CreateSurfaceError as Error;
         if self.surface_instance.is_some() {
-            //SAFETY:
+            // SAFETY: entry and handle are live vulkan objects because they are
+            // only destroyed in drop. Per the contract with our caller, source
+            // will live at least as long as the returned surface
             unsafe {
                 ash_window::create_surface(
                     &self.entry,
