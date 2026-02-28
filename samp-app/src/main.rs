@@ -782,7 +782,6 @@ impl AppRunner {
         // is complete.
         unsafe { frame_objs.release_retained() };
 
-        // SAFETY: is_none() is checked at the top of this function.
         let sc = state
             .swapchain
             .as_ref()
@@ -914,8 +913,7 @@ impl AppRunner {
                 &[&state.descriptor_sets[frame_idx]],
             )
         };
-        // SAFETY: inside render pass recording; buffer is valid and bound to
-        // host-visible memory for the app lifetime.
+        // SAFETY: inside render pass recording; buffer is valid
         unsafe { frame_cmd.bind_vertex_buffer(0, &*state.vertex_buffer, 0) };
 
         let viewport = vk::Viewport {
