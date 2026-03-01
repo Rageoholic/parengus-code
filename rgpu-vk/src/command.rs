@@ -9,9 +9,6 @@
 //! `Arc` so the pool cannot be destroyed while buffers are alive. On
 //! drop, the raw handle is returned to the pool's channel for recycling.
 //!
-//! The [`CommandBufferHandle`] trait allows recording helpers in this
-//! module to accept either `ResettableCommandBuffer` or raw handle
-//! wrappers through a single interface.
 
 use std::{
     marker::PhantomData,
@@ -26,33 +23,37 @@ use crate::descriptor::DescriptorSet;
 use crate::device::{Device, DynamicRenderingError};
 use crate::pipeline::PipelineLayout;
 
-/// Trait for types that expose a raw `VkCommandBuffer` handle.
+
+// ---------------------------------------------------------------------------
+// State tracking
+// ---------------------------------------------------------------------------
+
+/// The recording state of a [`ResettableCommandBuffer`].
 ///
-/// Implemented by [`ResettableCommandBuffer`]. Blanket impls cover
-/// `&T` and `&mut T`. Allows helpers in [`buffer`] and here to be
-/// generic over command buffer wrapper types.
-///
-/// [`buffer`]: crate::buffer
-pub trait CommandBufferHandle {
-    fn raw_command_buffer(&self) -> vk::CommandBuffer;
+/// Transitions:
+/// - `Reset` → `Recording` via [`ResettableCommandBuffer::begin`]
+/// - `Recording` → `Recorded` via [`ResettableCommandBuffer::end`]
+/// - Any → `Reset` via [`ResettableCommandBuffer::reset`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandBufferState {
+    /// Initial / post-reset state. The buffer is ready to begin recording.
+    Reset,
+    /// The buffer is between `begin()` and `end()`. Recording commands
+    /// may be issued.
+    Recording,
+    /// Recording has ended. The buffer is executable or pending on the GPU.
+    Recorded,
 }
 
-impl<T> CommandBufferHandle for &T
-where
-    T: CommandBufferHandle + ?Sized,
-{
-    fn raw_command_buffer(&self) -> vk::CommandBuffer {
-        (*self).raw_command_buffer()
-    }
-}
-
-impl<T> CommandBufferHandle for &mut T
-where
-    T: CommandBufferHandle + ?Sized,
-{
-    fn raw_command_buffer(&self) -> vk::CommandBuffer {
-        (**self).raw_command_buffer()
-    }
+/// Error returned when a state-transition method is called from the wrong
+/// [`CommandBufferState`].
+#[derive(Debug, Error)]
+#[error(
+    "command buffer in {actual:?} state, expected {expected:?}"
+)]
+pub struct CommandBufferStateError {
+    pub expected: CommandBufferState,
+    pub actual: CommandBufferState,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +200,7 @@ impl ResettableCommandPool {
         let mut returned: Vec<vk::CommandBuffer> =
             std::iter::from_fn(|| self.receiver.try_recv().ok()).collect();
 
-        let handle = if let Some(recycled) = returned.pop() {
+        let (handle, recycled) = if let Some(recycled) = returned.pop() {
             if !returned.is_empty() {
                 // SAFETY: All handles in `returned` were allocated from
                 // self.shared.pool. The drop→send contract requires callers
@@ -214,7 +215,7 @@ impl ResettableCommandPool {
                         .free_raw_command_buffers(self.shared.pool, &returned)
                 };
             }
-            recycled
+            (recycled, true)
         } else {
             let allocate_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(self.shared.pool)
@@ -224,7 +225,7 @@ impl ResettableCommandPool {
             // SAFETY: allocate_info references a valid pool created from
             // parent. ResettableCommandPool is !Sync so no concurrent pool
             // access is possible.
-            unsafe {
+            let handle = unsafe {
                 self.shared
                     .parent
                     .allocate_raw_command_buffers(&allocate_info)
@@ -233,13 +234,25 @@ impl ResettableCommandPool {
                 debug_assert_eq!(bufs.len(), 1);
                 bufs.remove(0)
             })
-            .map_err(AllocateCommandBufferError::Vulkan)?
+            .map_err(AllocateCommandBufferError::Vulkan)?;
+            (handle, false)
+        };
+
+        // Fresh allocations are in Vulkan's initial state → Reset.
+        // Recycled handles had an unknown prior state; Recorded is the most
+        // conservative assumption and forces the caller to reset() before
+        // recording.
+        let state = if recycled {
+            CommandBufferState::Recorded
+        } else {
+            CommandBufferState::Reset
         };
 
         Ok(ResettableCommandBuffer {
             _pool: Arc::clone(&self.shared),
             parent: Arc::clone(&self.shared.parent),
             handle,
+            state,
             return_sender: self.sender.clone(),
         })
     }
@@ -259,8 +272,10 @@ impl ResettableCommandPool {
 
 /// A primary command buffer allocated from a [`ResettableCommandPool`].
 ///
-/// All recording operations (`reset`, `begin`, `end`) are `unsafe` — the
-/// caller is responsible for correct Vulkan state sequencing.
+/// The buffer's [`CommandBufferState`] is tracked at runtime. `begin()` and
+/// `end()` are safe methods that return [`CommandBufferStateError`] if called
+/// from the wrong state. `reset()` remains `unsafe` because the
+/// GPU-not-pending guarantee cannot be verified at runtime.
 ///
 /// On drop, the raw handle is sent back to the pool's return channel for
 /// recycling. If the pool has already been dropped the send is silently
@@ -270,6 +285,7 @@ pub struct ResettableCommandBuffer {
     _pool: Arc<CommandPoolShared>,
     parent: Arc<Device>,
     handle: vk::CommandBuffer,
+    state: CommandBufferState,
     /// Returns the handle to the pool's channel on drop.
     return_sender: mpsc::Sender<vk::CommandBuffer>,
 }
@@ -293,40 +309,76 @@ impl std::fmt::Debug for ResettableCommandBuffer {
 }
 
 impl ResettableCommandBuffer {
-    /// Reset this buffer to the initial state.
+    /// Reset this buffer to the [`Reset`](CommandBufferState::Reset) state.
     ///
     /// # Safety
     /// The buffer must not be pending execution on the GPU.
     pub unsafe fn reset(&mut self) -> Result<(), vk::Result> {
         // SAFETY: Caller guarantees the buffer is not pending.
-        unsafe {
+        let result = unsafe {
             self.parent.reset_raw_command_buffer(
                 self.handle,
                 vk::CommandBufferResetFlags::empty(),
             )
+        };
+        if result.is_ok() {
+            self.state = CommandBufferState::Reset;
         }
+        result
     }
 
     /// Begin recording.
     ///
-    /// # Safety
-    /// The buffer must be in the initial state (freshly allocated or reset).
-    pub unsafe fn begin(&mut self) -> Result<(), vk::Result> {
+    /// Returns [`CommandBufferStateError`] if the buffer is not in the
+    /// [`Reset`](CommandBufferState::Reset) state.
+    pub fn begin(
+        &mut self,
+    ) -> Result<(), CommandBufferStateError> {
+        if self.state != CommandBufferState::Reset {
+            return Err(CommandBufferStateError {
+                expected: CommandBufferState::Reset,
+                actual: self.state,
+            });
+        }
         let begin_info = vk::CommandBufferBeginInfo::default();
-        // SAFETY: Caller guarantees the buffer is in the initial state.
+        // SAFETY: state == Reset guarantees the buffer is in Vulkan's
+        // initial state, which is the precondition for vkBeginCommandBuffer.
         unsafe {
             self.parent
                 .begin_raw_command_buffer(self.handle, &begin_info)
         }
+        // vkBeginCommandBuffer returns VK_SUCCESS or a device-lost error.
+        // Map the vk::Result into a panic via expect; a device-lost error
+        // here is unrecoverable and not a state-machine violation.
+        .expect("vkBeginCommandBuffer failed");
+        self.state = CommandBufferState::Recording;
+        Ok(())
     }
 
     /// End recording.
     ///
-    /// # Safety
-    /// The buffer must be in the recording state.
-    pub unsafe fn end(&mut self) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees the buffer is in the recording state.
+    /// Returns [`CommandBufferStateError`] if the buffer is not in the
+    /// [`Recording`](CommandBufferState::Recording) state.
+    pub fn end(
+        &mut self,
+    ) -> Result<(), CommandBufferStateError> {
+        if self.state != CommandBufferState::Recording {
+            return Err(CommandBufferStateError {
+                expected: CommandBufferState::Recording,
+                actual: self.state,
+            });
+        }
+        // SAFETY: state == Recording guarantees the buffer is in Vulkan's
+        // recording state, which is the precondition for vkEndCommandBuffer.
         unsafe { self.parent.end_raw_command_buffer(self.handle) }
+        .expect("vkEndCommandBuffer failed");
+        self.state = CommandBufferState::Recorded;
+        Ok(())
+    }
+
+    /// Returns the current [`CommandBufferState`] of this buffer.
+    pub fn state(&self) -> CommandBufferState {
+        self.state
     }
 
     /// Record a pipeline barrier using the synchronization2 API.
@@ -338,6 +390,7 @@ impl ResettableCommandBuffer {
         &mut self,
         dependency_info: &vk::DependencyInfo<'_>,
     ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees recording state and
         // dependency_info validity.
         unsafe {
@@ -356,6 +409,7 @@ impl ResettableCommandBuffer {
         &mut self,
         rendering_info: &vk::RenderingInfo<'_>,
     ) -> Result<(), DynamicRenderingError> {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees recording state and
         // rendering_info validity.
         unsafe {
@@ -372,6 +426,7 @@ impl ResettableCommandBuffer {
     pub unsafe fn end_rendering(
         &mut self,
     ) -> Result<(), DynamicRenderingError> {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees active render pass state.
         unsafe { self.parent.cmd_end_raw_rendering(self.handle) }
     }
@@ -382,6 +437,7 @@ impl ResettableCommandBuffer {
     /// The buffer must be in the recording state. `pipeline` must be a valid
     /// graphics pipeline created from the same device as this buffer.
     pub unsafe fn bind_graphics_pipeline(&mut self, pipeline: vk::Pipeline) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees recording state and pipeline validity.
         unsafe {
             self.parent
@@ -401,6 +457,7 @@ impl ResettableCommandBuffer {
         buffers: &[vk::Buffer],
         offsets: &[vk::DeviceSize],
     ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees recording state and buffer validity.
         unsafe {
             self.parent.cmd_bind_vertex_buffers(
@@ -487,6 +544,7 @@ impl ResettableCommandBuffer {
         dst_buffer: vk::Buffer,
         regions: &[vk::BufferCopy],
     ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees recording state and copy validity.
         unsafe {
             self.parent.cmd_copy_buffer(
@@ -504,6 +562,7 @@ impl ResettableCommandBuffer {
     /// The buffer must be in the recording state with a pipeline bound that
     /// declares `VK_DYNAMIC_STATE_VIEWPORT`.
     pub unsafe fn set_viewport(&mut self, viewports: &[vk::Viewport]) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees recording state and dynamic
         // viewport pipeline.
         unsafe { self.parent.cmd_set_viewport(self.handle, viewports) }
@@ -515,6 +574,7 @@ impl ResettableCommandBuffer {
     /// The buffer must be in the recording state with a pipeline bound that
     /// declares `VK_DYNAMIC_STATE_SCISSOR`.
     pub unsafe fn set_scissor(&mut self, scissors: &[vk::Rect2D]) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees recording state and dynamic
         // scissor pipeline.
         unsafe { self.parent.cmd_set_scissor(self.handle, scissors) }
@@ -533,6 +593,7 @@ impl ResettableCommandBuffer {
         first_vertex: u32,
         first_instance: u32,
     ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees render pass and pipeline state validity.
         unsafe {
             self.parent.cmd_draw(
@@ -559,6 +620,7 @@ impl ResettableCommandBuffer {
     ) where
         B: BufferHandle,
     {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees recording state and buffer validity.
         unsafe {
             self.parent.cmd_bind_index_buffer(
@@ -584,6 +646,7 @@ impl ResettableCommandBuffer {
         vertex_offset: i32,
         first_instance: u32,
     ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees render pass, pipeline, and
         // index buffer state validity.
         unsafe {
@@ -611,6 +674,7 @@ impl ResettableCommandBuffer {
         first_set: u32,
         descriptor_sets: &[&DescriptorSet],
     ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
         let raw_sets: Vec<vk::DescriptorSet> = descriptor_sets
             .iter()
             .map(|s| s.raw_descriptor_set())
@@ -637,11 +701,6 @@ impl ResettableCommandBuffer {
     }
 }
 
-impl CommandBufferHandle for ResettableCommandBuffer {
-    fn raw_command_buffer(&self) -> vk::CommandBuffer {
-        self.handle
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Auto-trait assertions

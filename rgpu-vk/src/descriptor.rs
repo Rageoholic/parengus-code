@@ -11,6 +11,8 @@ use ash::vk;
 
 use crate::buffer::BufferHandle;
 use crate::device::Device;
+use crate::image::Texture;
+use crate::sampler::Sampler;
 
 // ---------------------------------------------------------------------------
 // DescriptorBindingDesc
@@ -245,6 +247,34 @@ impl DescriptorSet {
             device.update_raw_descriptor_sets(
                 std::slice::from_ref(&write),
                 &[],
+            )
+        }
+    }
+
+    /// Update this descriptor set's binding with a texture and sampler.
+    ///
+    /// The image layout is assumed to be `SHADER_READ_ONLY_OPTIMAL`,
+    /// which is the layout left by [`Texture::record_copy_from`].
+    ///
+    /// # Safety
+    /// - `texture` and `sampler` must remain alive for as long as this
+    ///   descriptor set is bound in any submitted command buffer.
+    pub unsafe fn write_texture_sampler(
+        &self,
+        device: &Arc<Device>,
+        binding: u32,
+        texture: &Texture,
+        sampler: &Sampler,
+    ) {
+        // SAFETY: caller guarantees texture and sampler outlive the
+        // descriptor set binding.
+        unsafe {
+            self.write_combined_image_sampler(
+                device,
+                binding,
+                texture.raw_image_view(),
+                sampler.raw_sampler(),
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             )
         }
     }

@@ -22,7 +22,7 @@ use rgpu_vk::{
         DescriptorSetLayout,
     },
     device::{Device, DeviceConfig, QueueMode},
-    image::{DeviceLocalImage, ImageView},
+    image::Texture,
     instance::{Instance, InstanceExtensions},
     pipeline::{
         CullModeFlags, DynamicPipeline, DynamicPipelineDesc, FrontFace,
@@ -344,24 +344,6 @@ struct FrameSync {
     image_available: Semaphore,
     in_flight_fence: Fence,
     command_buffer: ResettableCommandBuffer,
-    /// Keeps the pipeline alive until this frame slot's fence signals.
-    ///
-    /// Set to the current pipeline after each submit and cleared at the
-    /// start of the next use of this slot. This prevents a retired pipeline
-    /// from being destroyed while in-flight command buffers still reference it.
-    retained_pipeline: Option<Arc<DynamicPipeline>>,
-}
-
-impl FrameSync {
-    /// Release all retained resource references for this frame slot.
-    ///
-    /// # Safety
-    /// The GPU must not be accessing any of the retained resources. The caller
-    /// must ensure either this slot's fence has signaled, or `vkDeviceWaitIdle`
-    /// has returned successfully, before calling this function.
-    unsafe fn release_retained(&mut self) {
-        self.retained_pipeline = None;
-    }
 }
 
 /// Ensures [`Device::wait_idle`] is called before [`RunningState`]'s Vulkan
@@ -455,9 +437,9 @@ struct RunningState {
     /// is `None`.
     render_finished_semaphores: Option<Arc<Vec<Semaphore>>>,
     shader: ShaderModule,
-    pipeline: Arc<DynamicPipeline>,
-    vertex_buffer: Arc<DeviceLocalBuffer>,
-    index_buffer: Arc<DeviceLocalBuffer>,
+    pipeline: DynamicPipeline,
+    vertex_buffer: DeviceLocalBuffer,
+    index_buffer: DeviceLocalBuffer,
     pipeline_color_format: vk::Format,
     command_pool: ResettableCommandPool,
     frames: Vec<FrameSync>,
@@ -477,8 +459,7 @@ struct RunningState {
     /// used to drive the rotation animation.
     start_time: Instant,
     asset_map: AssetMap,
-    texture: DeviceLocalImage,
-    texture_view: ImageView,
+    texture: Texture,
     sampler: Sampler,
 }
 
@@ -509,9 +490,9 @@ struct SuspendedState {
     win: Arc<WinitWindow>,
     device: Arc<Device>,
     shader: ShaderModule,
-    pipeline: Arc<DynamicPipeline>,
-    vertex_buffer: Arc<DeviceLocalBuffer>,
-    index_buffer: Arc<DeviceLocalBuffer>,
+    pipeline: DynamicPipeline,
+    vertex_buffer: DeviceLocalBuffer,
+    index_buffer: DeviceLocalBuffer,
     pipeline_color_format: vk::Format,
     command_pool: ResettableCommandPool,
     frames: Vec<FrameSync>,
@@ -523,8 +504,7 @@ struct SuspendedState {
     descriptor_sets: Vec<DescriptorSet>,
     start_time: Instant,
     asset_map: AssetMap,
-    texture: DeviceLocalImage,
-    texture_view: ImageView,
+    texture: Texture,
     sampler: Sampler,
 }
 #[derive(Debug)]
@@ -595,7 +575,7 @@ impl ApplicationHandler for AppRunner {
                 index_buffer,
                 pipeline_color_format,
                 command_pool,
-                mut frames,
+                frames,
                 current_frame: _,
                 debug_counters,
                 descriptor_set_layout,
@@ -606,7 +586,6 @@ impl ApplicationHandler for AppRunner {
                 start_time,
                 asset_map,
                 texture,
-                texture_view,
                 sampler,
             } = running_state;
 
@@ -617,14 +596,6 @@ impl ApplicationHandler for AppRunner {
                 );
                 self.transition_to_exiting("Running", event_loop);
                 return;
-            }
-
-            // GPU is idle; eagerly release all retained references so resources
-            // dropped via field destructuring above are destroyed now.
-            for frame in &mut frames {
-                // SAFETY: wait_idle() succeeded above; no GPU work is in
-                // flight.
-                unsafe { frame.release_retained() };
             }
 
             self.set_suspended(SuspendedState {
@@ -646,7 +617,6 @@ impl ApplicationHandler for AppRunner {
                 start_time,
                 asset_map,
                 texture,
-                texture_view,
                 sampler,
             });
         }
@@ -789,13 +759,6 @@ impl AppRunner {
             }
         }
 
-        // GPU work for this slot is done; release retained references.
-        // This allows retired resources to be destroyed once all slots
-        // have cleared.
-        // SAFETY: wait_and_reset() succeeded above; this slot's GPU work
-        // is complete.
-        unsafe { frame_objs.release_retained() };
-
         let sc = state
             .swapchain
             .as_ref()
@@ -857,8 +820,7 @@ impl AppRunner {
                 "Command buffer reset failed: {e}"
             ));
         }
-        // SAFETY: buffer was just reset to the initial state.
-        if let Err(e) = unsafe { frame_cmd.begin() } {
+        if let Err(e) = frame_cmd.begin() {
             return DrawFrameOutcome::Fatal(format!(
                 "Command buffer begin failed: {e}"
             ));
@@ -928,7 +890,7 @@ impl AppRunner {
             )
         };
         // SAFETY: inside render pass recording; buffer is valid
-        unsafe { frame_cmd.bind_vertex_buffer(0, &*state.vertex_buffer, 0) };
+        unsafe { frame_cmd.bind_vertex_buffer(0, &state.vertex_buffer, 0) };
 
         let viewport = vk::Viewport {
             x: 0.0,
@@ -951,7 +913,7 @@ impl AppRunner {
         // SAFETY: inside render pass recording; buffer is valid.
         unsafe {
             frame_cmd.bind_index_buffer(
-                &*state.index_buffer,
+                &state.index_buffer,
                 0,
                 vk::IndexType::UINT16,
             )
@@ -986,8 +948,7 @@ impl AppRunner {
         // SAFETY: recording; image is in COLOR_ATTACHMENT_OPTIMAL.
         unsafe { frame_cmd.pipeline_barrier2(&dep_info_present) };
 
-        // SAFETY: recording state.
-        if let Err(e) = unsafe { frame_cmd.end() } {
+        if let Err(e) = frame_cmd.end() {
             return DrawFrameOutcome::Fatal(format!(
                 "Command buffer end failed: {e}"
             ));
@@ -1024,12 +985,6 @@ impl AppRunner {
                 "Queue submit failed: {e}"
             ));
         }
-
-        // Retain pipeline until this slot's fence signals (guarantees
-        // render commands referencing it are done). The swapchain is kept
-        // alive by running_state.swapchain; it is only replaced after
-        // wait_idle, so no fence-based retain is needed for it.
-        frame_objs.retained_pipeline = Some(Arc::clone(&state.pipeline));
 
         // Present — wait on render_finished.
         let present_info = vk::PresentInfoKHR::default()
@@ -1170,28 +1125,8 @@ impl AppRunner {
             device.graphics_present_queue_family(),
             Some("upload command pool"),
         )?;
-        let mut upload_command_buffer =
-            upload_command_pool.allocate_command_buffer()?;
-        // SAFETY: upload_command_pool is used on this thread only during
-        // initialization, and `None` fence path waits for device idle before
-        // returning, so source/destination buffers outlive GPU access.
-        unsafe {
-            vertex_buffer.upload_from_host_visible(
-                &mut upload_command_buffer,
-                &staging_vertex_buffer,
-                None,
-            )
-        }?;
-        // SAFETY: Same contract as vertex buffer upload above.
-        unsafe {
-            index_buffer.upload_from_host_visible(
-                &mut upload_command_buffer,
-                &staging_index_buffer,
-                None,
-            )
-        }?;
-        let vertex_buffer = Arc::new(vertex_buffer);
-        let index_buffer = Arc::new(index_buffer);
+        let mut upload_cmd = upload_command_pool.allocate_command_buffer()?;
+        upload_cmd.begin()?;
 
         let win_size = win.inner_size();
         let debug_counters = DebugCounters::new();
@@ -1295,7 +1230,7 @@ impl AppRunner {
                 color_format = ?pipeline_color_format,
             )
             .entered();
-            Arc::new(build_pipeline(
+            build_pipeline(
                 &device,
                 &shader,
                 pipeline_color_format,
@@ -1304,7 +1239,7 @@ impl AppRunner {
                     let idx = debug_counters.next_pipeline();
                     move || format!("main pipeline {idx}")
                 }),
-            )?)
+            )?
         };
 
         let command_pool = ResettableCommandPool::new(
@@ -1330,7 +1265,6 @@ impl AppRunner {
                         Some(&format!("in flight [{i}]")),
                     )?,
                     command_buffer: command_pool.allocate_command_buffer()?,
-                    retained_pipeline: None,
                 })
             })
             .collect::<eyre::Result<Vec<_>>>()?;
@@ -1417,7 +1351,7 @@ impl AppRunner {
         )?;
         tex_staging.write_pod(tex_bytes.as_slice())?;
 
-        let texture = rgpu_vk::image::DeviceLocalImage::new(
+        let texture = rgpu_vk::image::Texture::new(
             &device,
             tex_width,
             tex_height,
@@ -1425,22 +1359,39 @@ impl AppRunner {
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
             Some("statue-tex"),
         )?;
-        // SAFETY: upload_command_pool is used on this thread only during
-        // initialisation and the None fence path waits for device idle
-        // before returning, so staging/image buffers outlive GPU access.
+
+        // Record all uploads into a single command buffer, then
+        // submit once and wait for completion before the staging
+        // buffers are dropped.
+        //
+        // SAFETY: upload_cmd is in the recording state (begun above);
+        // all buffers remain alive until wait_idle below completes.
         unsafe {
-            texture.upload_from_host_visible(
-                &mut upload_command_buffer,
-                &tex_staging,
-                None,
+            vertex_buffer
+                .record_copy_from(&mut upload_cmd, &staging_vertex_buffer)
+        }?;
+        // SAFETY: same as vertex buffer copy above.
+        unsafe {
+            index_buffer
+                .record_copy_from(&mut upload_cmd, &staging_index_buffer)
+        }?;
+        // SAFETY: same as buffer copies above; image in recording state.
+        unsafe { texture.record_copy_from(&mut upload_cmd, &tex_staging) }?;
+
+        upload_cmd.end()?;
+        let cmd_info = vk::CommandBufferSubmitInfo::default()
+            .command_buffer(upload_cmd.raw_command_buffer());
+        let submit_info = vk::SubmitInfo2::default()
+            .command_buffer_infos(std::slice::from_ref(&cmd_info));
+        // SAFETY: command buffer is executable; referenced resources
+        // remain alive until wait_idle below.
+        unsafe {
+            device.graphics_present_queue_submit2_raw_fence(
+                std::slice::from_ref(&submit_info),
+                vk::Fence::null(),
             )
         }?;
-
-        let texture_view = rgpu_vk::image::ImageView::new(
-            &device,
-            &texture,
-            Some("statue-tex view"),
-        )?;
+        device.wait_idle()?;
 
         let sampler = rgpu_vk::sampler::Sampler::new(
             &device,
@@ -1451,17 +1402,11 @@ impl AppRunner {
         )?;
 
         for set in &descriptor_sets {
-            // SAFETY: texture_view and sampler are valid handles from device
-            // and remain alive for the lifetime of the descriptor set (both
-            // live in RunningState/SuspendedState).
+            // SAFETY: texture and sampler live in RunningState /
+            // SuspendedState and outlive any command buffer that
+            // references these descriptor sets.
             unsafe {
-                set.write_combined_image_sampler(
-                    &device,
-                    1,
-                    texture_view.raw_image_view(),
-                    sampler.raw_sampler(),
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                )
+                set.write_texture_sampler(&device, 1, &texture, &sampler)
             };
         }
 
@@ -1492,7 +1437,6 @@ impl AppRunner {
             start_time: Instant::now(),
             asset_map,
             texture,
-            texture_view,
             sampler,
         })
     }
@@ -1500,9 +1444,7 @@ impl AppRunner {
     fn suspended_to_running(
         state: SuspendedState,
     ) -> eyre::Result<RunningState> {
-        // SAFETY: The surface outlives all derived swapchains via
-        // Arc<Surface>. Frame slots' retained_pipeline Arcs are cleared
-        // after device.wait_idle() in the next suspended() call.
+        // SAFETY: The surface outlives all derived swapchains via Arc<Surface>.
         let surface = Arc::new(unsafe {
             Surface::new(state.device.parent(), Arc::clone(&state.win))
         }?);
@@ -1552,7 +1494,7 @@ impl AppRunner {
                             color_format = ?new_format,
                         )
                         .entered();
-                        Arc::new(build_pipeline(
+                        build_pipeline(
                             &state.device,
                             &state.shader,
                             new_format,
@@ -1561,7 +1503,7 @@ impl AppRunner {
                                 let idx = debug_counters.next_pipeline();
                                 move || format!("main pipeline {idx}")
                             }),
-                        )?)
+                        )?
                     };
                     (pipeline, new_format)
                 }
@@ -1607,7 +1549,6 @@ impl AppRunner {
             start_time: state.start_time,
             asset_map: state.asset_map,
             texture: state.texture,
-            texture_view: state.texture_view,
             sampler: state.sampler,
         })
     }
@@ -1630,11 +1571,6 @@ impl AppRunner {
                     e
                 );
                 return false;
-            }
-            for frame in &mut running_state.frames {
-                // SAFETY: wait_idle() succeeded above; no GPU work is
-                // in flight.
-                unsafe { frame.release_retained() };
             }
             running_state.swapchain = None;
             running_state.render_finished_semaphores = None;
@@ -1672,10 +1608,6 @@ impl AppRunner {
                 e
             );
             return false;
-        }
-        for frame in &mut running_state.frames {
-            // SAFETY: wait_idle() succeeded above.
-            unsafe { frame.release_retained() };
         }
 
         let sc_idx = running_state.debug_counters.next_swapchain();
@@ -1738,10 +1670,7 @@ impl AppRunner {
                         }),
                     ) {
                         Ok(pipeline) => {
-                            // Arc::clone in draw_frame's retained_pipeline
-                            // keeps the old pipeline alive until each
-                            // in-flight slot's fence signals.
-                            running_state.pipeline = Arc::new(pipeline);
+                            running_state.pipeline = pipeline;
                             running_state.pipeline_color_format = new_format;
                         }
                         Err(e) => {
