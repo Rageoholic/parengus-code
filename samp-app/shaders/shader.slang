@@ -6,18 +6,21 @@ struct Ubo
 [[vk::binding(0, 0)]]
 ConstantBuffer<Ubo> ubo;
 
+[[vk::binding(1, 0)]]
+Sampler2D tex;
+
 struct VertexInput
 {
     [[vk::location(0)]]
     float2 position;
     [[vk::location(1)]]
-    float3 color;
+    float2 tex_coord;
 };
 
 struct VertexOutput
 {
     [[vk::location(0)]]
-    float3 color;
+    float2 tex_coord;
     float4 sv_position : SV_Position;
 };
 
@@ -29,13 +32,12 @@ VertexOutput vert_main(VertexInput input)
         ubo.model,
         float4(input.position, 0.0, 1.0)
     );
-    output.color = input.color;
+    output.tex_coord = input.tex_coord;
     return output;
 }
 
 [shader("fragment")]
 float4 frag_main(VertexOutput in_vert) : SV_Target
 {
-    float3 color = in_vert.color;
-    return float4(color, 1.0);
+    return tex.Sample(in_vert.tex_coord);
 }

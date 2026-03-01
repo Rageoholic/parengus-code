@@ -893,6 +893,80 @@ impl Device {
         unsafe { self.handle.destroy_image_view(image_view, None) };
     }
 
+    /// Create a `VkImage`.
+    ///
+    /// # Safety
+    /// `create_info` must be valid and all referenced pointers must remain
+    /// valid for the duration of the call.
+    pub unsafe fn create_raw_image(
+        &self,
+        create_info: &vk::ImageCreateInfo<'_>,
+    ) -> Result<vk::Image, vk::Result> {
+        // SAFETY: Caller guarantees create_info validity.
+        unsafe { self.handle.create_image(create_info, None) }
+    }
+
+    /// Destroy a `VkImage`.
+    ///
+    /// # Safety
+    /// `image` must be a valid handle created from this device and not yet
+    /// destroyed. No in-flight GPU work may still reference `image`.
+    pub unsafe fn destroy_raw_image(&self, image: vk::Image) {
+        // SAFETY: Caller guarantees image provenance and drop ordering.
+        unsafe { self.handle.destroy_image(image, None) };
+    }
+
+    /// Query memory requirements for an image.
+    ///
+    /// # Safety
+    /// `image` must be a valid handle created from this device.
+    pub unsafe fn get_raw_image_memory_requirements(
+        &self,
+        image: vk::Image,
+    ) -> vk::MemoryRequirements {
+        // SAFETY: Caller guarantees image validity.
+        unsafe { self.handle.get_image_memory_requirements(image) }
+    }
+
+    /// Bind device memory to an image.
+    ///
+    /// # Safety
+    /// `image` and `memory` must both be valid handles created from this
+    /// device. `offset` must satisfy alignment/size requirements from
+    /// `vkGetImageMemoryRequirements`.
+    pub unsafe fn bind_raw_image_memory(
+        &self,
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        offset: vk::DeviceSize,
+    ) -> Result<(), vk::Result> {
+        // SAFETY: Caller guarantees image, memory, and offset validity.
+        unsafe { self.handle.bind_image_memory(image, memory, offset) }
+    }
+
+    /// Create a `VkSampler`.
+    ///
+    /// # Safety
+    /// `create_info` must be valid and all referenced pointers must remain
+    /// valid for the duration of the call.
+    pub unsafe fn create_raw_sampler(
+        &self,
+        create_info: &vk::SamplerCreateInfo<'_>,
+    ) -> Result<vk::Sampler, vk::Result> {
+        // SAFETY: Caller guarantees create_info validity.
+        unsafe { self.handle.create_sampler(create_info, None) }
+    }
+
+    /// Destroy a `VkSampler`.
+    ///
+    /// # Safety
+    /// `sampler` must be a valid handle created from this device and not yet
+    /// destroyed. No in-flight GPU work may still reference `sampler`.
+    pub unsafe fn destroy_raw_sampler(&self, sampler: vk::Sampler) {
+        // SAFETY: Caller guarantees sampler provenance and drop ordering.
+        unsafe { self.handle.destroy_sampler(sampler, None) };
+    }
+
     /// Acquire the next presentable swapchain image.
     ///
     /// Returns `(image_index, is_suboptimal)`. A suboptimal result means the
@@ -1404,6 +1478,33 @@ impl Device {
                 command_buffer,
                 src_buffer,
                 dst_buffer,
+                regions,
+            )
+        }
+    }
+
+    /// Record a buffer-to-image copy.
+    ///
+    /// # Safety
+    /// `command_buffer` must be in the recording state. `src_buffer` must be
+    /// a valid `TRANSFER_SRC` buffer. `dst_image` must be a valid image in
+    /// `dst_image_layout`. Regions must be valid and within bounds.
+    pub unsafe fn cmd_copy_buffer_to_image(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        src_buffer: vk::Buffer,
+        dst_image: vk::Image,
+        dst_image_layout: vk::ImageLayout,
+        regions: &[vk::BufferImageCopy],
+    ) {
+        // SAFETY: Caller guarantees command buffer state, handle
+        // provenance, and region validity.
+        unsafe {
+            self.handle.cmd_copy_buffer_to_image(
+                command_buffer,
+                src_buffer,
+                dst_image,
+                dst_image_layout,
                 regions,
             )
         }

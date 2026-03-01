@@ -20,7 +20,7 @@ use bytemuck::Pod;
 use gpu_allocator::{AllocationError, vulkan::Allocation};
 use thiserror::Error;
 
-use crate::command::CommandBufferHandle;
+use crate::command::ResettableCommandBuffer;
 use crate::device::{Device, MemoryUsage};
 
 /// Trait for types that expose a raw `VkBuffer` handle.
@@ -94,21 +94,6 @@ pub enum UploadBufferError {
         dst_offset: vk::DeviceSize,
         copy_size: vk::DeviceSize,
     },
-
-    #[error("Vulkan error resetting upload command buffer: {0}")]
-    ResetCommandBuffer(vk::Result),
-
-    #[error("Vulkan error beginning upload command buffer: {0}")]
-    BeginCommandBuffer(vk::Result),
-
-    #[error("Vulkan error ending upload command buffer: {0}")]
-    EndCommandBuffer(vk::Result),
-
-    #[error("Queue submit failed: {0}")]
-    QueueSubmit(vk::Result),
-
-    #[error("Device wait idle failed after upload submit: {0}")]
-    WaitIdle(vk::Result),
 }
 
 struct AllocatedBuffer {
@@ -369,24 +354,28 @@ impl DeviceLocalBuffer {
         self.inner.parent()
     }
 
-    /// Upload data from a host-visible source buffer into this device-local
-    /// buffer using a one-time copy submission.
+    /// Record an upload of the entire source buffer into this device-local
+    /// buffer. Returns [`UploadBufferError::SourceTooLarge`] if `src` is larger
+    /// than `self`.
+    ///
+    /// The caller is responsible for begin/end/submit and any CPU/GPU
+    /// synchronization.
     ///
     /// # Safety
-    /// - `command_buffer` must be externally synchronized and valid for
-    ///   reset/begin/record/end on the current thread.
+    /// - `command_buffer` must be in the recording state.
     /// - The caller must ensure `src` and `self` remain alive until GPU
-    ///   execution of the submitted copy has completed.
-    /// - If `fence` is `Some`, the caller must ensure it is unsignaled and
-    ///   later wait/reset it before reusing resources referenced by the copy.
-    /// - `src` must be created with vk::BufferUsageFlags::TRANSFER_SRC and
-    ///   `self` must be created with vk::BufferusageFlags::TRANSFER_DST
-    pub unsafe fn upload_from_host_visible(
+    ///   execution of the recorded copy has completed.
+    /// - `src` must be created with `TRANSFER_SRC` usage and `self` with
+    ///   `TRANSFER_DST` usage.
+    pub unsafe fn record_copy_from(
         &mut self,
-        command_buffer: &mut impl CommandBufferHandle,
+        command_buffer: &mut ResettableCommandBuffer,
         src: &HostVisibleBuffer,
-        fence: Option<vk::Fence>,
     ) -> Result<(), UploadBufferError> {
+        debug_assert_eq!(
+            command_buffer.state(),
+            crate::command::CommandBufferState::Recording
+        );
         let copy_size = src.size();
         if copy_size > self.size() {
             return Err(UploadBufferError::SourceTooLarge {
@@ -394,41 +383,32 @@ impl DeviceLocalBuffer {
                 dst_bytes: self.size(),
             });
         }
-
-        // SAFETY: This functions preconditions carry through. Offset of 0 is
-        // definitionally in bounds
+        // SAFETY: preconditions carry through; offset 0 is in-bounds.
         unsafe {
-            self.upload_from_host_visible_region(
-                command_buffer,
-                src,
-                0,
-                0,
-                copy_size,
-                fence,
-            )
+            self.record_upload_region_from(command_buffer, src, 0, 0, copy_size)
         }
     }
 
-    /// Upload a byte range from a host-visible source buffer into this
-    /// device-local buffer.
+    /// Record an upload of a byte range from the source buffer into this
+    /// device-local buffer. Returns [`UploadBufferError::RegionOutOfBounds`] if
+    /// any region extends past the end of its buffer.
+    ///
+    /// The caller is responsible for begin/end/submit and any CPU/GPU
+    /// synchronization.
     ///
     /// # Safety
-    /// - `command_buffer` must be externally synchronized and valid for
-    ///   reset/begin/record/end on the current thread.
+    /// - `command_buffer` must be in the recording state.
     /// - The caller must ensure `src` and `self` remain alive until GPU
-    ///   execution of the submitted copy has completed.
-    /// - If `fence` is `Some`, the caller must ensure it is unsignaled and
-    ///   later wait/reset it before reusing resources referenced by the copy.
-    /// - `src` must be created with vk::BufferUsageFlags::TRANSFER_SRC and
-    ///   `self` must be created with vk::BufferusageFlags::TRANSFER_DST
-    pub unsafe fn upload_from_host_visible_region(
+    ///   execution of the recorded copy has completed.
+    /// - `src` must be created with `TRANSFER_SRC` usage and `self` with
+    ///   `TRANSFER_DST` usage.
+    pub unsafe fn record_upload_region_from(
         &mut self,
-        command_buffer: &mut impl CommandBufferHandle,
+        command_buffer: &mut ResettableCommandBuffer,
         src: &HostVisibleBuffer,
         src_offset: vk::DeviceSize,
         dst_offset: vk::DeviceSize,
         copy_size: vk::DeviceSize,
-        fence: Option<vk::Fence>,
     ) -> Result<(), UploadBufferError> {
         if src_offset.saturating_add(copy_size) > src.size()
             || dst_offset.saturating_add(copy_size) > self.size()
@@ -442,63 +422,21 @@ impl DeviceLocalBuffer {
             });
         }
 
-        let raw_command_buffer = command_buffer.raw_command_buffer();
-        let begin_info = vk::CommandBufferBeginInfo::default();
-
-        // SAFETY: caller guarantees command buffer is not pending.
-        unsafe {
-            self.parent().reset_raw_command_buffer(
-                raw_command_buffer,
-                vk::CommandBufferResetFlags::empty(),
-            )
-        }
-        .map_err(UploadBufferError::ResetCommandBuffer)?;
-
-        // SAFETY: caller guarantees command buffer is in initial state.
-        unsafe {
-            self.parent()
-                .begin_raw_command_buffer(raw_command_buffer, &begin_info)
-        }
-        .map_err(UploadBufferError::BeginCommandBuffer)?;
-
+        let raw_cmd = command_buffer.raw_command_buffer();
         let copy_region = vk::BufferCopy::default()
             .src_offset(src_offset)
             .dst_offset(dst_offset)
             .size(copy_size);
-        // SAFETY: buffers and region are valid and in-bounds.
+        // SAFETY: caller guarantees recording state; buffers and
+        // region are valid and in-bounds.
         unsafe {
             self.parent().cmd_copy_buffer(
-                raw_command_buffer,
+                raw_cmd,
                 src.raw_buffer(),
                 self.raw_buffer(),
                 std::slice::from_ref(&copy_region),
             )
         };
-
-        // SAFETY: caller guarantees command buffer is in recording state.
-        unsafe { self.parent().end_raw_command_buffer(raw_command_buffer) }
-            .map_err(UploadBufferError::EndCommandBuffer)?;
-
-        let upload_cmd_info = vk::CommandBufferSubmitInfo::default()
-            .command_buffer(raw_command_buffer);
-        let upload_submit = vk::SubmitInfo2::default()
-            .command_buffer_infos(std::slice::from_ref(&upload_cmd_info));
-        let submit_fence = fence.unwrap_or(vk::Fence::null());
-
-        // SAFETY: command buffer is executable and references valid resources.
-        unsafe {
-            self.parent().graphics_present_queue_submit2_raw_fence(
-                std::slice::from_ref(&upload_submit),
-                submit_fence,
-            )
-        }
-        .map_err(UploadBufferError::QueueSubmit)?;
-
-        if fence.is_none() {
-            self.parent()
-                .wait_idle()
-                .map_err(UploadBufferError::WaitIdle)?;
-        }
 
         Ok(())
     }

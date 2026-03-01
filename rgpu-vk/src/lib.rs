@@ -11,6 +11,8 @@
 //! │   └── Swapchain<T>
 //! └── Device
 //!     ├── HostVisibleBuffer / DeviceLocalBuffer
+//!     ├── Texture (DeviceLocalImage + ImageView)
+//!     ├── Sampler
 //!     ├── DescriptorSetLayout → DescriptorPool → DescriptorSet
 //!     ├── PipelineLayout (with DescriptorSetLayout refs)
 //!     ├── ShaderModule → EntryPoint → DynamicPipeline
@@ -35,8 +37,10 @@ pub mod buffer;
 pub mod command;
 pub mod descriptor;
 pub mod device;
+pub mod image;
 pub mod instance;
 pub mod pipeline;
+pub mod sampler;
 pub mod shader;
 pub mod surface;
 pub mod swapchain;
