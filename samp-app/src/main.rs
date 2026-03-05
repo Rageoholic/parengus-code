@@ -24,6 +24,7 @@ use rgpu_vk::{
     device::{Device, DeviceConfig, QueueMode},
     image::Texture,
     instance::{Instance, InstanceExtensions},
+    memory::image_barrier2,
     pipeline::{
         CullModeFlags, DynamicPipeline, DynamicPipelineDesc, FrontFace,
         PipelineLayout, PipelineLayoutDesc, VertexAttributeDesc,
@@ -834,7 +835,7 @@ impl AppRunner {
             .layer_count(1);
 
         // Transition: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
-        let to_color = vk::ImageMemoryBarrier2::default()
+        let to_color = image_barrier2()
             .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
             .src_access_mask(vk::AccessFlags2::NONE)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -934,7 +935,7 @@ impl AppRunner {
         }
 
         // Transition: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
-        let to_present = vk::ImageMemoryBarrier2::default()
+        let to_present = image_barrier2()
             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)

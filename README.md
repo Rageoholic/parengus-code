@@ -35,6 +35,17 @@ All unsafe operations inside `unsafe fn` bodies are wrapped in
 explicit `unsafe {}` blocks, satisfying
 `#![deny(unsafe_op_in_unsafe_fn)]`.
 
+**ash barrier defaults**
+
+`ash` implements `Default` for Vulkan structs manually to set `sType`
+correctly, but leaves all other fields at zero. For the four barrier
+types (`ImageMemoryBarrier`, `ImageMemoryBarrier2`,
+`BufferMemoryBarrier`, `BufferMemoryBarrier2`) this means
+`srcQueueFamilyIndex` and `dstQueueFamilyIndex` default to **0**
+rather than `VK_QUEUE_FAMILY_IGNORED`. Use the helpers in
+`rgpu_vk::memory` instead of calling `.default()` directly on barrier
+structs.
+
 ## Prerequisites
 
 - Rust toolchain (`cargo`)
