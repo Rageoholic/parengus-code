@@ -460,7 +460,7 @@ impl DeviceLocalImage {
             .layer_count(1);
 
         // Barrier: UNDEFINED → TRANSFER_DST_OPTIMAL
-        let to_transfer = vk::ImageMemoryBarrier2::default()
+        let to_transfer = crate::memory::image_barrier2()
             .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
             .src_access_mask(vk::AccessFlags2::NONE)
             .dst_stage_mask(vk::PipelineStageFlags2::COPY)
@@ -500,7 +500,7 @@ impl DeviceLocalImage {
         };
 
         // Barrier: TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
-        let to_shader = vk::ImageMemoryBarrier2::default()
+        let to_shader = crate::memory::image_barrier2()
             .src_stage_mask(vk::PipelineStageFlags2::COPY)
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)

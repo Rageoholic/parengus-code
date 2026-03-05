@@ -39,6 +39,7 @@ pub mod descriptor;
 pub mod device;
 pub mod image;
 pub mod instance;
+pub mod memory;
 pub mod pipeline;
 pub mod sampler;
 pub mod shader;
