@@ -706,6 +706,30 @@ impl Device {
         self.properties.limits.non_coherent_atom_size
     }
 
+    /// Return the first format in `candidates` that supports
+    /// `DEPTH_STENCIL_ATTACHMENT` in optimal tiling, or `None` if
+    /// none do.
+    pub fn find_depth_format(
+        &self,
+        candidates: &[vk::Format],
+    ) -> Option<vk::Format> {
+        candidates.iter().copied().find(|&fmt| {
+            // SAFETY: physical_device is a valid handle selected from
+            // this instance during device creation.
+            let props = unsafe {
+                self.parent
+                    .ash_instance()
+                    .get_physical_device_format_properties(
+                        self.physical_device,
+                        fmt,
+                    )
+            };
+            props
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+        })
+    }
+
     /// Score a memory type for a given usage; returns `None` if the
     /// type is incompatible.  Higher scores are more preferred.
     fn score_memory_type(

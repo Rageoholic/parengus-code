@@ -1,9 +1,9 @@
 //! GPU image types.
 //!
-//! The public-facing type is [`Texture`], which bundles a
-//! [`DeviceLocalImage`] with its default 2-D colour [`ImageView`].
+//! The public-facing types are [`Texture`] (colour images uploaded
+//! from a staging buffer) and [`DepthImage`] (depth render targets).
 //! [`DeviceLocalImage`] and [`ImageView`] are `pub(crate)` building
-//! blocks; external code should use [`Texture`] instead.
+//! blocks.
 
 use std::sync::Arc;
 
@@ -575,6 +575,41 @@ impl ImageView {
     pub(crate) fn raw_image_view(&self) -> vk::ImageView {
         self.handle
     }
+
+    /// Create a 2-D depth image view for `image`.
+    pub(crate) fn new_depth(
+        device: &Arc<Device>,
+        image: &DeviceLocalImage,
+        name: Option<&str>,
+    ) -> Result<Self, CreateImageViewError> {
+        let subresource_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let create_info = vk::ImageViewCreateInfo::default()
+            .image(image.raw_image())
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(image.format())
+            .subresource_range(subresource_range);
+
+        // SAFETY: create_info references a valid image from the same
+        // device.
+        let handle = unsafe { device.create_raw_image_view(&create_info) }
+            .map_err(CreateImageViewError::Vulkan)?;
+
+        // SAFETY: handle is a valid image view from this device.
+        let name_result = unsafe { device.set_object_name_str(handle, name) };
+        if let Err(e) = name_result {
+            tracing::warn!("Failed to name image view {:?}: {e}", handle);
+        }
+
+        Ok(Self {
+            parent: Arc::clone(device),
+            handle,
+        })
+    }
 }
 
 impl Drop for ImageView {
@@ -661,6 +696,67 @@ impl Texture {
 
     /// Returns the raw `VkImageView` handle for use in descriptor
     /// writes.
+    pub fn raw_image_view(&self) -> vk::ImageView {
+        self.view.raw_image_view()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DepthImage
+// ---------------------------------------------------------------------------
+
+/// A GPU-only 2-D depth render target: a [`DeviceLocalImage`] with a
+/// depth [`ImageView`].
+///
+/// Unlike [`Texture`], a `DepthImage` is never uploaded to from a
+/// staging buffer. Layout transitions are performed per-frame using
+/// `old_layout = UNDEFINED` so the driver can discard old contents;
+/// this is safe because `LOAD_OP_CLEAR` is always used.
+///
+/// # Drop order
+///
+/// `view` is declared before `image` so Rust drops the view first,
+/// satisfying the Vulkan requirement that all image views must be
+/// destroyed before the image they reference.
+#[derive(Debug)]
+pub struct DepthImage {
+    // IMPORTANT: `view` must be declared before `image`.
+    view: ImageView,
+    image: DeviceLocalImage,
+}
+
+impl DepthImage {
+    /// Create a 2-D device-local depth image (image + depth view).
+    ///
+    /// `format` must be a depth-only format (e.g.
+    /// `vk::Format::D32_SFLOAT`). The image is created with
+    /// `DEPTH_STENCIL_ATTACHMENT` usage.
+    pub fn new(
+        device: &Arc<Device>,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        name: Option<&str>,
+    ) -> Result<Self, CreateTextureError> {
+        let image = DeviceLocalImage::new(
+            device,
+            width,
+            height,
+            format,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            name,
+        )?;
+        let view = ImageView::new_depth(device, &image, name)?;
+        Ok(Self { view, image })
+    }
+
+    /// Returns the raw `VkImage` handle for use in barriers.
+    pub fn raw_image(&self) -> vk::Image {
+        self.image.raw_image()
+    }
+
+    /// Returns the raw `VkImageView` handle for use as a depth
+    /// attachment.
     pub fn raw_image_view(&self) -> vk::ImageView {
         self.view.raw_image_view()
     }
