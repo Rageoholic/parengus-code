@@ -3,7 +3,30 @@
 //! `Device` wraps a `VkDevice` and centralises all per-device state:
 //! a `gpu-allocator` allocator (behind a `Mutex`), extension loaders
 //! for swapchain, dynamic rendering, synchronization2, and debug utils,
-//! plus the graphics/present queue and its family index.
+//! plus queues for graphics/present, transfer, and compute roles.
+//!
+//! # Queue model
+//!
+//! Queue behaviour is controlled by [`QueueConfig`] in
+//! [`DeviceConfig`]. Three independent boolean axes govern allocation:
+//!
+//! | Field | `true` | `false` |
+//! |-------|--------|---------|
+//! | `dedicated_transfer` | dedicated family | shares gfx family |
+//! | `dedicated_compute` | dedicated family | shares gfx family |
+//! | `parallel` | all queues per family | one queue per family |
+//!
+//! When multiple queues are available for a role, callers pass a
+//! `queue_index` to submit methods to select one per frame in flight.
+//! Roles that share a family share the same underlying `Arc<Mutex<…>>`.
+//!
+//! [`Device::create_compatible`] tries to honour each requested axis.
+//! When `DeviceConfig::queue_config_strict = true`, any axis that
+//! could not be satisfied returns
+//! [`CreateCompatibleError::QueueConfigUnsatisfied`]; otherwise the
+//! device uses the best configuration the hardware provides.
+//!
+//! # Physical device selection
 //!
 //! Physical device selection uses a priority-based fold: discrete GPUs
 //! outrank integrated GPUs, and only devices that satisfy all required
@@ -90,11 +113,20 @@ pub struct Device {
     synchronization2: Option<Synchronization2Loader>,
     physical_device: vk::PhysicalDevice,
     memory_budget: bool,
-    /// Aliased queues share the same `Arc<Mutex<vk::Queue>>` so that locking
-    /// either role serializes on the same underlying resource.
-    graphics_present_queue: (Arc<Mutex<vk::Queue>>, u32),
-    transfer_queue: (Arc<Mutex<vk::Queue>>, u32),
-    compute_queue: (Arc<Mutex<vk::Queue>>, u32),
+    /// Queues for the graphics+present role.
+    ///
+    /// In `DedicatedParallel`/`Parallel` modes this Vec may hold
+    /// multiple distinct `VkQueue` handles from the same family.
+    /// Roles that share a family share the same `Arc<Mutex<…>>`.
+    graphics_present_queues: Vec<Arc<Mutex<vk::Queue>>>,
+    graphics_present_family: u32,
+    transfer_queues: Vec<Arc<Mutex<vk::Queue>>>,
+    transfer_family: u32,
+    compute_queues: Vec<Arc<Mutex<vk::Queue>>>,
+    compute_family: u32,
+    /// The [`QueueConfig`] that was actually applied (may differ
+    /// from the requested config when strict mode is off).
+    queue_config: QueueConfig,
 }
 
 impl std::fmt::Debug for Device {
@@ -135,6 +167,15 @@ pub enum CreateCompatibleError {
 
     #[error("No queue family supporting both graphics and present")]
     NoGraphicsPresentQueue,
+
+    #[error(
+        "Requested queue config ({requested}) could not be fully \
+         satisfied (achieved: {actual}) and strict mode is enabled"
+    )]
+    QueueConfigUnsatisfied {
+        requested: QueueConfig,
+        actual: QueueConfig,
+    },
 
     #[error("Failed to create logical device: {0}")]
     DeviceCreationFailed(vk::Result),
@@ -180,17 +221,68 @@ pub enum QueueSubmitError {
     FenceNotReady,
     #[error("The fence passed was from a different device")]
     MismatchedObjects,
+    #[error("queue_index {0} is out of bounds for the graphics/present queue")]
+    QueueIndexOutOfBounds(usize),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum QueueMode {
-    /// Use dedicated transfer and compute queue families when available.
-    #[default]
-    Auto,
-    /// Force all queue types to the same queue family.
-    Unified,
-    /// Force all queue types onto a single queue from one family.
-    Single,
+#[derive(Debug, Error)]
+pub enum QueuePresentError {
+    #[error("queue_index {0} is out of bounds for the graphics/present queue")]
+    QueueIndexOutOfBounds(usize),
+    #[error("Vulkan error during queue present: {0}")]
+    Vulkan(vk::Result),
+}
+
+/// Controls how Vulkan queues are allocated for the three roles
+/// (graphics+present, transfer, compute).
+///
+/// Each field is an independent boolean axis:
+///
+/// | Field | `true` | `false` |
+/// |-------|--------|---------|
+/// | `dedicated_transfer` | dedicated family | shares gfx family |
+/// | `dedicated_compute` | dedicated family | shares gfx family |
+/// | `parallel` | all queues per family | one queue per family |
+///
+/// The default (`true` for all) requests the most capable
+/// configuration. [`Device::create_compatible`] uses whatever the
+/// hardware provides and reports the achieved config via
+/// [`Device::queue_config`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueConfig {
+    /// Use a dedicated transfer queue family (not shared with
+    /// graphics). When `false`, the graphics/present family is
+    /// used for transfer.
+    pub dedicated_transfer: bool,
+    /// Use a dedicated compute queue family (not shared with
+    /// graphics). When `false`, the graphics/present family is
+    /// used for compute.
+    pub dedicated_compute: bool,
+    /// Allocate all available queues from each family, enabling
+    /// per-frame-in-flight parallelism. When `false`, exactly one
+    /// queue is allocated per family.
+    pub parallel: bool,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            dedicated_transfer: true,
+            dedicated_compute: true,
+            parallel: true,
+        }
+    }
+}
+
+impl std::fmt::Display for QueueConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dedicated_transfer={}, dedicated_compute={}, \
+             parallel={}",
+            self.dedicated_transfer, self.dedicated_compute, self.parallel,
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -199,7 +291,13 @@ pub struct DeviceConfig {
     pub dynamic_rendering: bool,
     pub synchronization2: bool,
     pub maintenance1: bool,
-    pub queue_mode: QueueMode,
+    pub queue_config: QueueConfig,
+    /// When `true`, [`Device::create_compatible`] returns
+    /// [`CreateCompatibleError::QueueConfigUnsatisfied`] if any
+    /// requested axis in [`queue_config`] could not be satisfied.
+    /// When `false` (the default), the device uses the best
+    /// configuration the hardware supports.
+    pub queue_config_strict: bool,
 }
 
 impl Device {
@@ -454,42 +552,42 @@ impl Device {
             best.score.0,
         );
 
-        // Find dedicated transfer and compute queue families
-        let (transfer_family, compute_family) = if matches!(
-            config.queue_mode,
-            QueueMode::Unified | QueueMode::Single
-        ) {
-            (graphics_present_family, graphics_present_family)
+        // --- Family selection ---
+        // When dedicated_transfer/compute is requested, prefer a
+        // family with the required flag but without GRAPHICS.
+        // Fall back to graphics_present_family if none exists.
+        let dedicated_transfer_family =
+            queue_families.iter().enumerate().find_map(|(idx, qf)| {
+                if qf.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                    && !qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                {
+                    Some(idx as u32)
+                } else {
+                    None
+                }
+            });
+
+        let dedicated_compute_family =
+            queue_families.iter().enumerate().find_map(|(idx, qf)| {
+                if qf.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                    && !qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                {
+                    Some(idx as u32)
+                } else {
+                    None
+                }
+            });
+
+        let transfer_family = if config.queue_config.dedicated_transfer {
+            dedicated_transfer_family.unwrap_or(graphics_present_family)
         } else {
-            let dedicated_transfer = queue_families
-                .iter()
-                .enumerate()
-                .find_map(|(idx, props)| {
-                    if props.queue_flags.contains(vk::QueueFlags::TRANSFER)
-                        && !props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                    {
-                        Some(idx as u32)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(graphics_present_family);
+            graphics_present_family
+        };
 
-            let dedicated_compute = queue_families
-                .iter()
-                .enumerate()
-                .find_map(|(idx, props)| {
-                    if props.queue_flags.contains(vk::QueueFlags::COMPUTE)
-                        && !props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                    {
-                        Some(idx as u32)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(graphics_present_family);
-
-            (dedicated_transfer, dedicated_compute)
+        let compute_family = if config.queue_config.dedicated_compute {
+            dedicated_compute_family.unwrap_or(graphics_present_family)
+        } else {
+            graphics_present_family
         };
 
         tracing::info!(
@@ -500,22 +598,48 @@ impl Device {
             compute_family
         );
 
-        // Build deduplicated queue create infos
+        // --- Queue count per family ---
+        // Parallel mode allocates all available queues from each
+        // family. Non-parallel mode allocates exactly one.
+        let want_parallel = config.queue_config.parallel;
+
+        // Deduplicate families; count is set once per unique family.
         let mut family_queue_counts: HashMap<u32, u32> = HashMap::new();
-        for family in [graphics_present_family, transfer_family, compute_family]
+        for &family in
+            &[graphics_present_family, transfer_family, compute_family]
         {
-            *family_queue_counts.entry(family).or_insert(0) += 1;
+            family_queue_counts.entry(family).or_insert_with(|| {
+                if want_parallel {
+                    queue_families[family as usize].queue_count.max(1)
+                } else {
+                    1
+                }
+            });
         }
 
-        // Clamp to available queue count per family, or to 1 if forced
-        for (&family, count) in &mut family_queue_counts {
-            if config.queue_mode == QueueMode::Single {
-                *count = 1;
-            } else {
-                let available = queue_families[family as usize].queue_count;
-                if *count > available {
-                    *count = available;
-                }
+        // --- Determine effective config and check strictness ---
+        // Each axis is checked independently: dedicated_transfer and
+        // dedicated_compute reflect whether each role got its own
+        // family; parallel reflects whether more than one queue was
+        // allocated from the graphics/present family.
+        let gfx_queue_count = family_queue_counts[&graphics_present_family];
+        let effective_config = QueueConfig {
+            dedicated_transfer: transfer_family != graphics_present_family,
+            dedicated_compute: compute_family != graphics_present_family,
+            parallel: gfx_queue_count > 1,
+        };
+
+        if config.queue_config_strict {
+            let req = config.queue_config;
+            let eff = effective_config;
+            if (req.dedicated_transfer && !eff.dedicated_transfer)
+                || (req.dedicated_compute && !eff.dedicated_compute)
+                || (req.parallel && !eff.parallel)
+            {
+                return Err(CreateCompatibleError::QueueConfigUnsatisfied {
+                    requested: req,
+                    actual: eff,
+                });
             }
         }
 
@@ -587,42 +711,27 @@ impl Device {
         }
         .map_err(CreateCompatibleError::DeviceCreationFailed)?;
 
-        // Get queues. For families with multiple queues, assign
-        // incrementing indices. For families where we requested more
-        // queues than available, reuse index 0.
-        let mut family_next_index: HashMap<u32, u32> = HashMap::new();
-        let mut get_next_queue = |family: u32| -> vk::Queue {
-            let idx = family_next_index.entry(family).or_insert(0);
-            let max = family_queue_counts[&family];
-            let queue_idx = if *idx < max { *idx } else { 0 };
-            *idx += 1;
-            // SAFETY: device was just created with this family/index.
-            unsafe { device.get_device_queue(family, queue_idx) }
-        };
+        // Build per-family Vec<Arc<Mutex<vk::Queue>>>.
+        // Roles that share a family share the same Arc instances, so
+        // locking any role serialises on the same Mutex.
+        let mut family_queues: HashMap<u32, Vec<Arc<Mutex<vk::Queue>>>> =
+            HashMap::new();
+        for (&family, &count) in &family_queue_counts {
+            let queues = (0..count)
+                .map(|i| {
+                    // SAFETY: device was just created requesting
+                    // `count` queues from this family.
+                    let q = unsafe { device.get_device_queue(family, i) };
+                    Arc::new(Mutex::new(q))
+                })
+                .collect();
+            family_queues.insert(family, queues);
+        }
 
-        let graphics_present_queue_handle =
-            get_next_queue(graphics_present_family);
-        let transfer_queue_handle = get_next_queue(transfer_family);
-        let compute_queue_handle = get_next_queue(compute_family);
-
-        // Aliased queues (same underlying VkQueue handle) must share a
-        // single Mutex so that locking any role serializes on the same
-        // resource.
-        let gfx_queue_arc = Arc::new(Mutex::new(graphics_present_queue_handle));
-        let transfer_queue_arc =
-            if transfer_queue_handle == graphics_present_queue_handle {
-                Arc::clone(&gfx_queue_arc)
-            } else {
-                Arc::new(Mutex::new(transfer_queue_handle))
-            };
-        let compute_queue_arc =
-            if compute_queue_handle == graphics_present_queue_handle {
-                Arc::clone(&gfx_queue_arc)
-            } else if compute_queue_handle == transfer_queue_handle {
-                Arc::clone(&transfer_queue_arc)
-            } else {
-                Arc::new(Mutex::new(compute_queue_handle))
-            };
+        let graphics_present_queues =
+            family_queues[&graphics_present_family].clone();
+        let transfer_queues = family_queues[&transfer_family].clone();
+        let compute_queues = family_queues[&compute_family].clone();
 
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.ash_instance().clone(),
@@ -671,9 +780,13 @@ impl Device {
             handle: device,
             physical_device,
             memory_budget: best.enable_memory_budget,
-            graphics_present_queue: (gfx_queue_arc, graphics_present_family),
-            transfer_queue: (transfer_queue_arc, transfer_family),
-            compute_queue: (compute_queue_arc, compute_family),
+            graphics_present_queues,
+            graphics_present_family,
+            transfer_queues,
+            transfer_family,
+            compute_queues,
+            compute_family,
+            queue_config: effective_config,
         })
     }
 
@@ -872,7 +985,31 @@ impl Device {
     }
 
     pub fn graphics_present_queue_family(&self) -> u32 {
-        self.graphics_present_queue.1
+        self.graphics_present_family
+    }
+
+    pub fn transfer_queue_family(&self) -> u32 {
+        self.transfer_family
+    }
+
+    pub fn compute_queue_family(&self) -> u32 {
+        self.compute_family
+    }
+
+    pub fn graphics_present_queue_count(&self) -> usize {
+        self.graphics_present_queues.len()
+    }
+
+    pub fn transfer_queue_count(&self) -> usize {
+        self.transfer_queues.len()
+    }
+
+    pub fn compute_queue_count(&self) -> usize {
+        self.compute_queues.len()
+    }
+
+    pub fn queue_config(&self) -> QueueConfig {
+        self.queue_config
     }
 }
 
@@ -1071,19 +1208,22 @@ impl Device {
     pub unsafe fn queue_present(
         &self,
         present_info: &vk::PresentInfoKHR<'_>,
-    ) -> Result<bool, vk::Result> {
+        queue_index: usize,
+    ) -> Result<bool, QueuePresentError> {
         let swapchain_device = self
             .swapchain_device
             .as_ref()
             .expect("swapchain was not enabled in DeviceConfig");
         let queue = self
-            .graphics_present_queue
-            .0
+            .graphics_present_queues
+            .get(queue_index)
+            .ok_or(QueuePresentError::QueueIndexOutOfBounds(queue_index))?
             .lock()
             .expect("graphics/present queue lock poisoned");
         // SAFETY: Caller guarantees all handles and synchronization
         // requirements.
         unsafe { swapchain_device.queue_present(*queue, present_info) }
+            .map_err(QueuePresentError::Vulkan)
     }
 
     pub fn has_swapchain_support(&self) -> bool {
@@ -1372,10 +1512,12 @@ impl Device {
         &self,
         submits: &[vk::SubmitInfo2<'_>],
         fence: vk::Fence,
-    ) -> Result<(), vk::Result> {
+        queue_index: usize,
+    ) -> Result<(), QueueSubmitError> {
         let queue = self
-            .graphics_present_queue
-            .0
+            .graphics_present_queues
+            .get(queue_index)
+            .ok_or(QueueSubmitError::QueueIndexOutOfBounds(queue_index))?
             .lock()
             .expect("graphics/present queue lock poisoned");
         let sync2 = self
@@ -1394,6 +1536,7 @@ impl Device {
                 loader.queue_submit2(*queue, submits, fence)
             },
         }
+        .map_err(QueueSubmitError::SubmissionFailed)
     }
 
     /// Submit work to the graphics/present queue using the synchronization2
@@ -1407,6 +1550,7 @@ impl Device {
         &self,
         submits: &[vk::SubmitInfo2<'_>],
         fence: Option<&mut sync::Fence>,
+        queue_index: usize,
     ) -> Result<(), QueueSubmitError> {
         if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(false) {
             Err(QueueSubmitError::FenceNotReady)
@@ -1421,20 +1565,23 @@ impl Device {
                 .as_ref()
                 .map(|f| f.raw_fence())
                 .unwrap_or(vk::Fence::null());
-            // SAFETY: All handles in submits are valid and derived from this
-            // device by our own safety contract. Command buffers are in the
-            // executable state by our own safety contract. Wait semaphores are
-            // signaled by our own safety contract. raw_fence is known to have
-            // been derived from this device and is in the unsignaled state
+            // SAFETY: All handles in submits are valid and derived from
+            // this device by our own safety contract. Command buffers
+            // are in the executable state by our own safety contract.
+            // Wait semaphores are signaled by our own safety contract.
+            // raw_fence is known to have been derived from this device
+            // and is in the unsignaled state.
             unsafe {
                 self.graphics_present_queue_submit2_raw_fence(
-                    submits, raw_fence,
+                    submits,
+                    raw_fence,
+                    queue_index,
                 )
-            }
-            .map_err(QueueSubmitError::SubmissionFailed)?;
+            }?;
 
             if let Some(f) = fence {
-                // SAFETY: This fence has just been submitted to the queue via
+                // SAFETY: This fence has just been submitted to the
+                // queue via
                 // Self::graphics_present_queue_submit2_raw_fence.
                 _ = unsafe { f.mark_submitted() }
             }

@@ -21,7 +21,7 @@ use rgpu_vk::{
         DescriptorBindingDesc, DescriptorPool, DescriptorSet,
         DescriptorSetLayout,
     },
-    device::{Device, DeviceConfig, QueueMode},
+    device::{Device, DeviceConfig, QueueConfig},
     image::{DepthImage, Texture},
     instance::{Instance, InstanceConfig},
     memory::image_barrier2,
@@ -299,9 +299,22 @@ struct CliArgs {
     #[arg(long)]
     rgpu_log_level: Option<TracingLogLevel>,
 
-    /// Queue-family selection strategy for graphics/present.
-    #[arg(long, default_value = "auto")]
-    queue_mode: CliQueueMode,
+    /// Use a dedicated transfer queue family (default: true).
+    #[arg(long)]
+    dedicated_transfer: Option<bool>,
+
+    /// Use a dedicated compute queue family (default: true).
+    #[arg(long)]
+    dedicated_compute: Option<bool>,
+
+    /// Allocate all available queues per family (default: true).
+    #[arg(long)]
+    parallel: Option<bool>,
+
+    /// Treat queue config as hard requirements; error if any
+    /// requested axis is unsatisfied.
+    #[arg(long)]
+    queue_config_strict: bool,
 
     /// Load debug-info shader binary (`shader.debug.spv`) for RenderDoc.
     #[arg(long)]
@@ -310,28 +323,6 @@ struct CliArgs {
     /// Disable ANSI color codes in stdout log output.
     #[arg(long)]
     no_color: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-/// Queue-family selection policy.
-enum CliQueueMode {
-    #[default]
-    /// Pick the best available mode automatically.
-    Auto,
-    /// Prefer one family for graphics and present when possible.
-    Unified,
-    /// Use a single queue/family path.
-    Single,
-}
-
-impl From<CliQueueMode> for QueueMode {
-    fn from(value: CliQueueMode) -> Self {
-        match value {
-            CliQueueMode::Auto => QueueMode::Auto,
-            CliQueueMode::Unified => QueueMode::Unified,
-            CliQueueMode::Single => QueueMode::Single,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -474,12 +465,29 @@ fn main() -> eyre::Result<()> {
         )
     }?);
 
+    if cli_args.queue_config_strict
+        && (cli_args.dedicated_transfer.is_none()
+            || cli_args.dedicated_compute.is_none()
+            || cli_args.parallel.is_none())
+    {
+        eyre::bail!(
+            "--queue-config-strict requires all three of \
+             --dedicated-transfer, --dedicated-compute, \
+             and --parallel to be explicitly specified"
+        );
+    }
+
     let device_config = DeviceConfig {
         swapchain: true,
         dynamic_rendering: true,
         synchronization2: true,
         maintenance1: true,
-        queue_mode: cli_args.queue_mode.into(),
+        queue_config: QueueConfig {
+            dedicated_transfer: cli_args.dedicated_transfer.unwrap_or(true),
+            dedicated_compute: cli_args.dedicated_compute.unwrap_or(true),
+            parallel: cli_args.parallel.unwrap_or(true),
+        },
+        queue_config_strict: cli_args.queue_config_strict,
     };
 
     let mut app = AppRunner(Some(App::Initializing(InitializingState {
@@ -1240,6 +1248,7 @@ impl AppRunner {
             state.device.graphics_present_queue_submit2(
                 std::slice::from_ref(&submit),
                 Some(&mut frame_objs.in_flight_fence),
+                0,
             )
         } {
             return DrawFrameOutcome::Fatal(format!(
@@ -1255,15 +1264,16 @@ impl AppRunner {
         // SAFETY: render_finished is signaled by submit; image is in
         // PRESENT_SRC_KHR.
         let present_result =
-            unsafe { state.device.queue_present(&present_info) };
+            unsafe { state.device.queue_present(&present_info, 0) };
 
         state.current_frame = (state.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
         match present_result {
             Ok(false) if !suboptimal => DrawFrameOutcome::Success,
-            Ok(_) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                DrawFrameOutcome::SwapchainOutOfDate
-            }
+            Ok(_)
+            | Err(rgpu_vk::device::QueuePresentError::Vulkan(
+                vk::Result::ERROR_OUT_OF_DATE_KHR,
+            )) => DrawFrameOutcome::SwapchainOutOfDate,
             Err(e) => DrawFrameOutcome::Fatal(format!("Present failed: {e}")),
         }
     }
@@ -1672,6 +1682,7 @@ impl AppRunner {
             device.graphics_present_queue_submit2_raw_fence(
                 std::slice::from_ref(&submit_info),
                 vk::Fence::null(),
+                0,
             )
         }?;
         device.wait_idle()?;
