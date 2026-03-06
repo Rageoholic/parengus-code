@@ -16,19 +16,6 @@ Adding MSAA requires:
 - Wiring the sample count through `DynamicPipelineDesc` so the
   rasterisation state matches.
 
-## Depth Buffer
-
-No depth attachment is provided to `RenderingInfo` today, so
-overlapping geometry produces incorrect results based on draw order.
-Adding a depth buffer requires:
-
-- Selecting a supported depth format (e.g. `VK_FORMAT_D32_SFLOAT`).
-- Allocating a depth image and view sized to the swapchain extent,
-  recreated on resize.
-- Supplying a `RenderingAttachmentInfo` for the depth attachment in
-  `RenderingInfo`.
-- Enabling depth test and write in the pipeline's depth/stencil state.
-
 ## Consistency of Type Layouts Between Rust and Slang
 
 Shared types such as `Ubo` and `PushConstants` are defined independently
@@ -44,6 +31,24 @@ investigate:
   the Slang typedef and the Rust struct.
 - Compile-time assertions (`assert_eq!(size_of::<Ubo>(), EXPECTED)`)
   as a lightweight safety net until a fuller solution is in place.
+
+## Asset Pipeline: Texture Color Space Metadata
+
+The asset pipeline currently passes texture files through without tracking
+or validating their color space. This led to an sRGB correctness bug where
+the Vulkan format (`R8G8B8A8_SRGB` vs `R8G8B8A8_UNORM`) had to be chosen
+by convention rather than by inspecting the source asset.
+
+Improvements to make:
+
+- During asset processing, inspect PNG `sRGB`, `gAMA`, and `iCCP` chunks
+  (and JPEG APP2/ICC markers) to determine the source color space.
+- Emit a warning at asset-build time when no color space metadata is
+  found, prompting the author to either embed it or annotate the asset
+  manifest entry explicitly.
+- Propagate the detected color space into the asset map (e.g. as a
+  `color_space = "srgb" | "linear"` field) so the loader can select the
+  correct `VkFormat` without relying on convention.
 
 ## Decide If Shaders Are Assets or Code
 

@@ -68,7 +68,7 @@ fn choose_surface_format(
         .iter()
         .copied()
         .find(|f| {
-            f.format == vk::Format::B8G8R8A8_UNORM
+            f.format == vk::Format::B8G8R8A8_SRGB
                 && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
         })
         .unwrap_or(formats[0])
@@ -257,7 +257,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
     ///
     /// `preferred_format` is a hint for surface format selection. When the
     /// surface supports it, the swapchain will use that format. Falls back to
-    /// the default selection (B8G8R8A8_UNORM + SRGB_NONLINEAR) if not
+    /// the default selection (B8G8R8A8_SRGB + SRGB_NONLINEAR) if not
     /// available.
     pub fn new<F>(
         parent_device: &Arc<Device>,
@@ -670,7 +670,7 @@ mod tests {
             color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
         };
         let preferred = vk::SurfaceFormatKHR {
-            format: vk::Format::B8G8R8A8_UNORM,
+            format: vk::Format::B8G8R8A8_SRGB,
             color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
         };
 
