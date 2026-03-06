@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use crate::device::Device;
-use crate::surface::{Surface, SurfaceQueryError};
+use crate::surface::Surface;
 
 #[derive(Debug, Error)]
 pub enum CreateSwapchainError {
@@ -38,11 +38,9 @@ pub enum CreateSwapchainError {
     #[error("Invalid requested swapchain extent ({width}x{height})")]
     InvalidExtent { width: u32, height: u32 },
 
-    #[error("Swapchain support was not enabled on this device")]
-    SwapchainNotEnabled,
 
-    #[error("Failed while querying surface support details: {0}")]
-    SurfaceQuery(#[from] SurfaceQueryError),
+    #[error("Vulkan error querying surface support details: {0}")]
+    SurfaceQuery(vk::Result),
 
     #[error("Vulkan error creating swapchain: {0}")]
     VulkanCreate(vk::Result),
@@ -337,9 +335,10 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
     where
         F: FnOnce() -> String,
     {
-        if !parent_device.has_swapchain_support() {
-            return Err(CreateSwapchainError::SwapchainNotEnabled);
-        }
+        assert!(
+            parent_device.has_swapchain_support(),
+            "swapchain was not enabled in DeviceConfig"
+        );
 
         if desired_extent.width == 0 || desired_extent.height == 0 {
             return Err(CreateSwapchainError::InvalidExtent {
@@ -373,13 +372,18 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
 
         // SAFETY: physical_device belongs to parent_device's instance, and
         // parent_surface is derived from the same instance (validated above).
-        let capabilities =
-            unsafe { parent_surface.query_capabilities(physical_device) }?;
+        let capabilities = unsafe {
+            parent_surface.query_capabilities(physical_device)
+        }
+        .map_err(CreateSwapchainError::SurfaceQuery)?;
         // SAFETY: same reasoning as above.
-        let formats = unsafe { parent_surface.query_formats(physical_device) }?;
+        let formats = unsafe { parent_surface.query_formats(physical_device) }
+            .map_err(CreateSwapchainError::SurfaceQuery)?;
         // SAFETY: same reasoning as above.
-        let present_modes =
-            unsafe { parent_surface.query_present_modes(physical_device) }?;
+        let present_modes = unsafe {
+            parent_surface.query_present_modes(physical_device)
+        }
+        .map_err(CreateSwapchainError::SurfaceQuery)?;
 
         if formats.is_empty() {
             return Err(CreateSwapchainError::NoSurfaceFormats);
@@ -420,7 +424,8 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         // queried surface support details.
         let handle = unsafe {
             parent_device.create_raw_swapchain(&swapchain_create_info)
-        }?;
+        }
+        .map_err(CreateSwapchainError::VulkanCreate)?;
         // Wrap in LazyCell: the closure is evaluated at most once,
         // and only if set_object_name_with actually invokes it
         // (i.e. only when debug_utils is enabled).
@@ -438,6 +443,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         // SAFETY: handle was created by this device's swapchain loader
         // and is valid.
         let images = unsafe { parent_device.get_raw_swapchain_images(handle) }
+            .map_err(CreateSwapchainError::VulkanGetImages)
             .inspect_err(|_| {
                 // SAFETY: handle was created above and must be
                 // destroyed on early exit.
