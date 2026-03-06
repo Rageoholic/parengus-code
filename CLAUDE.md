@@ -59,6 +59,12 @@ For things rustfmt cannot wrap (comments, string literals, `#[derive(...)]`):
 Only exceed 80 columns when there is no syntactically valid way to break
 the line (e.g., a single token or URL that is itself longer than 80 chars).
 
+## Contributing
+
+Branch naming, issue templates, and PR format are defined in
+[CONTRIBUTING.md](CONTRIBUTING.md). Follow those rules when creating
+branches or opening issues and PRs on behalf of the user.
+
 ## AI Disclosure
 
 For externally visible project artifacts, explicitly disclose AI assistance.
