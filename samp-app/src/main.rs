@@ -299,9 +299,13 @@ struct CliArgs {
     #[arg(long)]
     rgpu_log_level: Option<TracingLogLevel>,
 
-    /// Queue-family selection strategy for graphics/present.
-    #[arg(long, default_value = "auto")]
-    queue_mode: CliQueueMode,
+    /// Queue-family selection strategy (default: dedicated-parallel).
+    #[arg(long)]
+    queue_mode: Option<CliQueueMode>,
+
+    /// Treat queue-mode as a hard requirement; error if unsatisfied.
+    #[arg(long)]
+    queue_mode_strict: bool,
 
     /// Load debug-info shader binary (`shader.debug.spv`) for RenderDoc.
     #[arg(long)]
@@ -312,23 +316,25 @@ struct CliArgs {
     no_color: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 /// Queue-family selection policy.
 enum CliQueueMode {
-    #[default]
-    /// Pick the best available mode automatically.
-    Auto,
-    /// Prefer one family for graphics and present when possible.
-    Unified,
-    /// Use a single queue/family path.
+    /// Separate dedicated families + all available queues per family.
+    DedicatedParallel,
+    /// Separate dedicated families, one queue per family.
+    Dedicated,
+    /// Single shared family + all available queues.
+    Parallel,
+    /// Single queue from the graphics/present family.
     Single,
 }
 
 impl From<CliQueueMode> for QueueMode {
     fn from(value: CliQueueMode) -> Self {
         match value {
-            CliQueueMode::Auto => QueueMode::Auto,
-            CliQueueMode::Unified => QueueMode::Unified,
+            CliQueueMode::DedicatedParallel => QueueMode::DedicatedParallel,
+            CliQueueMode::Dedicated => QueueMode::Dedicated,
+            CliQueueMode::Parallel => QueueMode::Parallel,
             CliQueueMode::Single => QueueMode::Single,
         }
     }
@@ -479,7 +485,8 @@ fn main() -> eyre::Result<()> {
         dynamic_rendering: true,
         synchronization2: true,
         maintenance1: true,
-        queue_mode: cli_args.queue_mode.into(),
+        queue_mode: cli_args.queue_mode.map(Into::into).unwrap_or_default(),
+        queue_mode_strict: cli_args.queue_mode_strict,
     };
 
     let mut app = AppRunner(Some(App::Initializing(InitializingState {
@@ -1240,6 +1247,7 @@ impl AppRunner {
             state.device.graphics_present_queue_submit2(
                 std::slice::from_ref(&submit),
                 Some(&mut frame_objs.in_flight_fence),
+                0,
             )
         } {
             return DrawFrameOutcome::Fatal(format!(
@@ -1255,15 +1263,16 @@ impl AppRunner {
         // SAFETY: render_finished is signaled by submit; image is in
         // PRESENT_SRC_KHR.
         let present_result =
-            unsafe { state.device.queue_present(&present_info) };
+            unsafe { state.device.queue_present(&present_info, 0) };
 
         state.current_frame = (state.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
         match present_result {
             Ok(false) if !suboptimal => DrawFrameOutcome::Success,
-            Ok(_) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                DrawFrameOutcome::SwapchainOutOfDate
-            }
+            Ok(_)
+            | Err(rgpu_vk::device::QueuePresentError::Vulkan(
+                vk::Result::ERROR_OUT_OF_DATE_KHR,
+            )) => DrawFrameOutcome::SwapchainOutOfDate,
             Err(e) => DrawFrameOutcome::Fatal(format!("Present failed: {e}")),
         }
     }
@@ -1672,6 +1681,7 @@ impl AppRunner {
             device.graphics_present_queue_submit2_raw_fence(
                 std::slice::from_ref(&submit_info),
                 vk::Fence::null(),
+                0,
             )
         }?;
         device.wait_idle()?;
