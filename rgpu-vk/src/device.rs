@@ -7,24 +7,24 @@
 //!
 //! # Queue model
 //!
-//! Queue behaviour is controlled by [`QueueMode`] in [`DeviceConfig`].
-//! The four modes span two orthogonal axes:
+//! Queue behaviour is controlled by [`QueueConfig`] in
+//! [`DeviceConfig`]. Three independent boolean axes govern allocation:
 //!
-//! | Mode | Families | Queues per family |
-//! |------|----------|-------------------|
-//! | [`DedicatedParallel`](QueueMode::DedicatedParallel) | separate | all available |
-//! | [`Dedicated`](QueueMode::Dedicated) | separate | 1 |
-//! | [`Parallel`](QueueMode::Parallel) | shared (gfx) | all available |
-//! | [`Single`](QueueMode::Single) | shared (gfx) | 1 |
+//! | Field | `true` | `false` |
+//! |-------|--------|---------|
+//! | `dedicated_transfer` | dedicated family | shares gfx family |
+//! | `dedicated_compute` | dedicated family | shares gfx family |
+//! | `parallel` | all queues per family | one queue per family |
 //!
 //! When multiple queues are available for a role, callers pass a
 //! `queue_index` to submit methods to select one per frame in flight.
 //! Roles that share a family share the same underlying `Arc<Mutex<…>>`.
 //!
-//! If the hardware cannot satisfy the requested mode, the device falls
-//! back through `DedicatedParallel → Dedicated → Parallel → Single`.
-//! Setting `DeviceConfig::queue_mode_strict = true` turns a fallback
-//! into a [`CreateCompatibleError::QueueModeUnsatisfied`] instead.
+//! [`Device::create_compatible`] tries to honour each requested axis.
+//! When `DeviceConfig::queue_config_strict = true`, any axis that
+//! could not be satisfied returns
+//! [`CreateCompatibleError::QueueConfigUnsatisfied`]; otherwise the
+//! device uses the best configuration the hardware provides.
 //!
 //! # Physical device selection
 //!
@@ -124,10 +124,9 @@ pub struct Device {
     transfer_family: u32,
     compute_queues: Vec<Arc<Mutex<vk::Queue>>>,
     compute_family: u32,
-    /// The [`QueueMode`] that was actually applied (may differ from
-    /// the requested mode when strict mode is off and a fallback
-    /// occurred).
-    queue_mode: QueueMode,
+    /// The [`QueueConfig`] that was actually applied (may differ
+    /// from the requested config when strict mode is off).
+    queue_config: QueueConfig,
 }
 
 impl std::fmt::Debug for Device {
@@ -170,12 +169,12 @@ pub enum CreateCompatibleError {
     NoGraphicsPresentQueue,
 
     #[error(
-        "Requested queue mode {requested} could not be satisfied \
-         (fell back to {actual}) and strict mode is enabled"
+        "Requested queue config ({requested}) could not be fully \
+         satisfied (achieved: {actual}) and strict mode is enabled"
     )]
-    QueueModeUnsatisfied {
-        requested: QueueMode,
-        actual: QueueMode,
+    QueueConfigUnsatisfied {
+        requested: QueueConfig,
+        actual: QueueConfig,
     },
 
     #[error("Failed to create logical device: {0}")]
@@ -234,38 +233,55 @@ pub enum QueuePresentError {
     Vulkan(vk::Result),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum QueueMode {
-    /// Separate dedicated families for graphics/present, compute,
-    /// and transfer. Allocates all available queues in each family
-    /// to enable per-frame-in-flight parallelism. Falls back toward
-    /// [`Dedicated`](Self::Dedicated) when the hardware does not
-    /// provide dedicated families or multiple queues.
-    #[default]
-    DedicatedParallel,
-    /// Separate dedicated families for graphics/present, compute,
-    /// and transfer. Exactly one queue per family. Falls back toward
-    /// [`Parallel`](Self::Parallel) when the hardware does not
-    /// provide dedicated families.
-    Dedicated,
-    /// All roles share the graphics/present queue family. Allocates
-    /// all available queues in that family for per-frame parallelism.
-    /// Falls back toward [`Single`](Self::Single) when the family
-    /// only has one queue.
-    Parallel,
-    /// All roles share one queue from the graphics/present family.
-    /// Always satisfiable; never needs a fallback.
-    Single,
+/// Controls how Vulkan queues are allocated for the three roles
+/// (graphics+present, transfer, compute).
+///
+/// Each field is an independent boolean axis:
+///
+/// | Field | `true` | `false` |
+/// |-------|--------|---------|
+/// | `dedicated_transfer` | dedicated family | shares gfx family |
+/// | `dedicated_compute` | dedicated family | shares gfx family |
+/// | `parallel` | all queues per family | one queue per family |
+///
+/// The default (`true` for all) requests the most capable
+/// configuration. [`Device::create_compatible`] uses whatever the
+/// hardware provides and reports the achieved config via
+/// [`Device::queue_config`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueConfig {
+    /// Use a dedicated transfer queue family (not shared with
+    /// graphics). When `false`, the graphics/present family is
+    /// used for transfer.
+    pub dedicated_transfer: bool,
+    /// Use a dedicated compute queue family (not shared with
+    /// graphics). When `false`, the graphics/present family is
+    /// used for compute.
+    pub dedicated_compute: bool,
+    /// Allocate all available queues from each family, enabling
+    /// per-frame-in-flight parallelism. When `false`, exactly one
+    /// queue is allocated per family.
+    pub parallel: bool,
 }
 
-impl std::fmt::Display for QueueMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DedicatedParallel => f.write_str("DedicatedParallel"),
-            Self::Dedicated => f.write_str("Dedicated"),
-            Self::Parallel => f.write_str("Parallel"),
-            Self::Single => f.write_str("Single"),
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            dedicated_transfer: true,
+            dedicated_compute: true,
+            parallel: true,
         }
+    }
+}
+
+impl std::fmt::Display for QueueConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dedicated_transfer={}, dedicated_compute={}, \
+             parallel={}",
+            self.dedicated_transfer, self.dedicated_compute, self.parallel,
+        )
     }
 }
 
@@ -275,14 +291,13 @@ pub struct DeviceConfig {
     pub dynamic_rendering: bool,
     pub synchronization2: bool,
     pub maintenance1: bool,
-    pub queue_mode: QueueMode,
+    pub queue_config: QueueConfig,
     /// When `true`, [`Device::create_compatible`] returns
-    /// [`CreateCompatibleError::QueueModeUnsatisfied`] if the
-    /// requested [`QueueMode`] cannot be fully honoured. When
-    /// `false` (the default), the device silently falls back
-    /// through the chain `DedicatedParallel → Dedicated →
-    /// Parallel → Single`.
-    pub queue_mode_strict: bool,
+    /// [`CreateCompatibleError::QueueConfigUnsatisfied`] if any
+    /// requested axis in [`queue_config`] could not be satisfied.
+    /// When `false` (the default), the device uses the best
+    /// configuration the hardware supports.
+    pub queue_config_strict: bool,
 }
 
 impl Device {
@@ -538,15 +553,9 @@ impl Device {
         );
 
         // --- Family selection ---
-        // For Dedicated* modes: prefer a family with the required flag
-        // but without GRAPHICS (a "dedicated" family). Fall back to
-        // graphics_present_family if none exists.
-        // For Parallel/Single: all roles share graphics_present_family.
-        let want_dedicated = matches!(
-            config.queue_mode,
-            QueueMode::DedicatedParallel | QueueMode::Dedicated
-        );
-
+        // When dedicated_transfer/compute is requested, prefer a
+        // family with the required flag but without GRAPHICS.
+        // Fall back to graphics_present_family if none exists.
         let dedicated_transfer_family =
             queue_families.iter().enumerate().find_map(|(idx, qf)| {
                 if qf.queue_flags.contains(vk::QueueFlags::TRANSFER)
@@ -569,13 +578,13 @@ impl Device {
                 }
             });
 
-        let transfer_family = if want_dedicated {
+        let transfer_family = if config.queue_config.dedicated_transfer {
             dedicated_transfer_family.unwrap_or(graphics_present_family)
         } else {
             graphics_present_family
         };
 
-        let compute_family = if want_dedicated {
+        let compute_family = if config.queue_config.dedicated_compute {
             dedicated_compute_family.unwrap_or(graphics_present_family)
         } else {
             graphics_present_family
@@ -590,12 +599,9 @@ impl Device {
         );
 
         // --- Queue count per family ---
-        // Parallel modes allocate all available queues from each
-        // family. Non-parallel modes allocate exactly one.
-        let want_parallel = matches!(
-            config.queue_mode,
-            QueueMode::DedicatedParallel | QueueMode::Parallel
-        );
+        // Parallel mode allocates all available queues from each
+        // family. Non-parallel mode allocates exactly one.
+        let want_parallel = config.queue_config.parallel;
 
         // Deduplicate families; count is set once per unique family.
         let mut family_queue_counts: HashMap<u32, u32> = HashMap::new();
@@ -611,29 +617,30 @@ impl Device {
             });
         }
 
-        // --- Determine effective mode and check strictness ---
-        // "Dedicated" axis: both transfer AND compute have their own
-        // family separate from graphics/present.
-        // "Parallel" axis: the graphics/present family has >1 queue
-        // (it is the bottleneck role; per-frame parallelism hinges
-        // on it).
-        let fully_dedicated = transfer_family != graphics_present_family
-            && compute_family != graphics_present_family;
+        // --- Determine effective config and check strictness ---
+        // Each axis is checked independently: dedicated_transfer and
+        // dedicated_compute reflect whether each role got its own
+        // family; parallel reflects whether more than one queue was
+        // allocated from the graphics/present family.
         let gfx_queue_count = family_queue_counts[&graphics_present_family];
-        let has_parallel_queues = gfx_queue_count > 1;
-
-        let effective_mode = match (fully_dedicated, has_parallel_queues) {
-            (true, true) => QueueMode::DedicatedParallel,
-            (true, false) => QueueMode::Dedicated,
-            (false, true) => QueueMode::Parallel,
-            (false, false) => QueueMode::Single,
+        let effective_config = QueueConfig {
+            dedicated_transfer: transfer_family != graphics_present_family,
+            dedicated_compute: compute_family != graphics_present_family,
+            parallel: gfx_queue_count > 1,
         };
 
-        if config.queue_mode_strict && effective_mode != config.queue_mode {
-            return Err(CreateCompatibleError::QueueModeUnsatisfied {
-                requested: config.queue_mode,
-                actual: effective_mode,
-            });
+        if config.queue_config_strict {
+            let req = config.queue_config;
+            let eff = effective_config;
+            if (req.dedicated_transfer && !eff.dedicated_transfer)
+                || (req.dedicated_compute && !eff.dedicated_compute)
+                || (req.parallel && !eff.parallel)
+            {
+                return Err(CreateCompatibleError::QueueConfigUnsatisfied {
+                    requested: req,
+                    actual: eff,
+                });
+            }
         }
 
         let queue_priorities_storage: Vec<Vec<f32>> = family_queue_counts
@@ -779,7 +786,7 @@ impl Device {
             transfer_family,
             compute_queues,
             compute_family,
-            queue_mode: effective_mode,
+            queue_config: effective_config,
         })
     }
 
@@ -1001,8 +1008,8 @@ impl Device {
         self.compute_queues.len()
     }
 
-    pub fn queue_mode(&self) -> QueueMode {
-        self.queue_mode
+    pub fn queue_config(&self) -> QueueConfig {
+        self.queue_config
     }
 }
 

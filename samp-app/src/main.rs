@@ -21,7 +21,7 @@ use rgpu_vk::{
         DescriptorBindingDesc, DescriptorPool, DescriptorSet,
         DescriptorSetLayout,
     },
-    device::{Device, DeviceConfig, QueueMode},
+    device::{Device, DeviceConfig, QueueConfig},
     image::{DepthImage, Texture},
     instance::{Instance, InstanceConfig},
     memory::image_barrier2,
@@ -299,13 +299,22 @@ struct CliArgs {
     #[arg(long)]
     rgpu_log_level: Option<TracingLogLevel>,
 
-    /// Queue-family selection strategy (default: dedicated-parallel).
+    /// Use a dedicated transfer queue family (default: true).
     #[arg(long)]
-    queue_mode: Option<CliQueueMode>,
+    dedicated_transfer: Option<bool>,
 
-    /// Treat queue-mode as a hard requirement; error if unsatisfied.
+    /// Use a dedicated compute queue family (default: true).
     #[arg(long)]
-    queue_mode_strict: bool,
+    dedicated_compute: Option<bool>,
+
+    /// Allocate all available queues per family (default: true).
+    #[arg(long)]
+    parallel: Option<bool>,
+
+    /// Treat queue config as hard requirements; error if any
+    /// requested axis is unsatisfied.
+    #[arg(long)]
+    queue_config_strict: bool,
 
     /// Load debug-info shader binary (`shader.debug.spv`) for RenderDoc.
     #[arg(long)]
@@ -314,30 +323,6 @@ struct CliArgs {
     /// Disable ANSI color codes in stdout log output.
     #[arg(long)]
     no_color: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-/// Queue-family selection policy.
-enum CliQueueMode {
-    /// Separate dedicated families + all available queues per family.
-    DedicatedParallel,
-    /// Separate dedicated families, one queue per family.
-    Dedicated,
-    /// Single shared family + all available queues.
-    Parallel,
-    /// Single queue from the graphics/present family.
-    Single,
-}
-
-impl From<CliQueueMode> for QueueMode {
-    fn from(value: CliQueueMode) -> Self {
-        match value {
-            CliQueueMode::DedicatedParallel => QueueMode::DedicatedParallel,
-            CliQueueMode::Dedicated => QueueMode::Dedicated,
-            CliQueueMode::Parallel => QueueMode::Parallel,
-            CliQueueMode::Single => QueueMode::Single,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -480,13 +465,29 @@ fn main() -> eyre::Result<()> {
         )
     }?);
 
+    if cli_args.queue_config_strict
+        && (cli_args.dedicated_transfer.is_none()
+            || cli_args.dedicated_compute.is_none()
+            || cli_args.parallel.is_none())
+    {
+        eyre::bail!(
+            "--queue-config-strict requires all three of \
+             --dedicated-transfer, --dedicated-compute, \
+             and --parallel to be explicitly specified"
+        );
+    }
+
     let device_config = DeviceConfig {
         swapchain: true,
         dynamic_rendering: true,
         synchronization2: true,
         maintenance1: true,
-        queue_mode: cli_args.queue_mode.map(Into::into).unwrap_or_default(),
-        queue_mode_strict: cli_args.queue_mode_strict,
+        queue_config: QueueConfig {
+            dedicated_transfer: cli_args.dedicated_transfer.unwrap_or(true),
+            dedicated_compute: cli_args.dedicated_compute.unwrap_or(true),
+            parallel: cli_args.parallel.unwrap_or(true),
+        },
+        queue_config_strict: cli_args.queue_config_strict,
     };
 
     let mut app = AppRunner(Some(App::Initializing(InitializingState {
