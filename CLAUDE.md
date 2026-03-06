@@ -51,7 +51,10 @@ For things rustfmt cannot wrap (comments, string literals, `#[derive(...)]`):
   strips the newline and leading whitespace on the next line).
 - **Long `#[derive(...)]`:** Stable `rustfmt` does not wrap derive
   item lists and merges split `#[derive]` attributes back into one.
-  No workaround exists on stable; slightly-over lines are accepted.
+  Workaround: place `#[rustfmt::skip]` on the **item** (struct, enum,
+  etc.) — item-level skip is stable and causes rustfmt to leave the
+  entire item, including its attributes, untouched. Split the derive
+  list manually across lines as desired.
 
 Only exceed 80 columns when there is no syntactically valid way to break
 the line (e.g., a single token or URL that is itself longer than 80 chars).

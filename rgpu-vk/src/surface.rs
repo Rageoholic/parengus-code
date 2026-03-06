@@ -24,28 +24,8 @@ pub enum CreateSurfaceError {
     InvalidWindowHandle(crate::RwhHandleError),
     #[error("Vulkan surface creation failed: {0}")]
     VulkanError(ash::vk::Result),
-    #[error(
-        "Parent instance did not have the surface extensions \
-         for this platform loaded"
-    )]
-    MissingExtension,
 }
 
-#[derive(Debug, Error)]
-pub enum SurfaceSupportError {
-    #[error("Surface extension is not loaded")]
-    ExtensionNotLoaded,
-    #[error("Vulkan error checking surface support: {0}")]
-    Vulkan(vk::Result),
-}
-
-#[derive(Debug, Error)]
-pub enum SurfaceQueryError {
-    #[error("Surface extension is not loaded")]
-    ExtensionNotLoaded,
-    #[error("Vulkan error querying surface: {0}")]
-    Vulkan(vk::Result),
-}
 
 /// An owned `VkSurfaceKHR` tied to its window/display handle source.
 ///
@@ -158,7 +138,7 @@ impl<T: HasWindowHandle + HasDisplayHandle> Surface<T> {
         &self,
         physical_device: ash::vk::PhysicalDevice,
         queue_family_index: u32,
-    ) -> Result<bool, SurfaceSupportError> {
+    ) -> Result<bool, vk::Result> {
         //SAFETY: physical_device was derived from the same instance as this
         //surface (caller guarantees), self.handle is valid
         unsafe {
@@ -179,7 +159,7 @@ impl<T: HasWindowHandle + HasDisplayHandle> Surface<T> {
     pub unsafe fn query_capabilities(
         &self,
         physical_device: vk::PhysicalDevice,
-    ) -> Result<vk::SurfaceCapabilitiesKHR, SurfaceQueryError> {
+    ) -> Result<vk::SurfaceCapabilitiesKHR, vk::Result> {
         // SAFETY: Caller guarantees physical_device provenance for
         // this instance.
         unsafe {
@@ -196,7 +176,7 @@ impl<T: HasWindowHandle + HasDisplayHandle> Surface<T> {
     pub unsafe fn query_formats(
         &self,
         physical_device: vk::PhysicalDevice,
-    ) -> Result<Vec<vk::SurfaceFormatKHR>, SurfaceQueryError> {
+    ) -> Result<Vec<vk::SurfaceFormatKHR>, vk::Result> {
         // SAFETY: Caller guarantees physical_device provenance for
         // this instance.
         unsafe {
@@ -213,7 +193,7 @@ impl<T: HasWindowHandle + HasDisplayHandle> Surface<T> {
     pub unsafe fn query_present_modes(
         &self,
         physical_device: vk::PhysicalDevice,
-    ) -> Result<Vec<vk::PresentModeKHR>, SurfaceQueryError> {
+    ) -> Result<Vec<vk::PresentModeKHR>, vk::Result> {
         // SAFETY: Caller guarantees physical_device provenance for
         // this instance.
         unsafe {
@@ -228,13 +208,8 @@ impl<T: HasWindowHandle + HasDisplayHandle> Drop for Surface<T> {
         tracing::debug!("Dropping surface {:?}", self.handle);
         //SAFETY: This is being dropped which means all derived objects should
         //also be being dropped and no in-flight work may still reference it.
-        let _ =
-            unsafe { self.parent_instance.destroy_raw_surface(self.handle) }
-                .inspect_err(|e| {
-                    tracing::error!(
-                        "Error while dropping surface {:?}: {e}",
-                        self.handle
-                    )
-                });
+        // SAFETY: This is Drop, so all derived objects must be destroyed first
+        // and no in-flight work may reference this surface.
+        unsafe { self.parent_instance.destroy_raw_surface(self.handle) };
     }
 }

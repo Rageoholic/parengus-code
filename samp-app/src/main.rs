@@ -23,7 +23,7 @@ use rgpu_vk::{
     },
     device::{Device, DeviceConfig, QueueMode},
     image::Texture,
-    instance::{Instance, InstanceExtensions},
+    instance::{Instance, InstanceConfig},
     memory::image_barrier2,
     pipeline::{
         CullModeFlags, DynamicPipeline, DynamicPipelineDesc, FrontFace,
@@ -54,39 +54,158 @@ use winit::{
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct Vertex {
-    position: Vec2<f32>,
+    position: Vec3<f32>,
     tex_coord: Vec2<f32>,
 }
 
+/// Uniform buffer object — projection matrix only.
+///
+/// Projection is separated from model-view because it only changes
+/// on window resize; keeping it in the UBO lets the descriptor set
+/// carry it without a push-constant update each frame.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct Ubo {
-    model: Mat4<f32>,
+    projection: Mat4<f32>,
 }
 
+/// Push-constant block — model-view matrix.
+///
+/// Model-view changes every frame (the model rotates, camera is
+/// fixed) so it is supplied as a push constant: baked directly into
+/// the command buffer with no descriptor set update needed.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct PushConstants {
+    model_view: Mat4<f32>,
+}
+
+/// A unit quad centred at the origin in the XY plane (Z = 0).
+///
+/// In our world-space convention (+Z up, right-handed) this quad
+/// lies flat on the ground plane.  The camera is positioned above
+/// and to the side, so it appears as a tilted rectangle.
 const RECT_VERTICES: [Vertex; 4] = [
     Vertex {
-        position: Vec2::new(-0.5, -0.5),
+        position: Vec3::new(-0.5, -0.5, 0.0),
         tex_coord: Vec2::new(0.0, 0.0),
     },
     Vertex {
-        position: Vec2::new(0.5, 0.5),
+        position: Vec3::new(0.5, 0.5, 0.0),
         tex_coord: Vec2::new(1.0, 1.0),
     },
     Vertex {
-        position: Vec2::new(0.5, -0.5),
+        position: Vec3::new(0.5, -0.5, 0.0),
         tex_coord: Vec2::new(1.0, 0.0),
     },
     Vertex {
-        position: Vec2::new(-0.5, 0.5),
+        position: Vec3::new(-0.5, 0.5, 0.0),
         tex_coord: Vec2::new(0.0, 1.0),
     },
 ];
 
-const RECT_INDICES: [u16; 6] = [0, 1, 2, 0, 3, 1];
+// ---------------------------------------------------------------------------
+// Matrix math — right-handed, +Z up
+// ---------------------------------------------------------------------------
+//
+// We build our own look-at and perspective helpers using vek's Vec/Mat
+// primitives so the math is explicit and auditable.  vek's higher-level
+// helpers (e.g. Mat4::perspective_rh_zo) are intentionally avoided.
 
+/// Build a right-handed view matrix that places the camera at `eye`
+/// looking toward `center`, with `world_up` as the reference up axis.
+///
+/// Convention: after this transform the camera sits at the origin and
+/// looks down its **negative Z** axis (standard camera-space convention).
+///
+/// Column-major storage matches vek's [`Mat4`] layout.
+#[rustfmt::skip]
+fn look_at_rh(
+    eye: Vec3<f32>,
+    center: Vec3<f32>,
+    world_up: Vec3<f32>,
+) -> Mat4<f32> {
+    // Forward: unit vector from eye toward the target.
+    let f = (center - eye).normalized();
+    // Right: perpendicular to forward in the horizontal plane.
+    // cross(f, world_up) gives a right-hand-rule right vector.
+    let r = f.cross(world_up).normalized();
+    // Up: recomputed from r and f to guarantee orthogonality even
+    // when world_up is not exactly perpendicular to f.
+    let u = r.cross(f);
+
+    // The view matrix is R * T, where T translates by -eye and R
+    // rotates so that (r, u, -f) align with the camera axes.
+    // vek's Mat4::new takes 16 scalars in column-major order
+    // (all of col 0 first, then col 1, …).
+    //   col 0 = [ r.x,        u.x,        -f.x,       0 ]
+    //   col 1 = [ r.y,        u.y,        -f.y,       0 ]
+    //   col 2 = [ r.z,        u.z,        -f.z,       0 ]
+    //   col 3 = [ -dot(r,eye), -dot(u,eye), dot(f,eye), 1 ]
+    Mat4::from_col_arrays(
+        [
+        [r.x,         u.x,         -f.x,        0.0,],
+        [r.y,         u.y,         -f.y,        0.0,],
+        [r.z,         u.z,         -f.z,        0.0,],
+        [-r.dot(eye), -u.dot(eye), f.dot(eye),  1.0,]],
+    )
+}
+
+/// Build a right-handed perspective projection matrix for Vulkan's
+/// clip space (depth range [0, 1], Y axis pointing **down**).
+///
+/// - `fov_y`: vertical field of view in radians.
+/// - `aspect`: viewport width divided by height.
+/// - `near` / `far`: distances to the near and far clip planes
+///   (both positive, measured along the view direction).
+///
+/// The camera is assumed to look down **−Z** in view space (see
+/// [`look_at_rh`]).
+///
+/// Uses a standard right-handed projection (positive Y up in clip space).
+/// Pair with a flipped viewport (`y = height, height = -height`,
+/// enabled by VK_KHR_maintenance1 / Vulkan 1.1) so the image appears
+/// right-side-up and CCW world-space winding maps to CCW screen-space
+/// winding without any sign baked into this matrix.
+fn perspective_rh_zo(
+    fov_y: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+) -> Mat4<f32> {
+    // Focal length: distance from the image plane at which the
+    // vertical half-FOV spans exactly 1 unit.
+    let f = 1.0 / (fov_y * 0.5).tan();
+
+    // Depth remapping coefficients for the [0, 1] range:
+    //   At z_view = -near → z_ndc = 0
+    //   At z_view = -far  → z_ndc = 1
+    // Derived from z_ndc = (A·z_view + B) / (-z_view) with the
+    // above boundary conditions:
+    //   A = far / (near - far)
+    //   B = far·near / (near - far)
+    let a = far / (near - far);
+    let b = far * near / (near - far);
+
+    // Column-major layout (vek convention, 16-scalar Mat4::new):
+    //   col 0 = [ f/aspect,  0,   0,  0 ]
+    //   col 1 = [ 0,        f,   0,  0 ]
+    //   col 2 = [ 0,         0,   a, -1 ]  ← w_clip = -z_view
+    //   col 3 = [ 0,         0,   b,  0 ]
+    Mat4::from_col_arrays([
+        [f / aspect, 0.0, 0.0, 0.0],
+        [0.0, f, 0.0, 0.0],
+        [0.0, 0.0, a, -1.0],
+        [0.0, 0.0, b, 0.0],
+    ])
+}
+
+const RECT_INDICES: [u16; 6] = [0, 2, 1, 0, 1, 3];
+
+#[rustfmt::skip]
 #[derive(
-    Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default, clap::ValueEnum,
+    Debug, PartialEq, Eq, PartialOrd, Ord,
+    Clone, Copy, Default, clap::ValueEnum,
 )]
 /// Log verbosity level for tracing output.
 enum TracingLogLevel {
@@ -305,13 +424,15 @@ fn main() -> eyre::Result<()> {
             "samp-app",
             cli_args.graphics_debug_level.map(Into::into),
             Some(&event_loop),
-            InstanceExtensions { surface: true },
+            InstanceConfig { surface: true },
         )
     }?);
 
     let device_config = DeviceConfig {
         swapchain: true,
         dynamic_rendering: true,
+        synchronization2: true,
+        maintenance1: true,
         queue_mode: cli_args.queue_mode.into(),
     };
 
@@ -799,15 +920,28 @@ impl AppRunner {
 
         let elapsed = state.start_time.elapsed().as_secs_f32();
         let aspect = extent.width as f32 / extent.height as f32;
+
+        // Projection — uploaded to the per-frame UBO (changes on
+        // resize, but we simply recompute every frame for simplicity).
+        // 60° vertical FOV, depth range [0.1, 100].
         let ubo = Ubo {
-            model: Mat4::<f32>::scaling_3d(Vec3::new(1.0 / aspect, 1.0, 1.0))
-                * Mat4::rotation_z(elapsed * PI32 * 2.0 / 5.0),
+            projection: perspective_rh_zo(PI32 / 3.0, aspect, 0.1, 100.0),
         };
         if let Err(e) =
             state.ubo_buffers[frame_idx].write_pod(std::slice::from_ref(&ubo))
         {
             return DrawFrameOutcome::Fatal(format!("UBO write failed: {e}"));
         }
+
+        // Model-view — uploaded as a push constant each frame.
+        // Camera is fixed at world-space (2, -2, 1.5) looking at the
+        // origin; the model rotates around +Z (the world up axis).
+        let model = Mat4::<f32>::rotation_z(elapsed * PI32 * 2.0 / 5.0);
+        let view =
+            look_at_rh(Vec3::new(2.0, -2.0, 1.5), Vec3::zero(), Vec3::unit_z());
+        let push = PushConstants {
+            model_view: view * model,
+        };
 
         let pipeline_handle = state.pipeline.raw_pipeline();
         let frame_cmd = &mut frame_objs.command_buffer;
@@ -870,11 +1004,7 @@ impl AppRunner {
             .color_attachments(std::slice::from_ref(&color_attachment));
         // SAFETY: recording; image in COLOR_ATTACHMENT_OPTIMAL;
         // image_view valid.
-        if let Err(e) = unsafe { frame_cmd.begin_rendering(&rendering_info) } {
-            return DrawFrameOutcome::Fatal(format!(
-                "begin_rendering failed: {e}"
-            ));
-        }
+        unsafe { frame_cmd.begin_rendering(&rendering_info) };
 
         // Bind pipeline, set dynamic viewport/scissor, draw.
         // SAFETY: inside a dynamic render pass with a compatible
@@ -890,14 +1020,30 @@ impl AppRunner {
                 &[&state.descriptor_sets[frame_idx]],
             )
         };
+        // SAFETY: recording state; layout is compatible with the bound
+        // pipeline; VERTEX stage and offset 0 match the declared range;
+        // push is sized within the minimum 128-byte guarantee.
+        unsafe {
+            frame_cmd.push_constants(
+                &state.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                std::slice::from_ref(&push),
+            )
+        };
         // SAFETY: inside render pass recording; buffer is valid
         unsafe { frame_cmd.bind_vertex_buffer(0, &state.vertex_buffer, 0) };
 
+        // Negative height flips the viewport Y axis (VK_KHR_maintenance1,
+        // core since Vulkan 1.1).  This maps NDC +Y to the top of the
+        // screen, keeping the projection matrix in standard RH form and
+        // preserving CCW world-space winding as screen-space CCW.
+        let h = extent.height as f32;
         let viewport = vk::Viewport {
             x: 0.0,
-            y: 0.0,
+            y: h,
             width: extent.width as f32,
-            height: extent.height as f32,
+            height: -h,
             min_depth: 0.0,
             max_depth: 1.0,
         };
@@ -928,11 +1074,7 @@ impl AppRunner {
         };
 
         // SAFETY: inside a dynamic render pass.
-        if let Err(e) = unsafe { frame_cmd.end_rendering() } {
-            return DrawFrameOutcome::Fatal(format!(
-                "end_rendering failed: {e}"
-            ));
-        }
+        unsafe { frame_cmd.end_rendering() };
 
         // Transition: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
         let to_present = image_barrier2()
@@ -1030,7 +1172,7 @@ where
         VertexAttributeDesc {
             location: 0,
             binding: 0,
-            format: vk::Format::R32G32_SFLOAT,
+            format: vk::Format::R32G32B32_SFLOAT,
             offset: std::mem::offset_of!(Vertex, position) as u32,
         },
         VertexAttributeDesc {
@@ -1221,7 +1363,14 @@ impl AppRunner {
             &device,
             &PipelineLayoutDesc {
                 set_layouts: &[&descriptor_set_layout],
-                ..Default::default()
+                // One push constant range covering the full
+                // PushConstants struct (model_view: Mat4 = 64 bytes),
+                // accessible from the vertex stage only.
+                push_constant_ranges: &[vk::PushConstantRange {
+                    stage_flags: vk::ShaderStageFlags::VERTEX,
+                    offset: 0,
+                    size: size_of::<PushConstants>() as u32,
+                }],
             },
         )?);
 
