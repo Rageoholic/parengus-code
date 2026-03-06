@@ -31,9 +31,7 @@ pub struct DescriptorBindingDesc {
     pub stage_flags: vk::ShaderStageFlags,
 }
 
-impl From<DescriptorBindingDesc>
-    for vk::DescriptorSetLayoutBinding<'static>
-{
+impl From<DescriptorBindingDesc> for vk::DescriptorSetLayoutBinding<'static> {
     fn from(b: DescriptorBindingDesc) -> Self {
         vk::DescriptorSetLayoutBinding::default()
             .binding(b.binding)
@@ -70,39 +68,30 @@ impl DescriptorSetLayout {
     ) -> Result<Self, vk::Result> {
         let vk_bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> =
             bindings.iter().copied().map(Into::into).collect();
-        let create_info = vk::DescriptorSetLayoutCreateInfo::default()
-            .bindings(&vk_bindings);
+        let create_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&vk_bindings);
         // SAFETY: create_info references valid binding descriptions
         // for the duration of this call.
-        let handle = unsafe {
-            device.create_raw_descriptor_set_layout(&create_info)
-        }?;
+        let handle =
+            unsafe { device.create_raw_descriptor_set_layout(&create_info) }?;
         Ok(Self {
             parent: Arc::clone(device),
             handle,
         })
     }
 
-    pub fn raw_descriptor_set_layout(
-        &self,
-    ) -> vk::DescriptorSetLayout {
+    pub fn raw_descriptor_set_layout(&self) -> vk::DescriptorSetLayout {
         self.handle
     }
 }
 
 impl Drop for DescriptorSetLayout {
     fn drop(&mut self) {
-        tracing::debug!(
-            "Dropping descriptor set layout {:?}",
-            self.handle
-        );
+        tracing::debug!("Dropping descriptor set layout {:?}", self.handle);
         // SAFETY: handle was created from parent and is being
         // destroyed during teardown. No descriptor pool that used
         // this layout may still be alive.
-        unsafe {
-            self.parent
-                .destroy_raw_descriptor_set_layout(self.handle)
-        };
+        unsafe { self.parent.destroy_raw_descriptor_set_layout(self.handle) };
     }
 }
 
@@ -141,13 +130,10 @@ impl DescriptorPool {
         let create_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(max_sets)
             .pool_sizes(pool_sizes)
-            .flags(
-                vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET,
-            );
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
         // SAFETY: create_info is valid and references only stack data.
-        let handle = unsafe {
-            device.create_raw_descriptor_pool(&create_info)
-        }?;
+        let handle =
+            unsafe { device.create_raw_descriptor_pool(&create_info) }?;
         Ok(Self {
             parent: Arc::clone(device),
             handle,
@@ -172,9 +158,8 @@ impl DescriptorPool {
             .set_layouts(&raw_layouts);
         // SAFETY: alloc_info references a valid pool and valid
         // layouts, all created from self.parent.
-        let raw_sets = unsafe {
-            self.parent.allocate_raw_descriptor_sets(&alloc_info)
-        }?;
+        let raw_sets =
+            unsafe { self.parent.allocate_raw_descriptor_sets(&alloc_info) }?;
         Ok(raw_sets
             .into_iter()
             .map(|handle| DescriptorSet { handle })
@@ -189,9 +174,7 @@ impl Drop for DescriptorPool {
         // destroyed during teardown. All in-flight GPU work
         // referencing descriptor sets from this pool must be
         // complete before drop.
-        unsafe {
-            self.parent.destroy_raw_descriptor_pool(self.handle)
-        };
+        unsafe { self.parent.destroy_raw_descriptor_pool(self.handle) };
     }
 }
 
@@ -244,10 +227,7 @@ impl DescriptorSet {
         // SAFETY: Caller guarantees device, image_view, sampler, and
         // image_layout validity.
         unsafe {
-            device.update_raw_descriptor_sets(
-                std::slice::from_ref(&write),
-                &[],
-            )
+            device.update_raw_descriptor_sets(std::slice::from_ref(&write), &[])
         }
     }
 
@@ -306,10 +286,7 @@ impl DescriptorSet {
         // SAFETY: Caller guarantees device, buffer, and range
         // validity.
         unsafe {
-            device.update_raw_descriptor_sets(
-                std::slice::from_ref(&write),
-                &[],
-            )
+            device.update_raw_descriptor_sets(std::slice::from_ref(&write), &[])
         }
     }
 }

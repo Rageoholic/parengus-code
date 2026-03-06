@@ -26,7 +26,6 @@ pub enum CreateSurfaceError {
     VulkanError(ash::vk::Result),
 }
 
-
 /// An owned `VkSurfaceKHR` tied to its window/display handle source.
 ///
 /// Holds the parent [`Instance`] and source `T` via `Arc` to ensure

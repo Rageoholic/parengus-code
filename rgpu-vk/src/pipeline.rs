@@ -352,15 +352,14 @@ impl DynamicPipeline {
             vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
-        let depth_stencil_state =
-            if desc.depth_attachment_format.is_some() {
-                vk::PipelineDepthStencilStateCreateInfo::default()
-                    .depth_test_enable(true)
-                    .depth_write_enable(true)
-                    .depth_compare_op(desc.depth_compare_op)
-            } else {
-                vk::PipelineDepthStencilStateCreateInfo::default()
-            };
+        let depth_stencil_state = if desc.depth_attachment_format.is_some() {
+            vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(true)
+                .depth_write_enable(true)
+                .depth_compare_op(desc.depth_compare_op)
+        } else {
+            vk::PipelineDepthStencilStateCreateInfo::default()
+        };
 
         let color_blend_attachments: Vec<
             vk::PipelineColorBlendAttachmentState,

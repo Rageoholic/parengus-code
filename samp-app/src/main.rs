@@ -243,9 +243,9 @@ fn perspective_rh_zo(
 // Each group of 6 uses the same CCW winding as the original
 // single-quad layout: [base, base+2, base+1, base, base+1, base+3].
 const SCENE_INDICES: [u16; 18] = [
-     0,  2,  1,  0,  1,  3, // nearest
-     4,  6,  5,  4,  5,  7, // middle
-     8, 10,  9,  8,  9, 11, // farthest
+    0, 2, 1, 0, 1, 3, // nearest
+    4, 6, 5, 4, 5, 7, // middle
+    8, 10, 9, 8, 9, 11, // farthest
 ];
 
 #[rustfmt::skip]

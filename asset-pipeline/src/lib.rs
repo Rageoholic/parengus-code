@@ -72,9 +72,7 @@ mod path_map_serde {
     use std::{collections::BTreeMap, path::PathBuf};
 
     use path_slash::PathBufExt as _;
-    use serde::{
-        Deserialize, Deserializer, Serializer, ser::SerializeMap,
-    };
+    use serde::{Deserialize, Deserializer, Serializer, ser::SerializeMap};
 
     pub fn serialize<S: Serializer>(
         map: &BTreeMap<String, PathBuf>,
