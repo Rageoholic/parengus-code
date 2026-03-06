@@ -1460,7 +1460,7 @@ impl AppRunner {
         let pipeline_color_format = swapchain
             .as_ref()
             .map(|sc| sc.format())
-            .unwrap_or(vk::Format::B8G8R8A8_UNORM);
+            .unwrap_or(vk::Format::B8G8R8A8_SRGB);
 
         let descriptor_set_layout = Arc::new(DescriptorSetLayout::new(
             &device,
