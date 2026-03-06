@@ -11,7 +11,8 @@
 //! │   └── Swapchain<T>
 //! └── Device
 //!     ├── HostVisibleBuffer / DeviceLocalBuffer
-//!     ├── Texture (DeviceLocalImage + ImageView)
+//!     ├── Texture (DeviceLocalImage + colour ImageView)
+//!     ├── DepthImage (DeviceLocalImage + depth ImageView)
 //!     ├── Sampler
 //!     ├── DescriptorSetLayout → DescriptorPool → DescriptorSet
 //!     ├── PipelineLayout (with DescriptorSetLayout refs)

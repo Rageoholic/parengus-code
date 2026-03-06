@@ -174,6 +174,7 @@ impl From<VertexAttributeDesc> for vk::VertexInputAttributeDescription {
 /// | `stages` | `&[]` (must be overridden) |
 /// | `color_attachment_formats` | `&[]` |
 /// | `depth_attachment_format` | `None` |
+/// | `depth_compare_op` | `LESS_OR_EQUAL` |
 /// | `layout` | `None` (empty layout is created internally) |
 /// | `polygon_mode` | `FILL` |
 /// | `cull_mode` | `NONE` |
@@ -190,8 +191,16 @@ pub struct DynamicPipelineDesc<'a> {
     /// time. Use an empty slice when rendering with no color output.
     pub color_attachment_formats: &'a [vk::Format],
 
-    /// Format of the depth attachment. `None` means no depth attachment.
+    /// Format of the depth attachment. `None` means no depth attachment,
+    /// and depth test/write are disabled regardless of `depth_compare_op`.
     pub depth_attachment_format: Option<vk::Format>,
+
+    /// Depth comparison operator used when depth testing is enabled.
+    ///
+    /// Use `LESS_OR_EQUAL` for standard depth (near=0, far=1) and
+    /// `GREATER_OR_EQUAL` for reversed depth (near=1, far=0).
+    /// Ignored when `depth_attachment_format` is `None`.
+    pub depth_compare_op: vk::CompareOp,
 
     /// Vertex buffer binding declarations.
     pub vertex_bindings: &'a [VertexBindingDesc],
@@ -201,9 +210,10 @@ pub struct DynamicPipelineDesc<'a> {
 
     /// Pipeline layout to use.
     ///
-    /// When `None` an empty layout (no descriptor sets, no push constants) is
-    /// created internally and owned exclusively by the resulting pipeline. Pass
-    /// an `Arc<PipelineLayout>` to share a layout across multiple pipelines.
+    /// When `None` an empty layout (no descriptor sets, no push constants)
+    /// is created internally and owned exclusively by the resulting
+    /// pipeline. Pass an `Arc<PipelineLayout>` to share a layout across
+    /// multiple pipelines.
     pub layout: Option<Arc<PipelineLayout>>,
 
     /// Polygon fill mode used by the rasterizer.
@@ -222,6 +232,7 @@ impl Default for DynamicPipelineDesc<'_> {
             stages: &[],
             color_attachment_formats: &[],
             depth_attachment_format: None,
+            depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
             vertex_bindings: &[],
             vertex_attributes: &[],
             layout: None,
@@ -342,7 +353,14 @@ impl DynamicPipeline {
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
         let depth_stencil_state =
-            vk::PipelineDepthStencilStateCreateInfo::default();
+            if desc.depth_attachment_format.is_some() {
+                vk::PipelineDepthStencilStateCreateInfo::default()
+                    .depth_test_enable(true)
+                    .depth_write_enable(true)
+                    .depth_compare_op(desc.depth_compare_op)
+            } else {
+                vk::PipelineDepthStencilStateCreateInfo::default()
+            };
 
         let color_blend_attachments: Vec<
             vk::PipelineColorBlendAttachmentState,

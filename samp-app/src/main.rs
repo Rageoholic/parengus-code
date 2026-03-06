@@ -22,7 +22,7 @@ use rgpu_vk::{
         DescriptorSetLayout,
     },
     device::{Device, DeviceConfig, QueueMode},
-    image::Texture,
+    image::{DepthImage, Texture},
     instance::{Instance, InstanceConfig},
     memory::image_barrier2,
     pipeline::{
@@ -80,26 +80,66 @@ struct PushConstants {
     model_view: Mat4<f32>,
 }
 
-/// A unit quad centred at the origin in the XY plane (Z = 0).
+/// Three overlapping 0.8×0.8 quads at increasing Z heights.
 ///
-/// In our world-space convention (+Z up, right-handed) this quad
-/// lies flat on the ground plane.  The camera is positioned above
-/// and to the side, so it appears as a tilted rectangle.
-const RECT_VERTICES: [Vertex; 4] = [
+/// World convention: +Z up, right-handed. The camera sits at
+/// (2, −2, 1.5) looking at the origin, so higher-Z vertices are
+/// closer to it.
+///
+/// The quads are ordered **nearest-first** in the buffer: without
+/// depth testing the farthest quad (drawn last) would incorrectly
+/// overdraw the nearest one, making the depth buffer's effect
+/// immediately obvious.
+const SCENE_VERTICES: [Vertex; 12] = [
+    // Nearest (z = 0.7), centre at (−0.25, 0)
     Vertex {
-        position: Vec3::new(-0.5, -0.5, 0.0),
+        position: Vec3::new(-0.65, -0.4, 0.7),
         tex_coord: Vec2::new(0.0, 0.0),
     },
     Vertex {
-        position: Vec3::new(0.5, 0.5, 0.0),
+        position: Vec3::new(0.15, 0.4, 0.7),
         tex_coord: Vec2::new(1.0, 1.0),
     },
     Vertex {
-        position: Vec3::new(0.5, -0.5, 0.0),
+        position: Vec3::new(0.15, -0.4, 0.7),
         tex_coord: Vec2::new(1.0, 0.0),
     },
     Vertex {
-        position: Vec3::new(-0.5, 0.5, 0.0),
+        position: Vec3::new(-0.65, 0.4, 0.7),
+        tex_coord: Vec2::new(0.0, 1.0),
+    },
+    // Middle (z = 0.35), centre at (0.25, 0)
+    Vertex {
+        position: Vec3::new(-0.15, -0.4, 0.35),
+        tex_coord: Vec2::new(0.0, 0.0),
+    },
+    Vertex {
+        position: Vec3::new(0.65, 0.4, 0.35),
+        tex_coord: Vec2::new(1.0, 1.0),
+    },
+    Vertex {
+        position: Vec3::new(0.65, -0.4, 0.35),
+        tex_coord: Vec2::new(1.0, 0.0),
+    },
+    Vertex {
+        position: Vec3::new(-0.15, 0.4, 0.35),
+        tex_coord: Vec2::new(0.0, 1.0),
+    },
+    // Farthest (z = 0.0), centre at (0, 0)
+    Vertex {
+        position: Vec3::new(-0.4, -0.4, 0.0),
+        tex_coord: Vec2::new(0.0, 0.0),
+    },
+    Vertex {
+        position: Vec3::new(0.4, 0.4, 0.0),
+        tex_coord: Vec2::new(1.0, 1.0),
+    },
+    Vertex {
+        position: Vec3::new(0.4, -0.4, 0.0),
+        tex_coord: Vec2::new(1.0, 0.0),
+    },
+    Vertex {
+        position: Vec3::new(-0.4, 0.4, 0.0),
         tex_coord: Vec2::new(0.0, 1.0),
     },
 ];
@@ -200,7 +240,13 @@ fn perspective_rh_zo(
     ])
 }
 
-const RECT_INDICES: [u16; 6] = [0, 2, 1, 0, 1, 3];
+// Each group of 6 uses the same CCW winding as the original
+// single-quad layout: [base, base+2, base+1, base, base+1, base+3].
+const SCENE_INDICES: [u16; 18] = [
+     0,  2,  1,  0,  1,  3, // nearest
+     4,  6,  5,  4,  5,  7, // middle
+     8, 10,  9,  8,  9, 11, // farthest
+];
 
 #[rustfmt::skip]
 #[derive(
@@ -460,6 +506,13 @@ enum App {
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
+/// Depth format candidates tried in preference order.
+const DEPTH_FORMAT_CANDIDATES: &[vk::Format] = &[
+    vk::Format::D32_SFLOAT,
+    vk::Format::D32_SFLOAT_S8_UINT,
+    vk::Format::D24_UNORM_S8_UINT,
+];
+
 /// Per-frame-in-flight synchronization primitives and command buffer.
 #[derive(Debug)]
 struct FrameSync {
@@ -558,6 +611,10 @@ struct RunningState {
     /// image index from `vkAcquireNextImageKHR`. `None` iff `swapchain`
     /// is `None`.
     render_finished_semaphores: Option<Arc<Vec<Semaphore>>>,
+    /// One depth image per frame-in-flight, matched to swapchain extent.
+    /// Empty when `swapchain` is `None`.
+    depth_images: Vec<DepthImage>,
+    depth_format: vk::Format,
     shader: ShaderModule,
     pipeline: DynamicPipeline,
     vertex_buffer: DeviceLocalBuffer,
@@ -691,6 +748,8 @@ impl ApplicationHandler for AppRunner {
                 _surface: _,
                 swapchain: _,
                 render_finished_semaphores: _,
+                depth_images: _,
+                depth_format: _,
                 shader,
                 pipeline,
                 vertex_buffer,
@@ -856,6 +915,26 @@ impl AppRunner {
         Ok(Arc::new(sems))
     }
 
+    /// Create one depth image per frame-in-flight for `extent`.
+    fn make_depth_images(
+        device: &Arc<Device>,
+        extent: vk::Extent2D,
+        depth_format: vk::Format,
+    ) -> eyre::Result<Vec<DepthImage>> {
+        (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|i| {
+                DepthImage::new(
+                    device,
+                    extent.width,
+                    extent.height,
+                    depth_format,
+                    Some(&format!("depth [{i}]")),
+                )
+                .map_err(eyre::Report::from)
+            })
+            .collect()
+    }
+
     fn draw_frame(state: &mut RunningState) -> DrawFrameOutcome {
         // Skip if the window is currently zero-sized (no swapchain).
         if state.swapchain.is_none() {
@@ -978,15 +1057,47 @@ impl AppRunner {
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(image)
             .subresource_range(subresource_range);
-        let dep_info = vk::DependencyInfo::default()
-            .image_memory_barriers(std::slice::from_ref(&to_color));
-        // SAFETY: recording state; image is a valid swapchain image.
+        let depth_image = state.depth_images[frame_idx].raw_image();
+        let depth_subresource_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        // Transition: UNDEFINED → DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
+        // old_layout = UNDEFINED discards previous contents, which is
+        // safe because LOAD_OP_CLEAR overwrites them anyway.
+        let to_depth = image_barrier2()
+            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            )
+            .dst_access_mask(
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            .image(depth_image)
+            .subresource_range(depth_subresource_range);
+        let barriers = [to_color, to_depth];
+        let dep_info =
+            vk::DependencyInfo::default().image_memory_barriers(&barriers);
+        // SAFETY: recording state; swapchain image and depth image valid.
         unsafe { frame_cmd.pipeline_barrier2(&dep_info) };
 
         // Begin dynamic rendering with a clear.
-        let clear = vk::ClearValue {
+        let color_clear = vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        };
+        let depth_clear = vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
             },
         };
         let color_attachment = vk::RenderingAttachmentInfo::default()
@@ -994,16 +1105,23 @@ impl AppRunner {
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(clear);
+            .clear_value(color_clear);
+        let depth_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(state.depth_images[frame_idx].raw_image_view())
+            .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .clear_value(depth_clear);
         let rendering_info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent,
             })
             .layer_count(1)
-            .color_attachments(std::slice::from_ref(&color_attachment));
-        // SAFETY: recording; image in COLOR_ATTACHMENT_OPTIMAL;
-        // image_view valid.
+            .color_attachments(std::slice::from_ref(&color_attachment))
+            .depth_attachment(&depth_attachment);
+        // SAFETY: recording; color image in COLOR_ATTACHMENT_OPTIMAL;
+        // depth image in DEPTH_STENCIL_ATTACHMENT_OPTIMAL; views valid.
         unsafe { frame_cmd.begin_rendering(&rendering_info) };
 
         // Bind pipeline, set dynamic viewport/scissor, draw.
@@ -1070,7 +1188,7 @@ impl AppRunner {
         // SAFETY: all required dynamic state has been set;
         // render pass is active; index buffer is bound.
         unsafe {
-            frame_cmd.draw_indexed(RECT_INDICES.len() as u32, 1, 0, 0, 0)
+            frame_cmd.draw_indexed(SCENE_INDICES.len() as u32, 1, 0, 0, 0)
         };
 
         // SAFETY: inside a dynamic render pass.
@@ -1155,6 +1273,7 @@ fn build_pipeline<F>(
     device: &Arc<Device>,
     shader: &ShaderModule,
     color_format: vk::Format,
+    depth_format: vk::Format,
     layout: Option<Arc<PipelineLayout>>,
     name: Option<F>,
 ) -> eyre::Result<DynamicPipeline>
@@ -1187,6 +1306,7 @@ where
         &DynamicPipelineDesc {
             stages: &[vert, frag],
             color_attachment_formats: &[color_format],
+            depth_attachment_format: Some(depth_format),
             vertex_bindings: &vertex_bindings,
             vertex_attributes: &vertex_attributes,
             layout,
@@ -1228,14 +1348,14 @@ impl AppRunner {
         )?);
 
         let vertex_buffer_size =
-            (RECT_VERTICES.len() * size_of::<Vertex>()) as vk::DeviceSize;
+            (SCENE_VERTICES.len() * size_of::<Vertex>()) as vk::DeviceSize;
         let mut staging_vertex_buffer = HostVisibleBuffer::new(
             &device,
             vertex_buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             Some("rect staging vertex buffer"),
         )?;
-        staging_vertex_buffer.write_pod(&RECT_VERTICES)?;
+        staging_vertex_buffer.write_pod(&SCENE_VERTICES)?;
 
         let mut vertex_buffer = DeviceLocalBuffer::new(
             &device,
@@ -1246,14 +1366,14 @@ impl AppRunner {
         )?;
 
         let index_buffer_size =
-            (RECT_INDICES.len() * size_of::<u16>()) as vk::DeviceSize;
+            (SCENE_INDICES.len() * size_of::<u16>()) as vk::DeviceSize;
         let mut staging_index_buffer = HostVisibleBuffer::new(
             &device,
             index_buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             Some("rect staging index buffer"),
         )?;
-        staging_index_buffer.write_pod(&RECT_INDICES)?;
+        staging_index_buffer.write_pod(&SCENE_INDICES)?;
 
         let mut index_buffer = DeviceLocalBuffer::new(
             &device,
@@ -1374,6 +1494,10 @@ impl AppRunner {
             },
         )?);
 
+        let depth_format = device
+            .find_depth_format(DEPTH_FORMAT_CANDIDATES)
+            .ok_or_else(|| eyre::eyre!("No supported depth format found"))?;
+
         let pipeline = {
             let _span = tracing::trace_span!(
                 "pipeline_create",
@@ -1384,6 +1508,7 @@ impl AppRunner {
                 &device,
                 &shader,
                 pipeline_color_format,
+                depth_format,
                 Some(Arc::clone(&pipeline_layout)),
                 Some({
                     let idx = debug_counters.next_pipeline();
@@ -1428,6 +1553,14 @@ impl AppRunner {
                 )
             })
             .transpose()?;
+
+        let depth_images = swapchain
+            .as_ref()
+            .map(|sc| {
+                Self::make_depth_images(&device, sc.extent(), depth_format)
+            })
+            .transpose()?
+            .unwrap_or_default();
 
         let ubo_size = size_of::<Ubo>() as vk::DeviceSize;
         let ubo_buffers = (0..MAX_FRAMES_IN_FLIGHT)
@@ -1570,6 +1703,8 @@ impl AppRunner {
             _surface: surface,
             swapchain,
             render_finished_semaphores,
+            depth_images,
+            depth_format,
             shader,
             pipeline,
             vertex_buffer,
@@ -1624,8 +1759,14 @@ impl AppRunner {
             )?))
         };
 
-        // Reuse the existing pipeline when the swapchain honored the preferred
-        // format. Recreate it only if the surface forced a different format.
+        let depth_format = state
+            .device
+            .find_depth_format(DEPTH_FORMAT_CANDIDATES)
+            .ok_or_else(|| eyre::eyre!("No supported depth format found"))?;
+
+        // Reuse the existing pipeline when the swapchain honored the
+        // preferred format. Recreate it only if the surface forced a
+        // different format.
         let swapchain_format = swapchain.as_ref().map(|sc| sc.format());
         let (pipeline, pipeline_color_format) =
             if let Some(new_format) = swapchain_format {
@@ -1648,6 +1789,7 @@ impl AppRunner {
                             &state.device,
                             &state.shader,
                             new_format,
+                            depth_format,
                             Some(Arc::clone(&state.pipeline_layout)),
                             Some({
                                 let idx = debug_counters.next_pipeline();
@@ -1671,6 +1813,18 @@ impl AppRunner {
             })
             .transpose()?;
 
+        let depth_images = swapchain
+            .as_ref()
+            .map(|sc| {
+                Self::make_depth_images(
+                    &state.device,
+                    sc.extent(),
+                    depth_format,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
         let idle_guard = unsafe {
             RunningStateTransitionGuard::new(Arc::clone(&state.device))
@@ -1682,6 +1836,8 @@ impl AppRunner {
             _surface: surface,
             swapchain,
             render_finished_semaphores,
+            depth_images,
+            depth_format,
             shader: state.shader,
             pipeline,
             vertex_buffer: state.vertex_buffer,
@@ -1724,6 +1880,7 @@ impl AppRunner {
             }
             running_state.swapchain = None;
             running_state.render_finished_semaphores = None;
+            running_state.depth_images = Vec::new();
             return true;
         }
 
@@ -1776,6 +1933,7 @@ impl AppRunner {
                     desired_extent.height
                 );
                 let new_format = swapchain.format();
+                let new_extent = swapchain.extent();
                 let new_image_count = swapchain.images().len();
                 running_state.swapchain = Some(Arc::new(swapchain));
 
@@ -1796,6 +1954,20 @@ impl AppRunner {
                     }
                 }
 
+                match Self::make_depth_images(
+                    &running_state.device,
+                    new_extent,
+                    running_state.depth_format,
+                ) {
+                    Ok(images) => {
+                        running_state.depth_images = images;
+                    }
+                    Err(e) => {
+                        tracing::error!("Error recreating depth images: {}", e);
+                        return false;
+                    }
+                }
+
                 if new_format != running_state.pipeline_color_format {
                     tracing::debug!(
                         "Swapchain format changed on resize \
@@ -1812,6 +1984,7 @@ impl AppRunner {
                         &running_state.device,
                         &running_state.shader,
                         new_format,
+                        running_state.depth_format,
                         Some(Arc::clone(&running_state.pipeline_layout)),
                         Some({
                             let idx =
