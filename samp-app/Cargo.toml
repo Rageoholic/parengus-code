@@ -17,4 +17,4 @@ supports-color = "3"
 toml = "1.0"
 tracing-subscriber = "0.3.22"
 vek = { version = "0.17.2", features = ["bytemuck"] }
-winit = "0.30.12"
+winit = "0.30.13"
