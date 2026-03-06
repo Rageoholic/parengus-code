@@ -19,8 +19,11 @@ pub(crate) fn copy_assets(
     let app_assets: AppAssets =
         toml::from_str(&fs::read_to_string(app_assets_path)?)?;
 
-    let index: HashMap<&str, &ManifestEntry> =
-        manifest.asset.iter().map(|e| (e.name.as_str(), e)).collect();
+    let index: HashMap<&str, &ManifestEntry> = manifest
+        .asset
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
 
     fs::create_dir_all(dst_dir)?;
 
@@ -30,10 +33,7 @@ pub(crate) fn copy_assets(
 
     for req in &app_assets.asset {
         let entry = index.get(req.name.as_str()).ok_or_else(|| {
-            format!(
-                "asset `{}` not found in manifest",
-                req.name
-            )
+            format!("asset `{}` not found in manifest", req.name)
         })?;
 
         if entry.asset_type != req.asset_type {
@@ -59,10 +59,7 @@ pub(crate) fn copy_assets(
     }
 
     let asset_map = AssetMap { map };
-    fs::write(
-        dst_dir.join("asset_map.toml"),
-        toml::to_string(&asset_map)?,
-    )?;
+    fs::write(dst_dir.join("asset_map.toml"), toml::to_string(&asset_map)?)?;
 
     println!("Assets: {copied} copied, {skipped} up-to-date");
     Ok(())

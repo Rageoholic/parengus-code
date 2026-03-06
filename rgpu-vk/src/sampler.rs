@@ -51,12 +51,10 @@ impl Sampler {
             .max_lod(0.0);
 
         // SAFETY: create_info is fully initialised with no borrowed data.
-        let handle =
-            unsafe { device.create_raw_sampler(&create_info) }?;
+        let handle = unsafe { device.create_raw_sampler(&create_info) }?;
 
         // SAFETY: handle is a valid sampler from this device.
-        let name_result =
-            unsafe { device.set_object_name_str(handle, name) };
+        let name_result = unsafe { device.set_object_name_str(handle, name) };
         if let Err(e) = name_result {
             tracing::warn!("Failed to name sampler {:?}: {e}", handle);
         }

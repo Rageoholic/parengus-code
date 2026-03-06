@@ -38,7 +38,6 @@ pub enum CreateSwapchainError {
     #[error("Invalid requested swapchain extent ({width}x{height})")]
     InvalidExtent { width: u32, height: u32 },
 
-
     #[error("Vulkan error querying surface support details: {0}")]
     SurfaceQuery(vk::Result),
 
@@ -372,18 +371,16 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
 
         // SAFETY: physical_device belongs to parent_device's instance, and
         // parent_surface is derived from the same instance (validated above).
-        let capabilities = unsafe {
-            parent_surface.query_capabilities(physical_device)
-        }
-        .map_err(CreateSwapchainError::SurfaceQuery)?;
+        let capabilities =
+            unsafe { parent_surface.query_capabilities(physical_device) }
+                .map_err(CreateSwapchainError::SurfaceQuery)?;
         // SAFETY: same reasoning as above.
         let formats = unsafe { parent_surface.query_formats(physical_device) }
             .map_err(CreateSwapchainError::SurfaceQuery)?;
         // SAFETY: same reasoning as above.
-        let present_modes = unsafe {
-            parent_surface.query_present_modes(physical_device)
-        }
-        .map_err(CreateSwapchainError::SurfaceQuery)?;
+        let present_modes =
+            unsafe { parent_surface.query_present_modes(physical_device) }
+                .map_err(CreateSwapchainError::SurfaceQuery)?;
 
         if formats.is_empty() {
             return Err(CreateSwapchainError::NoSurfaceFormats);

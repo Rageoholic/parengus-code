@@ -23,7 +23,6 @@ use crate::descriptor::DescriptorSet;
 use crate::device::Device;
 use crate::pipeline::PipelineLayout;
 
-
 // ---------------------------------------------------------------------------
 // State tracking
 // ---------------------------------------------------------------------------
@@ -48,9 +47,7 @@ pub enum CommandBufferState {
 /// Error returned when a state-transition method is called from the wrong
 /// [`CommandBufferState`].
 #[derive(Debug, Error)]
-#[error(
-    "command buffer in {actual:?} state, expected {expected:?}"
-)]
+#[error("command buffer in {actual:?} state, expected {expected:?}")]
 pub struct CommandBufferStateError {
     pub expected: CommandBufferState,
     pub actual: CommandBufferState,
@@ -331,9 +328,7 @@ impl ResettableCommandBuffer {
     ///
     /// Returns [`CommandBufferStateError`] if the buffer is not in the
     /// [`Reset`](CommandBufferState::Reset) state.
-    pub fn begin(
-        &mut self,
-    ) -> Result<(), CommandBufferStateError> {
+    pub fn begin(&mut self) -> Result<(), CommandBufferStateError> {
         if self.state != CommandBufferState::Reset {
             return Err(CommandBufferStateError {
                 expected: CommandBufferState::Reset,
@@ -359,9 +354,7 @@ impl ResettableCommandBuffer {
     ///
     /// Returns [`CommandBufferStateError`] if the buffer is not in the
     /// [`Recording`](CommandBufferState::Recording) state.
-    pub fn end(
-        &mut self,
-    ) -> Result<(), CommandBufferStateError> {
+    pub fn end(&mut self) -> Result<(), CommandBufferStateError> {
         if self.state != CommandBufferState::Recording {
             return Err(CommandBufferStateError {
                 expected: CommandBufferState::Recording,
@@ -371,7 +364,7 @@ impl ResettableCommandBuffer {
         // SAFETY: state == Recording guarantees the buffer is in Vulkan's
         // recording state, which is the precondition for vkEndCommandBuffer.
         unsafe { self.parent.end_raw_command_buffer(self.handle) }
-        .expect("vkEndCommandBuffer failed");
+            .expect("vkEndCommandBuffer failed");
         self.state = CommandBufferState::Recorded;
         Ok(())
     }
@@ -732,7 +725,6 @@ impl ResettableCommandBuffer {
         &self.parent
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Auto-trait assertions
