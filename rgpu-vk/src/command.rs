@@ -20,7 +20,7 @@ use thiserror::Error;
 
 use crate::buffer::BufferHandle;
 use crate::descriptor::DescriptorSet;
-use crate::device::{Device, DynamicRenderingError};
+use crate::device::Device;
 use crate::pipeline::PipelineLayout;
 
 
@@ -408,7 +408,7 @@ impl ResettableCommandBuffer {
     pub unsafe fn begin_rendering(
         &mut self,
         rendering_info: &vk::RenderingInfo<'_>,
-    ) -> Result<(), DynamicRenderingError> {
+    ) {
         debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees recording state and
         // rendering_info validity.
@@ -423,9 +423,7 @@ impl ResettableCommandBuffer {
     /// # Safety
     /// The buffer must be inside a render pass begun with
     /// [`begin_rendering`](Self::begin_rendering).
-    pub unsafe fn end_rendering(
-        &mut self,
-    ) -> Result<(), DynamicRenderingError> {
+    pub unsafe fn end_rendering(&mut self) {
         debug_assert_eq!(self.state, CommandBufferState::Recording);
         // SAFETY: Caller guarantees active render pass state.
         unsafe { self.parent.cmd_end_raw_rendering(self.handle) }
@@ -688,6 +686,40 @@ impl ResettableCommandBuffer {
                 first_set,
                 &raw_sets,
                 &[],
+            )
+        }
+    }
+
+    /// Upload push-constant data into the command buffer.
+    ///
+    /// # Safety
+    /// - The buffer must be in the recording state.
+    /// - `layout` must be compatible with the pipeline that will be
+    ///   used for drawing.
+    /// - `stage_flags` and `offset` must match a push constant range
+    ///   declared in `layout`.
+    /// - The byte length of `values` must not exceed the range size.
+    pub unsafe fn push_constants<T: bytemuck::Pod>(
+        &mut self,
+        layout: &PipelineLayout,
+        stage_flags: vk::ShaderStageFlags,
+        offset: u32,
+        values: &[T],
+    ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
+        // Cast the CPU-side data to bytes for the Vulkan call.
+        // bytemuck operates on the caller's stack data here, not on
+        // mapped GPU memory, so no aliasing issue arises.
+        let bytes = bytemuck::cast_slice(values);
+        // SAFETY: Caller guarantees recording state, layout
+        // compatibility, stage_flags match, and range bounds.
+        unsafe {
+            self.parent.cmd_push_constants(
+                self.handle,
+                layout.raw_pipeline_layout(),
+                stage_flags,
+                offset,
+                bytes,
             )
         }
     }

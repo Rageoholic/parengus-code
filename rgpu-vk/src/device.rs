@@ -34,8 +34,7 @@ use thiserror::Error;
 use crate::sync;
 use crate::{
     instance::{FetchPhysicalDeviceError, Instance},
-    surface::{Surface, SurfaceSupportError},
-    swapchain::CreateSwapchainError,
+    surface::Surface,
 };
 
 enum DynamicRenderingLoader {
@@ -88,7 +87,7 @@ pub struct Device {
     swapchain_device: Option<ash::khr::swapchain::Device>,
     debug_utils_device: Option<ash::ext::debug_utils::Device>,
     dynamic_rendering: Option<DynamicRenderingLoader>,
-    synchronization2: Synchronization2Loader,
+    synchronization2: Option<Synchronization2Loader>,
     physical_device: vk::PhysicalDevice,
     memory_budget: bool,
     /// Aliased queues share the same `Arc<Mutex<vk::Queue>>` so that locking
@@ -140,9 +139,6 @@ pub enum CreateCompatibleError {
     #[error("Failed to create logical device: {0}")]
     DeviceCreationFailed(vk::Result),
 
-    #[error("Error checking surface support: {0}")]
-    SurfaceSupport(#[from] SurfaceSupportError),
-
     #[error(
         "Dynamic rendering was requested but VK_KHR_dynamic_rendering is not \
          supported by the selected physical device"
@@ -155,14 +151,14 @@ pub enum CreateCompatibleError {
     )]
     Synchronization2NotAvailable,
 
+    #[error(
+        "VK_KHR_maintenance1 is not supported by the \
+         selected physical device (required on Vulkan < 1.1)"
+    )]
+    Maintenance1NotAvailable,
+
     #[error("Failed to create GPU allocator: {0}")]
     AllocatorCreation(AllocationError),
-}
-
-#[derive(Debug, Error)]
-pub enum DynamicRenderingError {
-    #[error("Dynamic rendering is not enabled on this device")]
-    NotEnabled,
 }
 
 #[derive(Debug, Error)]
@@ -201,6 +197,8 @@ pub enum QueueMode {
 pub struct DeviceConfig {
     pub swapchain: bool,
     pub dynamic_rendering: bool,
+    pub synchronization2: bool,
+    pub maintenance1: bool,
     pub queue_mode: QueueMode,
 }
 
@@ -251,6 +249,9 @@ impl Device {
             use_sync2_ext: bool,
             /// True when dynamic rendering must use the extension loader.
             use_dr_ext: bool,
+            /// True when VK_KHR_maintenance1 must be enabled
+            /// (pre-1.1 device).
+            use_maintenance1_ext: bool,
             /// True when VK_KHR_shader_non_semantic_info should be
             /// enabled (available on this pre-1.3 device).
             enable_shader_non_semantic: bool,
@@ -277,6 +278,8 @@ impl Device {
                 crate::instance::VkVersion::from_raw(props.api_version);
             let is_pre_1_3 = dev_api.major() < 1
                 || (dev_api.major() == 1 && dev_api.minor() < 3);
+            let is_pre_1_1 = dev_api.major() < 1
+                || (dev_api.major() == 1 && dev_api.minor() < 1);
 
             // VK_KHR_swapchain is never promoted to core; always check
             // it when requested. Other extensions are only extensions on
@@ -317,13 +320,29 @@ impl Device {
             }
 
             // VK_KHR_synchronization2: core in 1.3; required extension
-            // on older devices — hard filter.
-            let use_sync2_ext = if is_pre_1_3 {
+            // on older devices when requested — hard filter.
+            let use_sync2_ext = if config.synchronization2 && is_pre_1_3 {
                 if has_ext(ash::khr::synchronization2::NAME) {
                     true
                 } else {
                     tracing::debug!(
                         "Skipping {:?}: missing VK_KHR_synchronization2",
+                        props.device_name_as_c_str().unwrap_or(c"unknown"),
+                    );
+                    continue 'dev;
+                }
+            } else {
+                false
+            };
+
+            // VK_KHR_maintenance1: core in 1.1; required extension
+            // on older devices when requested — hard filter.
+            let use_maintenance1_ext = if config.maintenance1 && is_pre_1_1 {
+                if has_ext(ash::khr::maintenance1::NAME) {
+                    true
+                } else {
+                    tracing::debug!(
+                        "Skipping {:?}: missing VK_KHR_maintenance1",
                         props.device_name_as_c_str().unwrap_or(c"unknown"),
                     );
                     continue 'dev;
@@ -406,6 +425,7 @@ impl Device {
                 score,
                 use_sync2_ext,
                 use_dr_ext,
+                use_maintenance1_ext,
                 enable_shader_non_semantic,
                 enable_memory_budget,
             });
@@ -421,6 +441,7 @@ impl Device {
         let graphics_present_family = best.graphics_present_family;
         let use_sync2_ext = best.use_sync2_ext;
         let use_dr_ext = best.use_dr_ext;
+        let use_maintenance1_ext = best.use_maintenance1_ext;
         // SAFETY: physical_device was selected from this instance.
         let memory_properties = unsafe {
             instance.get_raw_physical_device_memory_properties(physical_device)
@@ -531,6 +552,9 @@ impl Device {
         if use_dr_ext {
             mandatory_exts.push(ash::khr::dynamic_rendering::NAME);
         }
+        if use_maintenance1_ext {
+            mandatory_exts.push(ash::khr::maintenance1::NAME);
+        }
 
         let ext_ptrs: Vec<*const i8> =
             mandatory_exts.iter().map(|e| e.as_ptr()).collect();
@@ -547,8 +571,11 @@ impl Device {
 
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
-            .enabled_extension_names(&ext_ptrs)
-            .push_next(&mut sync2_features);
+            .enabled_extension_names(&ext_ptrs);
+        if config.synchronization2 {
+            device_create_info =
+                device_create_info.push_next(&mut sync2_features);
+        }
         if config.dynamic_rendering {
             device_create_info = device_create_info.push_next(&mut dr_features);
         }
@@ -630,12 +657,16 @@ impl Device {
             } else {
                 None
             },
-            synchronization2: if use_sync2_ext {
-                Synchronization2Loader::Extension(
-                    instance.create_synchronization2_loader(&device),
-                )
+            synchronization2: if config.synchronization2 {
+                Some(if use_sync2_ext {
+                    Synchronization2Loader::Extension(
+                        instance.create_synchronization2_loader(&device),
+                    )
+                } else {
+                    Synchronization2Loader::Core
+                })
             } else {
-                Synchronization2Loader::Core
+                None
             },
             handle: device,
             physical_device,
@@ -833,14 +864,13 @@ impl Device {
     pub unsafe fn create_raw_swapchain(
         &self,
         create_info: &vk::SwapchainCreateInfoKHR<'_>,
-    ) -> Result<vk::SwapchainKHR, CreateSwapchainError> {
+    ) -> Result<vk::SwapchainKHR, vk::Result> {
         let swapchain_device = self
             .swapchain_device
             .as_ref()
-            .ok_or(CreateSwapchainError::SwapchainNotEnabled)?;
+            .expect("swapchain was not enabled in DeviceConfig");
         // SAFETY: Caller guarantees create_info validity and handle provenance.
         unsafe { swapchain_device.create_swapchain(create_info, None) }
-            .map_err(CreateSwapchainError::VulkanCreate)
     }
 
     /// # Safety
@@ -849,14 +879,13 @@ impl Device {
     pub unsafe fn get_raw_swapchain_images(
         &self,
         swapchain: vk::SwapchainKHR,
-    ) -> Result<Vec<vk::Image>, CreateSwapchainError> {
+    ) -> Result<Vec<vk::Image>, vk::Result> {
         let swapchain_device = self
             .swapchain_device
             .as_ref()
-            .ok_or(CreateSwapchainError::SwapchainNotEnabled)?;
+            .expect("swapchain was not enabled in DeviceConfig");
         // SAFETY: Caller guarantees swapchain validity and lifetime.
         unsafe { swapchain_device.get_swapchain_images(swapchain) }
-            .map_err(CreateSwapchainError::VulkanGetImages)
     }
 
     /// # Safety
@@ -865,10 +894,12 @@ impl Device {
     ///
     /// No in-flight GPU work may still reference the swapchain.
     pub unsafe fn destroy_raw_swapchain(&self, swapchain: vk::SwapchainKHR) {
-        if let Some(swapchain_device) = self.swapchain_device.as_ref() {
-            // SAFETY: Caller guarantees swapchain provenance and drop ordering.
-            unsafe { swapchain_device.destroy_swapchain(swapchain, None) };
-        }
+        let swapchain_device = self
+            .swapchain_device
+            .as_ref()
+            .expect("swapchain was not enabled in DeviceConfig");
+        // SAFETY: Caller guarantees swapchain provenance and drop ordering.
+        unsafe { swapchain_device.destroy_swapchain(swapchain, None) };
     }
 
     /// # Safety
@@ -991,7 +1022,7 @@ impl Device {
         let swapchain_device = self
             .swapchain_device
             .as_ref()
-            .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
+            .expect("swapchain was not enabled in DeviceConfig");
         // SAFETY: Caller guarantees swapchain, semaphore, and fence validity.
         unsafe {
             swapchain_device
@@ -1020,7 +1051,7 @@ impl Device {
         let swapchain_device = self
             .swapchain_device
             .as_ref()
-            .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
+            .expect("swapchain was not enabled in DeviceConfig");
         let queue = self
             .graphics_present_queue
             .0
@@ -1250,25 +1281,26 @@ impl Device {
         &self,
         command_buffer: vk::CommandBuffer,
         rendering_info: &vk::RenderingInfo<'_>,
-    ) -> Result<(), DynamicRenderingError> {
-        match &self.dynamic_rendering {
-            None => Err(DynamicRenderingError::NotEnabled),
-            Some(DynamicRenderingLoader::Core) => {
+    ) {
+        let dr = self
+            .dynamic_rendering
+            .as_ref()
+            .expect("dynamic_rendering was not enabled in DeviceConfig");
+        match dr {
+            DynamicRenderingLoader::Core => {
                 // SAFETY: Caller guarantees command_buffer and
                 // rendering_info validity.
                 unsafe {
                     self.handle
                         .cmd_begin_rendering(command_buffer, rendering_info)
                 };
-                Ok(())
             }
-            Some(DynamicRenderingLoader::Extension(loader)) => {
+            DynamicRenderingLoader::Extension(loader) => {
                 // SAFETY: Caller guarantees command_buffer and
                 // rendering_info validity.
                 unsafe {
                     loader.cmd_begin_rendering(command_buffer, rendering_info)
                 };
-                Ok(())
             }
         }
     }
@@ -1282,20 +1314,21 @@ impl Device {
     pub unsafe fn cmd_end_raw_rendering(
         &self,
         command_buffer: vk::CommandBuffer,
-    ) -> Result<(), DynamicRenderingError> {
-        match &self.dynamic_rendering {
-            None => Err(DynamicRenderingError::NotEnabled),
-            Some(DynamicRenderingLoader::Core) => {
+    ) {
+        let dr = self
+            .dynamic_rendering
+            .as_ref()
+            .expect("dynamic_rendering was not enabled in DeviceConfig");
+        match dr {
+            DynamicRenderingLoader::Core => {
                 // SAFETY: Caller guarantees command_buffer validity
                 // and render pass state.
                 unsafe { self.handle.cmd_end_rendering(command_buffer) };
-                Ok(())
             }
-            Some(DynamicRenderingLoader::Extension(loader)) => {
+            DynamicRenderingLoader::Extension(loader) => {
                 // SAFETY: Caller guarantees command_buffer validity
                 // and render pass state.
                 unsafe { loader.cmd_end_rendering(command_buffer) };
-                Ok(())
             }
         }
     }
@@ -1321,7 +1354,11 @@ impl Device {
             .0
             .lock()
             .expect("graphics/present queue lock poisoned");
-        match &self.synchronization2 {
+        let sync2 = self
+            .synchronization2
+            .as_ref()
+            .expect("synchronization2 was not enabled in DeviceConfig");
+        match sync2 {
             // SAFETY: Caller guarantees all handle validity and
             // synchronization state.
             Synchronization2Loader::Core => unsafe {
@@ -1396,9 +1433,13 @@ impl Device {
         command_buffer: vk::CommandBuffer,
         dependency_info: &vk::DependencyInfo<'_>,
     ) {
+        let sync2 = self
+            .synchronization2
+            .as_ref()
+            .expect("synchronization2 was not enabled in DeviceConfig");
         // SAFETY: Caller guarantees command_buffer and
         // dependency_info validity.
-        match &self.synchronization2 {
+        match sync2 {
             // SAFETY: Caller guarantees command_buffer and
             // dependency_info validity.
             Synchronization2Loader::Core => unsafe {
@@ -2016,6 +2057,36 @@ impl Device {
                 first_set,
                 descriptor_sets,
                 dynamic_offsets,
+            )
+        }
+    }
+
+    /// Record a `vkCmdPushConstants` command.
+    ///
+    /// # Safety
+    /// - `command_buffer` must be in the recording state.
+    /// - `layout` must be compatible with the pipeline that will be
+    ///   used for drawing.
+    /// - `stage_flags` and `offset` must match a push constant range
+    ///   declared in `layout`.
+    /// - `values` length must not exceed the range size.
+    pub unsafe fn cmd_push_constants(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        layout: vk::PipelineLayout,
+        stage_flags: vk::ShaderStageFlags,
+        offset: u32,
+        values: &[u8],
+    ) {
+        // SAFETY: Caller guarantees recording state, layout
+        // compatibility, stage_flags match, and range bounds.
+        unsafe {
+            self.handle.cmd_push_constants(
+                command_buffer,
+                layout,
+                stage_flags,
+                offset,
+                values,
             )
         }
     }

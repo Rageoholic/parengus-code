@@ -11,9 +11,7 @@ use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
 
-use crate::surface::{
-    CreateSurfaceError, SurfaceQueryError, SurfaceSupportError,
-};
+use crate::surface::CreateSurfaceError;
 use std::{
     ffi::{CStr, CString},
     fmt::Debug,
@@ -215,7 +213,7 @@ unsafe extern "system" fn vulkan_debug_callback(
 /// A `display_handle_source` must also be provided so the required
 /// extension names can be enumerated.
 #[derive(Debug, Default)]
-pub struct InstanceExtensions {
+pub struct InstanceConfig {
     pub surface: bool,
 }
 
@@ -231,7 +229,7 @@ impl Instance {
         app_name: impl AsRef<str>,
         max_log_level: Option<VulkanLogLevel>,
         display_handle_source: Option<&impl HasDisplayHandle>,
-        enabled_exts: InstanceExtensions,
+        enabled_exts: InstanceConfig,
     ) -> Result<Self, InstanceCreationError> {
         use InstanceCreationError as Error;
 
@@ -452,19 +450,13 @@ impl Instance {
     /// You can't use surf after this function is called (for obvious reasons)
     ///
     /// surf must be derived from this instance
-    pub unsafe fn destroy_raw_surface(
-        &self,
-        surf: vk::SurfaceKHR,
-    ) -> Result<(), DestroyRawSurfaceError> {
-        if let Some(ref surface_instance) = self.surface_instance {
-            // SAFETY: Surf is derived from this instance (passed on to caller)
-            unsafe {
-                surface_instance.destroy_surface(surf, None);
-            };
-            Ok(())
-        } else {
-            Err(DestroyRawSurfaceError::ExtensionNotLoaded)
-        }
+    pub unsafe fn destroy_raw_surface(&self, surf: vk::SurfaceKHR) {
+        let surface_instance = self
+            .surface_instance
+            .as_ref()
+            .expect("surface was not enabled in InstanceExtensions");
+        // SAFETY: Surf is derived from this instance (passed on to caller)
+        unsafe { surface_instance.destroy_surface(surf, None) };
     }
 
     /// Get a vector of handles to available physical devices. These handles are
@@ -612,12 +604,6 @@ pub enum FetchPhysicalDeviceError {
     UnknownVulkan(vk::Result),
 }
 
-#[derive(Debug, Error)]
-pub enum DestroyRawSurfaceError {
-    #[error("Surface extension is not loaded")]
-    ExtensionNotLoaded,
-}
-
 // Extensions related to surface functionality
 impl Instance {
     /// Check if a queue family on a physical device supports presenting to
@@ -631,20 +617,18 @@ impl Instance {
         physical_device: vk::PhysicalDevice,
         queue_family_index: u32,
         surface: vk::SurfaceKHR,
-    ) -> Result<bool, SurfaceSupportError> {
-        if let Some(ref surface_instance) = self.surface_instance {
-            // SAFETY: physical_device and surface were derived from
-            // this instance
-            unsafe {
-                surface_instance.get_physical_device_surface_support(
-                    physical_device,
-                    queue_family_index,
-                    surface,
-                )
-            }
-            .map_err(SurfaceSupportError::Vulkan)
-        } else {
-            Err(SurfaceSupportError::ExtensionNotLoaded)
+    ) -> Result<bool, vk::Result> {
+        let surface_instance = self
+            .surface_instance
+            .as_ref()
+            .expect("surface was not enabled in InstanceExtensions");
+        // SAFETY: physical_device and surface were derived from this instance.
+        unsafe {
+            surface_instance.get_physical_device_surface_support(
+                physical_device,
+                queue_family_index,
+                surface,
+            )
         }
     }
 
@@ -657,18 +641,17 @@ impl Instance {
         &self,
         physical_device: vk::PhysicalDevice,
         surface: vk::SurfaceKHR,
-    ) -> Result<vk::SurfaceCapabilitiesKHR, SurfaceQueryError> {
-        if let Some(ref surface_instance) = self.surface_instance {
-            // SAFETY: Caller guarantees physical_device and surface provenance.
-            unsafe {
-                surface_instance.get_physical_device_surface_capabilities(
-                    physical_device,
-                    surface,
-                )
-            }
-            .map_err(SurfaceQueryError::Vulkan)
-        } else {
-            Err(SurfaceQueryError::ExtensionNotLoaded)
+    ) -> Result<vk::SurfaceCapabilitiesKHR, vk::Result> {
+        let surface_instance = self
+            .surface_instance
+            .as_ref()
+            .expect("surface was not enabled in InstanceExtensions");
+        // SAFETY: Caller guarantees physical_device and surface provenance.
+        unsafe {
+            surface_instance.get_physical_device_surface_capabilities(
+                physical_device,
+                surface,
+            )
         }
     }
 
@@ -681,18 +664,15 @@ impl Instance {
         &self,
         physical_device: vk::PhysicalDevice,
         surface: vk::SurfaceKHR,
-    ) -> Result<Vec<vk::SurfaceFormatKHR>, SurfaceQueryError> {
-        if let Some(ref surface_instance) = self.surface_instance {
-            // SAFETY: Caller guarantees physical_device and surface provenance.
-            unsafe {
-                surface_instance.get_physical_device_surface_formats(
-                    physical_device,
-                    surface,
-                )
-            }
-            .map_err(SurfaceQueryError::Vulkan)
-        } else {
-            Err(SurfaceQueryError::ExtensionNotLoaded)
+    ) -> Result<Vec<vk::SurfaceFormatKHR>, vk::Result> {
+        let surface_instance = self
+            .surface_instance
+            .as_ref()
+            .expect("surface was not enabled in InstanceExtensions");
+        // SAFETY: Caller guarantees physical_device and surface provenance.
+        unsafe {
+            surface_instance
+                .get_physical_device_surface_formats(physical_device, surface)
         }
     }
 
@@ -705,18 +685,17 @@ impl Instance {
         &self,
         physical_device: vk::PhysicalDevice,
         surface: vk::SurfaceKHR,
-    ) -> Result<Vec<vk::PresentModeKHR>, SurfaceQueryError> {
-        if let Some(ref surface_instance) = self.surface_instance {
-            // SAFETY: Caller guarantees physical_device and surface provenance.
-            unsafe {
-                surface_instance.get_physical_device_surface_present_modes(
-                    physical_device,
-                    surface,
-                )
-            }
-            .map_err(SurfaceQueryError::Vulkan)
-        } else {
-            Err(SurfaceQueryError::ExtensionNotLoaded)
+    ) -> Result<Vec<vk::PresentModeKHR>, vk::Result> {
+        let surface_instance = self
+            .surface_instance
+            .as_ref()
+            .expect("surface was not enabled in InstanceExtensions");
+        // SAFETY: Caller guarantees physical_device and surface provenance.
+        unsafe {
+            surface_instance.get_physical_device_surface_present_modes(
+                physical_device,
+                surface,
+            )
         }
     }
 
@@ -734,29 +713,29 @@ impl Instance {
         source: &T,
     ) -> Result<vk::SurfaceKHR, CreateSurfaceError> {
         use CreateSurfaceError as Error;
-        if self.surface_instance.is_some() {
-            // SAFETY: entry and handle are live vulkan objects because they are
-            // only destroyed in drop. Per the contract with our caller, source
-            // will live at least as long as the returned surface
-            unsafe {
-                ash_window::create_surface(
-                    &self.entry,
-                    &self.handle,
-                    source
-                        .display_handle()
-                        .map_err(Error::InvalidDisplayHandle)?
-                        .as_raw(),
-                    source
-                        .window_handle()
-                        .map_err(Error::InvalidWindowHandle)?
-                        .as_raw(),
-                    None,
-                )
-            }
-            .map_err(Error::VulkanError)
-        } else {
-            Err(Error::MissingExtension)
+        assert!(
+            self.surface_instance.is_some(),
+            "surface was not enabled in InstanceExtensions"
+        );
+        // SAFETY: entry and handle are live vulkan objects because they are
+        // only destroyed in drop. Per the contract with our caller, source
+        // will live at least as long as the returned surface
+        unsafe {
+            ash_window::create_surface(
+                &self.entry,
+                &self.handle,
+                source
+                    .display_handle()
+                    .map_err(Error::InvalidDisplayHandle)?
+                    .as_raw(),
+                source
+                    .window_handle()
+                    .map_err(Error::InvalidWindowHandle)?
+                    .as_raw(),
+                None,
+            )
         }
+        .map_err(Error::VulkanError)
     }
 }
 
