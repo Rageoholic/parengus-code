@@ -1,0 +1,10 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "cargo build": true,
+        "cargo test": true
+    },
+    "editor.rulers": [
+        80
+    ],
+    "rust-analyzer.check.command": "clippy"
+}
