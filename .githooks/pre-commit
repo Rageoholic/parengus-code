@@ -1,6 +1,16 @@
 #!/bin/bash
 set -e
 
+branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+if [[ "$branch" == "main" ]]; then
+    echo "Direct commits to 'main' are not allowed."
+    echo "Create a branch and open a PR instead."
+    exit 1
+fi
+
+echo "Running rustfmt check..."
+cargo fmt -- --check
+
 echo "Running per-package clippy checks..."
 for pkg in rgpu-vk samp-app; do
     echo "  Checking $pkg..."
