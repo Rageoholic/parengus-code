@@ -1241,14 +1241,19 @@ impl AppRunner {
             .wait_semaphore_infos(std::slice::from_ref(&wait_info))
             .command_buffer_infos(std::slice::from_ref(&cmd_submit_info))
             .signal_semaphore_infos(std::slice::from_ref(&signal_info));
-        // SAFETY: image_available is signaled by acquire;
-        // render_finished is unsignaled; fence is unsignaled
-        // (just reset above); cmd is in the executable state.
+        let queue_index = if state.device.queue_config().parallel {
+            frame_idx
+        } else {
+            0
+        };
+        // SAFETY: image_available is signaled by acquire; render_finished is
+        // unsignaled; fence is unsignaled (just reset above); cmd is in the
+        // executable state. Queue index is known to be in bounds
         if let Err(e) = unsafe {
             state.device.graphics_present_queue_submit2(
                 std::slice::from_ref(&submit),
                 Some(&mut frame_objs.in_flight_fence),
-                0,
+                queue_index,
             )
         } {
             return DrawFrameOutcome::Fatal(format!(
@@ -1262,9 +1267,9 @@ impl AppRunner {
             .swapchains(std::slice::from_ref(&swapchain_raw))
             .image_indices(std::slice::from_ref(&image_index));
         // SAFETY: render_finished is signaled by submit; image is in
-        // PRESENT_SRC_KHR.
+        // PRESENT_SRC_KHR. queue_index is in bounds
         let present_result =
-            unsafe { state.device.queue_present(&present_info, 0) };
+            unsafe { state.device.queue_present(&present_info, queue_index) };
 
         state.current_frame = (state.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
