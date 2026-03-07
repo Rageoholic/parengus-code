@@ -2,6 +2,14 @@
 
 > AI-assisted document — generated with Claude Code.
 
+## Note on Private Submodule
+
+The `private/` directory is a git submodule pointing to a private
+repository. It is not available to external contributors and can be
+safely ignored when working on the public codebase.
+
+---
+
 ## Branch Names
 
 Use `type/short-description` with kebab-case words.
