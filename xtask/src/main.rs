@@ -87,7 +87,7 @@ fn all_tasks() -> Vec<Task> {
             run: copy_assets_noext,
         },
         Task {
-            name: "build",
+            name: "build-samp-app",
             deps: &[
                 "cargo-build",
                 "compile-shaders",
@@ -107,8 +107,38 @@ fn all_tasks() -> Vec<Task> {
             run: noop,
         },
         Task {
+            name: "cargo-build-phoenix",
+            deps: &[],
+            run: cargo_build_phoenix,
+        },
+        Task {
+            name: "copy-exe-phoenix",
+            deps: &["cargo-build-phoenix"],
+            run: copy_exe_phoenix,
+        },
+        Task {
+            name: "copy-assets-phoenix",
+            deps: &["compile-shaders"],
+            run: copy_assets_phoenix,
+        },
+        Task {
+            name: "build-phoenix",
+            deps: &[
+                "cargo-build-phoenix",
+                "compile-shaders",
+                "copy-exe-phoenix",
+                "copy-assets-phoenix",
+            ],
+            run: noop,
+        },
+        Task {
+            name: "build",
+            deps: &["build-samp-app", "build-noext", "build-phoenix"],
+            run: noop,
+        },
+        Task {
             name: "build-all",
-            deps: &["build", "build-noext"],
+            deps: &["build"],
             run: noop,
         },
     ]
@@ -360,4 +390,16 @@ fn copy_assets() -> Result<()> {
 
 fn copy_assets_noext() -> Result<()> {
     copy_assets_for("samp-app-noext")
+}
+
+fn cargo_build_phoenix() -> Result<()> {
+    cargo_build_pkg("phoenix")
+}
+
+fn copy_exe_phoenix() -> Result<()> {
+    copy_exe_for("phoenix")
+}
+
+fn copy_assets_phoenix() -> Result<()> {
+    copy_assets_for("phoenix")
 }

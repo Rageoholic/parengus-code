@@ -1,0 +1,11 @@
+[[asset]]
+name = "shader"
+type = "shader"
+
+[[asset]]
+name = "shader-debug"
+type = "shader"
+
+[[asset]]
+name = "statue-tex"
+type = "image"

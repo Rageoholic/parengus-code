@@ -42,7 +42,7 @@
 			"command": "cargo xtask compile-shaders"
 		},
 		{
-			"label": "build samp-app debug",
+			"label": "build all debug",
 			"type": "shell",
 			"command": "cargo xtask build",
 			"group": {
@@ -51,14 +51,19 @@
 			}
 		},
 		{
+			"label": "build samp-app debug",
+			"type": "shell",
+			"command": "cargo xtask build-samp-app"
+		},
+		{
+			"label": "build phoenix debug",
+			"type": "shell",
+			"command": "cargo xtask build-phoenix"
+		},
+		{
 			"label": "build samp-app-noext debug",
 			"type": "shell",
 			"command": "cargo xtask build-noext"
-		},
-		{
-			"label": "build all debug",
-			"type": "shell",
-			"command": "cargo xtask build-all"
 		},
 	]
 }
