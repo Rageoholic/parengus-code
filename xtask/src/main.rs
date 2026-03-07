@@ -312,7 +312,7 @@ fn copy_assets_for(app_name: &str) -> Result<()> {
     let root = workspace_root();
     assets::copy_assets(
         &root.join("assets").join("manifest.toml"),
-        &root.join(app_name).join("src").join("assets.toml"),
+        &root.join(app_name).join("assets.toml"),
         &root.join("assets"),
         &root.join("cache").join("shaders"),
         &root.join("out").join(app_name).join("debug").join("assets"),
