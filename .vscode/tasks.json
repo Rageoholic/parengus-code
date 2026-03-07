@@ -50,5 +50,15 @@
 				"isDefault": true
 			}
 		},
+		{
+			"label": "build samp-app-noext debug",
+			"type": "shell",
+			"command": "cargo xtask build-noext"
+		},
+		{
+			"label": "build all debug",
+			"type": "shell",
+			"command": "cargo xtask build-all"
+		},
 	]
 }

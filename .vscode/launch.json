@@ -118,6 +118,55 @@
             "environment": [],
             "console": "integratedTerminal",
             "preLaunchTask": "build samp-app debug"
+        },
+        {
+            "name": "(Windows) Launch samp-app-noext",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/out/samp-app-noext/debug/samp-app-noext.exe",
+            "args": [
+                "--tracing-log-level",
+                "warn",
+                "--graphics-debug-level",
+                "warn"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}/out/samp-app-noext/debug/",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "build samp-app-noext debug"
+        },
+        {
+            "name": "(Windows) Launch samp-app-noext (errors only)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/out/samp-app-noext/debug/samp-app-noext.exe",
+            "args": [
+                "--graphics-debug-level",
+                "error"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}/out/samp-app-noext/debug/",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "build samp-app-noext debug"
+        },
+        {
+            "name": "(Windows) Launch samp-app-noext trace full",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/out/samp-app-noext/debug/samp-app-noext.exe",
+            "args": [
+                "--tracing-log-level",
+                "trace",
+                "--graphics-debug-level",
+                "trace"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}/out/samp-app-noext/debug/",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "build samp-app-noext debug"
         }
     ]
 }

@@ -97,4 +97,7 @@ sections:
 - [ ] `cargo test` passes
 - [ ] Lines ≤ 80 columns
 - [ ] No new `unsafe` without a safety comment
+- [ ] If the change touches `samp-app` or `samp-app-noext`, consider
+      whether the sibling app needs the same fix (they share structure
+      and bugs tend to appear in both)
 - [ ] AI assistance disclosed if applicable

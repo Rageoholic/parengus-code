@@ -1,13 +1,17 @@
-//! Graphics pipeline and layout wrappers for dynamic rendering.
+//! Graphics pipeline and layout wrappers.
 //!
-//! [`DynamicPipeline`] is a graphics pipeline that requires no
-//! `VkRenderPass` object. It is built for use with
-//! `VK_KHR_dynamic_rendering` (Vulkan 1.3 core). Render pass information
-//! is instead provided at draw time via `vkCmdBeginRendering`.
+//! Two pipeline types are provided:
+//!
+//! - [`DynamicPipeline`] — requires no `VkRenderPass` object; built for
+//!   use with `VK_KHR_dynamic_rendering` (Vulkan 1.3 core). Render pass
+//!   information is provided at draw time via `vkCmdBeginRendering`.
+//! - [`RenderPassPipeline`] — paired with a `VkRenderPass` (classic
+//!   Vulkan 1.0 API). Render pass and subpass index are baked in at
+//!   pipeline creation time.
 //!
 //! [`PipelineLayout`] wraps a `VkPipelineLayout` and can be shared
 //! across multiple pipelines via `Arc`. When no layout is provided in
-//! [`DynamicPipelineDesc`], an empty one is created internally.
+//! the pipeline desc, an empty one is created internally.
 
 use std::sync::Arc;
 
@@ -444,5 +448,283 @@ impl Drop for DynamicPipeline {
         unsafe { self.parent.destroy_raw_pipeline(self.handle) };
         // self.layout Arc is released here; the layout itself is destroyed
         // only when all pipelines sharing it have been dropped.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RenderPassPipelineDesc
+// ---------------------------------------------------------------------------
+
+/// Description of a [`RenderPassPipeline`] to create.
+///
+/// Attachment formats are inferred from the render pass; `depth_test` and
+/// `depth_write` control whether the depth/stencil state is active.
+///
+/// # Defaults (via [`Default`])
+/// | field | default |
+/// |---|---|
+/// | `stages` | `&[]` (must be overridden) |
+/// | `render_pass` | `vk::RenderPass::null()` (must be overridden) |
+/// | `subpass` | `0` |
+/// | `layout` | `None` (empty layout is created internally) |
+/// | `vertex_bindings` | `&[]` |
+/// | `vertex_attributes` | `&[]` |
+/// | `depth_test` | `false` |
+/// | `depth_write` | `false` |
+/// | `depth_compare_op` | `LESS_OR_EQUAL` |
+/// | `polygon_mode` | `FILL` |
+/// | `cull_mode` | `NONE` |
+/// | `front_face` | `COUNTER_CLOCKWISE` |
+pub struct RenderPassPipelineDesc<'a> {
+    /// Shader entry points that form this pipeline's stages.
+    ///
+    /// Must contain at least one entry.
+    pub stages: &'a [EntryPoint<'a>],
+
+    /// The render pass this pipeline will be used with.
+    pub render_pass: vk::RenderPass,
+
+    /// Index of the subpass within `render_pass`.
+    pub subpass: u32,
+
+    /// Pipeline layout to use.
+    ///
+    /// When `None` an empty layout (no descriptor sets, no push constants)
+    /// is created internally and owned exclusively by the resulting
+    /// pipeline. Pass an `Arc<PipelineLayout>` to share a layout across
+    /// multiple pipelines.
+    pub layout: Option<Arc<PipelineLayout>>,
+
+    /// Vertex buffer binding declarations.
+    pub vertex_bindings: &'a [VertexBindingDesc],
+
+    /// Vertex attribute declarations consumed by the vertex shader.
+    pub vertex_attributes: &'a [VertexAttributeDesc],
+
+    /// Enable depth testing.
+    pub depth_test: bool,
+
+    /// Enable depth writes.
+    pub depth_write: bool,
+
+    /// Depth comparison operator used when depth testing is enabled.
+    pub depth_compare_op: vk::CompareOp,
+
+    /// Polygon fill mode used by the rasterizer.
+    pub polygon_mode: vk::PolygonMode,
+
+    /// Face culling mode.
+    pub cull_mode: vk::CullModeFlags,
+
+    /// Winding order considered front-facing.
+    pub front_face: vk::FrontFace,
+}
+
+impl Default for RenderPassPipelineDesc<'_> {
+    fn default() -> Self {
+        Self {
+            stages: &[],
+            render_pass: vk::RenderPass::null(),
+            subpass: 0,
+            layout: None,
+            vertex_bindings: &[],
+            vertex_attributes: &[],
+            depth_test: false,
+            depth_write: false,
+            depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
+            polygon_mode: vk::PolygonMode::FILL,
+            cull_mode: vk::CullModeFlags::NONE,
+            front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RenderPassPipeline
+// ---------------------------------------------------------------------------
+
+/// A graphics pipeline paired with a `VkRenderPass` (classic Vulkan 1.0
+/// API).
+///
+/// The render pass and subpass index are baked in at pipeline creation
+/// time. This pipeline must only be used inside a render pass begun with
+/// the compatible `VkRenderPass`.
+///
+/// Fixed pipeline state applied during construction:
+/// - Vertex input: configurable via `vertex_bindings` and
+///   `vertex_attributes`
+/// - Input assembly: `TRIANGLE_LIST`
+/// - Viewport/scissor: fully dynamic (`VK_DYNAMIC_STATE_VIEWPORT` +
+///   `VK_DYNAMIC_STATE_SCISSOR`)
+/// - Rasterization: configurable polygon mode, cull mode, front face;
+///   line width fixed at 1.0
+/// - Multisample: single sample, no sample shading
+/// - Depth/stencil: controlled by `depth_test` and `depth_write`
+/// - Color blend: no blending, full RGBA write mask on one color
+///   attachment
+pub struct RenderPassPipeline {
+    parent: Arc<Device>,
+    handle: vk::Pipeline,
+    layout: Arc<PipelineLayout>,
+}
+
+impl std::fmt::Debug for RenderPassPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderPassPipeline")
+            .field("handle", &self.handle)
+            .field("layout", &self.layout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RenderPassPipeline {
+    /// Create a [`RenderPassPipeline`] from a description.
+    ///
+    /// `name` is an optional debug label applied via `VK_EXT_debug_utils`
+    /// when the extension is available. The closure is only called when
+    /// the extension is enabled. Naming failures are logged as warnings
+    /// and do not cause the call to fail.
+    pub fn new<F>(
+        device: &Arc<Device>,
+        desc: &RenderPassPipelineDesc<'_>,
+        name: Option<F>,
+    ) -> Result<Self, CreateDynamicPipelineError>
+    where
+        F: FnOnce() -> String,
+    {
+        if desc.stages.is_empty() {
+            return Err(CreateDynamicPipelineError::NoStages);
+        }
+
+        let layout = match &desc.layout {
+            Some(l) => Arc::clone(l),
+            None => Arc::new(
+                PipelineLayout::new_empty(device)
+                    .map_err(CreateDynamicPipelineError::LayoutCreation)?,
+            ),
+        };
+
+        let stage_create_infos: Vec<vk::PipelineShaderStageCreateInfo<'_>> =
+            desc.stages
+                .iter()
+                .map(|ep| ep.as_pipeline_stage_create_info())
+                .collect();
+
+        let vertex_bindings: Vec<vk::VertexInputBindingDescription> = desc
+            .vertex_bindings
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect();
+
+        let vertex_attributes: Vec<vk::VertexInputAttributeDescription> = desc
+            .vertex_attributes
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect();
+
+        let vertex_input_state =
+            vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&vertex_bindings)
+                .vertex_attribute_descriptions(&vertex_attributes);
+
+        let input_assembly_state =
+            vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+        // Viewport and scissor counts must be declared even though their
+        // values are supplied dynamically.
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+
+        let rasterization_state =
+            vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(desc.polygon_mode)
+                .cull_mode(desc.cull_mode)
+                .front_face(desc.front_face)
+                .line_width(1.0);
+
+        let multisample_state =
+            vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        let depth_stencil_state =
+            vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(desc.depth_test)
+                .depth_write_enable(desc.depth_write)
+                .depth_compare_op(desc.depth_compare_op);
+
+        // One color blend attachment to match the single color attachment
+        // declared in the render pass.
+        let color_blend_attachment =
+            vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA);
+        let color_blend_state =
+            vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(std::slice::from_ref(&color_blend_attachment));
+
+        let dynamic_states =
+            [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+
+        let create_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stage_create_infos)
+            .vertex_input_state(&vertex_input_state)
+            .input_assembly_state(&input_assembly_state)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization_state)
+            .multisample_state(&multisample_state)
+            .depth_stencil_state(&depth_stencil_state)
+            .color_blend_state(&color_blend_state)
+            .dynamic_state(&dynamic_state)
+            .layout(layout.raw_pipeline_layout())
+            .render_pass(desc.render_pass)
+            .subpass(desc.subpass);
+
+        // SAFETY: create_info references valid shader stages, a valid
+        // pipeline layout, and a valid VkRenderPass; all derived from
+        // device and valid for the duration of this call.
+        let handle =
+            unsafe { device.create_raw_graphics_pipeline(&create_info) }
+                .map_err(CreateDynamicPipelineError::PipelineCreation)?;
+
+        // SAFETY: handle is a valid pipeline created from device.
+        let name_result = unsafe {
+            device.set_object_name_with(handle, || {
+                std::ffi::CString::new(name?()).ok()
+            })
+        };
+        if let Err(e) = name_result {
+            tracing::warn!("Failed to name pipeline {:?}: {e}", handle);
+        }
+
+        Ok(Self {
+            parent: Arc::clone(device),
+            handle,
+            layout,
+        })
+    }
+
+    pub fn raw_pipeline(&self) -> vk::Pipeline {
+        self.handle
+    }
+
+    pub fn layout(&self) -> &Arc<PipelineLayout> {
+        &self.layout
+    }
+}
+
+impl Drop for RenderPassPipeline {
+    fn drop(&mut self) {
+        tracing::debug!("Dropping pipeline {:?}", self.handle);
+        // SAFETY: handle was created from parent and is being destroyed
+        // during teardown. All in-flight GPU work referencing this
+        // pipeline must be completed before drop.
+        unsafe { self.parent.destroy_raw_pipeline(self.handle) };
+        // self.layout Arc is released here; the layout itself is
+        // destroyed only when all pipelines sharing it have been dropped.
     }
 }

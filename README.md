@@ -3,7 +3,14 @@
 Rust workspace for Vulkan experiments.
 
 - `rgpu-vk`: Vulkan wrapper library (uses `ash`)
-- `samp-app`: sample app using `winit`
+- `samp-app`: sample app using `winit`, Vulkan 1.3 features
+- `samp-app-noext`: same app, Vulkan 1.0 core APIs only
+
+`samp-app` and `samp-app-noext` render the same scene and are
+intentional parallel implementations. They exist to contrast modern
+Vulkan APIs (dynamic rendering, synchronization2) against the
+classic render-pass / VK 1.0 submit path. **Do not factor shared
+code between them** — the duplication is the point.
 
 ## rgpu-vk overview
 
