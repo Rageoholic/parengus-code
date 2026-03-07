@@ -15,6 +15,9 @@ git config core.hooksPath .githooks
   `samp-app-noext` (same scene, VK 1.0 core APIs only)
 - CI: GitHub Actions at `.github/workflows/ci.yml` —
   per-package clippy + workspace build + tests
+- `private/` — git submodule (`Rageoholic/parengus-private`, private
+  repo) containing the GDD and other private assets. Requires SSH
+  access to clone. Run `git submodule update --init` after cloning.
 
 ## Sibling Apps: samp-app and samp-app-noext
 
