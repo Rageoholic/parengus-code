@@ -1,0 +1,123 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "(Windows) Launch samp-app",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
+            "args": [
+                "--tracing-log-level",
+                "warn",
+                "--graphics-debug-level",
+                "warn"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}/out/samp-app/debug/",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "build samp-app debug"
+        },
+        {
+            "name": "(Windows) Launch samp-app (errors only)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
+            "args": [
+                "--graphics-debug-level",
+                "error"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}/out/samp-app/debug/",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "build samp-app debug"
+        },
+        {
+            "name": "(Windows) Launch samp-app (debug) trace full",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
+            "args": [
+                "--tracing-log-level",
+                "trace",
+                "--graphics-debug-level",
+                "trace"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}/out/samp-app/debug/",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "build samp-app debug"
+        },
+        {
+            "name": "(Windows) Launch samp-app (debug) trace no vk debug callback",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
+            "args": [
+                "--tracing-log-level",
+                "trace",
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}/out/samp-app/debug/",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "build samp-app debug"
+        },
+        {
+            "name": "(Windows) Launch samp-app (debug) trace no rgpu",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
+            "args": [
+                "--tracing-log-level",
+                "trace",
+                "--rgpu-log-level",
+                "off"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}/out/samp-app/debug/",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "build samp-app debug"
+        },
+        {
+            "name": "(Windows) Launch samp-app (debug) queue-config: single",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
+            "args": [
+                "--graphics-debug-level",
+                "warn",
+                "--queue-mode",
+                "single"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}/out/samp-app/debug/",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "build samp-app debug"
+        },
+        {
+            "name": "(Windows) Launch samp-app (debug) queue-config: unified",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
+            "args": [
+                "--graphics-debug-level",
+                "warn",
+                "--queue-mode",
+                "unified"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}/out/samp-app/debug/",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "build samp-app debug"
+        }
+    ]
+}
