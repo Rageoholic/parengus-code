@@ -1,4 +1,5 @@
 /target
 /out
+/cache
 /.claude/*.local.*
 tmpclaude-*

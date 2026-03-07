@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [rgpu-vk, samp-app]
+        package: [rgpu-vk, samp-app, samp-app-noext]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

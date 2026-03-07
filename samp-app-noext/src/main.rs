@@ -1,6 +1,22 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+//! Classic Vulkan 1.0 sample app.
+//!
+//! Renders the same scene as `samp-app` (three overlapping textured
+//! quads with depth testing) using only Vulkan 1.0 core APIs:
+//!
+//! - `VkRenderPass` / `VkFramebuffer` instead of dynamic rendering
+//! - `vkCmdPipelineBarrier` instead of sync2 `vkCmdPipelineBarrier2`
+//! - `vkQueueSubmit` / `VkSubmitInfo` instead of sync2
+//!   `vkQueueSubmit2`
+//!
+//! The render pass uses `initial_layout = UNDEFINED` for both
+//! attachments and `final_layout = PRESENT_SRC_KHR` for the color
+//! attachment, eliminating the need for explicit pre-render and
+//! pre-present image barriers. The subpass dependency handles all
+//! stage/access synchronisation.
+
 use std::{
     cell::Cell,
     f32::consts::PI as PI32,
@@ -24,12 +40,12 @@ use rgpu_vk::{
     device::{Device, DeviceConfig, QueueConfig},
     image::{DepthImage, Texture},
     instance::{Instance, InstanceConfig},
-    memory::image_barrier2,
     pipeline::{
-        CullModeFlags, DynamicPipeline, DynamicPipelineDesc, FrontFace,
-        PipelineLayout, PipelineLayoutDesc, VertexAttributeDesc,
+        CullModeFlags, FrontFace, PipelineLayout, PipelineLayoutDesc,
+        RenderPassPipeline, RenderPassPipelineDesc, VertexAttributeDesc,
         VertexBindingDesc, VertexInputRate,
     },
+    renderpass::{RenderPass, RenderPassDesc},
     sampler::Sampler,
     shader::{ShaderModule, ShaderStage},
     surface::Surface,
@@ -59,10 +75,6 @@ struct Vertex {
 }
 
 /// Uniform buffer object — projection matrix only.
-///
-/// Projection is separated from model-view because it only changes
-/// on window resize; keeping it in the UBO lets the descriptor set
-/// carry it without a push-constant update each frame.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct Ubo {
@@ -70,10 +82,6 @@ struct Ubo {
 }
 
 /// Push-constant block — model-view matrix.
-///
-/// Model-view changes every frame (the model rotates, camera is
-/// fixed) so it is supplied as a push constant: baked directly into
-/// the command buffer with no descriptor set update needed.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct PushConstants {
@@ -81,15 +89,6 @@ struct PushConstants {
 }
 
 /// Three overlapping 0.8×0.8 quads at increasing Z heights.
-///
-/// World convention: +Z up, right-handed. The camera sits at
-/// (2, −2, 1.5) looking at the origin, so higher-Z vertices are
-/// closer to it.
-///
-/// The quads are ordered **nearest-first** in the buffer: without
-/// depth testing the farthest quad (drawn last) would incorrectly
-/// overdraw the nearest one, making the depth buffer's effect
-/// immediately obvious.
 const SCENE_VERTICES: [Vertex; 12] = [
     // Nearest (z = 0.7), centre at (−0.25, 0)
     Vertex {
@@ -147,41 +146,16 @@ const SCENE_VERTICES: [Vertex; 12] = [
 // ---------------------------------------------------------------------------
 // Matrix math — right-handed, +Z up
 // ---------------------------------------------------------------------------
-//
-// We build our own look-at and perspective helpers using vek's Vec/Mat
-// primitives so the math is explicit and auditable.  vek's higher-level
-// helpers (e.g. Mat4::perspective_rh_zo) are intentionally avoided.
 
-/// Build a right-handed view matrix that places the camera at `eye`
-/// looking toward `center`, with `world_up` as the reference up axis.
-///
-/// Convention: after this transform the camera sits at the origin and
-/// looks down its **negative Z** axis (standard camera-space convention).
-///
-/// Column-major storage matches vek's [`Mat4`] layout.
 #[rustfmt::skip]
 fn look_at_rh(
     eye: Vec3<f32>,
     center: Vec3<f32>,
     world_up: Vec3<f32>,
 ) -> Mat4<f32> {
-    // Forward: unit vector from eye toward the target.
     let f = (center - eye).normalized();
-    // Right: perpendicular to forward in the horizontal plane.
-    // cross(f, world_up) gives a right-hand-rule right vector.
     let r = f.cross(world_up).normalized();
-    // Up: recomputed from r and f to guarantee orthogonality even
-    // when world_up is not exactly perpendicular to f.
     let u = r.cross(f);
-
-    // The view matrix is R * T, where T translates by -eye and R
-    // rotates so that (r, u, -f) align with the camera axes.
-    // vek's Mat4::new takes 16 scalars in column-major order
-    // (all of col 0 first, then col 1, …).
-    //   col 0 = [ r.x,        u.x,        -f.x,       0 ]
-    //   col 1 = [ r.y,        u.y,        -f.y,       0 ]
-    //   col 2 = [ r.z,        u.z,        -f.z,       0 ]
-    //   col 3 = [ -dot(r,eye), -dot(u,eye), dot(f,eye), 1 ]
     Mat4::from_col_arrays(
         [
         [r.x,         u.x,         -f.x,        0.0,],
@@ -191,47 +165,15 @@ fn look_at_rh(
     )
 }
 
-/// Build a right-handed perspective projection matrix for Vulkan's
-/// clip space (depth range [0, 1], Y axis pointing **down**).
-///
-/// - `fov_y`: vertical field of view in radians.
-/// - `aspect`: viewport width divided by height.
-/// - `near` / `far`: distances to the near and far clip planes
-///   (both positive, measured along the view direction).
-///
-/// The camera is assumed to look down **−Z** in view space (see
-/// [`look_at_rh`]).
-///
-/// Uses a standard right-handed projection (positive Y up in clip space).
-/// Pair with a flipped viewport (`y = height, height = -height`,
-/// enabled by VK_KHR_maintenance1 / Vulkan 1.1) so the image appears
-/// right-side-up and CCW world-space winding maps to CCW screen-space
-/// winding without any sign baked into this matrix.
 fn perspective_rh_zo(
     fov_y: f32,
     aspect: f32,
     near: f32,
     far: f32,
 ) -> Mat4<f32> {
-    // Focal length: distance from the image plane at which the
-    // vertical half-FOV spans exactly 1 unit.
     let f = 1.0 / (fov_y * 0.5).tan();
-
-    // Depth remapping coefficients for the [0, 1] range:
-    //   At z_view = -near → z_ndc = 0
-    //   At z_view = -far  → z_ndc = 1
-    // Derived from z_ndc = (A·z_view + B) / (-z_view) with the
-    // above boundary conditions:
-    //   A = far / (near - far)
-    //   B = far·near / (near - far)
     let a = far / (near - far);
     let b = far * near / (near - far);
-
-    // Column-major layout (vek convention, 16-scalar Mat4::new):
-    //   col 0 = [ f/aspect,  0,   0,  0 ]
-    //   col 1 = [ 0,        f,   0,  0 ]
-    //   col 2 = [ 0,         0,   a, -1 ]  ← w_clip = -z_view
-    //   col 3 = [ 0,         0,   b,  0 ]
     Mat4::from_col_arrays([
         [f / aspect, 0.0, 0.0, 0.0],
         [0.0, f, 0.0, 0.0],
@@ -240,8 +182,6 @@ fn perspective_rh_zo(
     ])
 }
 
-// Each group of 6 uses the same CCW winding as the original
-// single-quad layout: [base, base+2, base+1, base, base+1, base+3].
 const SCENE_INDICES: [u16; 18] = [
     0, 2, 1, 0, 1, 3, // nearest
     4, 6, 5, 4, 5, 7, // middle
@@ -253,26 +193,18 @@ const SCENE_INDICES: [u16; 18] = [
     Debug, PartialEq, Eq, PartialOrd, Ord,
     Clone, Copy, Default, clap::ValueEnum,
 )]
-/// Log verbosity level for tracing output.
 enum TracingLogLevel {
-    /// Disable tracing logs.
     Off,
-    /// Very detailed execution logs.
     Trace,
-    /// Informational runtime events.
     Info,
-    /// Debug-level diagnostics.
     Debug,
-    /// Warnings and errors only.
     Warn,
     #[default]
-    /// Errors only.
     Error,
 }
 
 impl From<TracingLogLevel> for LevelFilter {
     fn from(value: TracingLogLevel) -> Self {
-        use tracing_subscriber::filter::LevelFilter;
         match value {
             TracingLogLevel::Off => LevelFilter::OFF,
             TracingLogLevel::Trace => LevelFilter::TRACE,
@@ -285,56 +217,46 @@ impl From<TracingLogLevel> for LevelFilter {
 }
 
 #[derive(clap::Parser, Debug)]
-#[command(about = "Sample Vulkan app", long_about = None)]
+#[command(
+    about = "Sample Vulkan app (classic VK 1.0 APIs)",
+    long_about = None
+)]
 struct CliArgs {
-    /// Tracing verbosity for stdout/file logging.
     #[arg(long, default_value = "error")]
     tracing_log_level: TracingLogLevel,
 
-    /// Vulkan validation/debug callback severity threshold.
     #[arg(long)]
     graphics_debug_level: Option<CliVulkanLogLevel>,
 
-    /// rgpu_vk tracing verbosity; defaults to --tracing-log-level.
     #[arg(long)]
     rgpu_log_level: Option<TracingLogLevel>,
 
-    /// Use a dedicated transfer queue family (default: true).
     #[arg(long)]
     dedicated_transfer: Option<bool>,
 
-    /// Use a dedicated compute queue family (default: true).
     #[arg(long)]
     dedicated_compute: Option<bool>,
 
-    /// Allocate all available queues per family (default: true).
     #[arg(long)]
     parallel: Option<bool>,
 
-    /// Treat queue config as hard requirements; error if any
-    /// requested axis is unsatisfied.
     #[arg(long)]
     queue_config_strict: bool,
 
-    /// Load debug-info shader binary (`shader.debug.spv`) for RenderDoc.
+    /// Load debug-info shader binary (`shader.debug.spv`) for
+    /// RenderDoc.
     #[arg(long)]
     shader_debug_info: bool,
 
-    /// Disable ANSI color codes in stdout log output.
     #[arg(long)]
     no_color: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-/// Vulkan validation/debug callback severity threshold.
 enum CliVulkanLogLevel {
-    /// Include verbose diagnostics (maps to Vulkan VERBOSE).
     Trace,
-    /// Include informational messages and above.
     Info,
-    /// Include warnings and errors.
     Warn,
-    /// Include errors only.
     Error,
 }
 
@@ -355,16 +277,6 @@ impl From<CliVulkanLogLevel> for rgpu_vk::instance::VulkanLogLevel {
     }
 }
 
-/// Build a [`Targets`] filter combining the global tracing level,
-/// an optional `rgpu_vk`-specific override, and an optional
-/// Vulkan debug-utils-specific override.
-///
-/// The default target uses `tracing_level`. When `rgpu_level` differs
-/// from the default, an `"rgpu_vk"` target override is added. When
-/// `gfx_level` maps to a more permissive filter than the effective
-/// `rgpu_vk` level, a `"rgpu_vk::instance::debug_utils"` override is
-/// added so Vulkan callback messages are not suppressed by the broader
-/// `rgpu_vk` filter.
 fn subscriber_filter(
     tracing_level: TracingLogLevel,
     rgpu_level: Option<TracingLogLevel>,
@@ -392,16 +304,18 @@ fn subscriber_filter(
 }
 
 fn main() -> eyre::Result<()> {
-    let app_dirs = directories::ProjectDirs::from("", "parengus", "samp-app")
-        .ok_or_else(|| {
-        eyre::eyre!("Failed to determine application directories")
-    })?;
+    let app_dirs =
+        directories::ProjectDirs::from("", "parengus", "samp-app-noext")
+            .ok_or_else(|| {
+                eyre::eyre!("Failed to determine application directories")
+            })?;
 
     let self_dir = std::env::current_exe()?
         .parent()
         .ok_or_else(|| {
             eyre::eyre!(
-                "Failed to take the parent directory of the current executable"
+                "Failed to take the parent directory of the \
+                 current executable"
             )
         })?
         .to_owned();
@@ -451,14 +365,11 @@ fn main() -> eyre::Result<()> {
 
     let event_loop = winit::event_loop::EventLoop::builder().build()?;
 
-    // SAFETY: Instance::new loads the Vulkan library via
-    // ash::Entry::load (libloading). The loaded Entry must outlive
-    // all Vulkan objects derived from it; wrapping the Instance in
-    // an Arc ensures it stays alive at least as long as any derived
-    // object does.
+    // SAFETY: Instance::new loads the Vulkan library. The Entry must
+    // outlive all derived objects; Arc<Instance> ensures this.
     let instance = Arc::new(unsafe {
         rgpu_vk::instance::Instance::new(
-            "samp-app",
+            "samp-app-noext",
             cli_args.graphics_debug_level.map(Into::into),
             Some(&event_loop),
             InstanceConfig { surface: true },
@@ -479,8 +390,8 @@ fn main() -> eyre::Result<()> {
 
     let device_config = DeviceConfig {
         swapchain: true,
-        dynamic_rendering: true,
-        synchronization2: true,
+        dynamic_rendering: false,
+        synchronization2: false,
         maintenance1: true,
         shader_non_semantic_info: true,
         queue_config: QueueConfig {
@@ -515,7 +426,6 @@ enum App {
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-/// Depth format candidates tried in preference order.
 const DEPTH_FORMAT_CANDIDATES: &[vk::Format] = &[
     vk::Format::D32_SFLOAT,
     vk::Format::D32_SFLOAT_S8_UINT,
@@ -530,33 +440,14 @@ struct FrameSync {
     command_buffer: ResettableCommandBuffer,
 }
 
-/// Ensures [`Device::wait_idle`] is called before [`RunningState`]'s Vulkan
-/// resources are destroyed.
-///
-/// Stored as the **first** field of `RunningState` so that Rust's field drop
-/// order guarantees `wait_idle` fires before the swapchain, frames,
-/// semaphores, and fences are freed.
-///
-/// The two exit paths are:
-///
-/// - **Drop** (`exit_from_running`, etc.): the guard is dropped with the rest
-///   of `RunningState`; `Drop` calls `wait_idle` automatically.
-/// - **Destructure** (`suspended()` transition): `RunningState` is
-///   destructured to move fields into `SuspendedState`; `wait_idle` is called
-///   explicitly first (for error handling), and the guard drops at end of
-///   scope, calling `wait_idle` a second time — which is a harmless no-op on
-///   an already-idle device.
 struct RunningStateTransitionGuard {
     device: Arc<Device>,
 }
 
 impl RunningStateTransitionGuard {
     /// # Safety
-    /// This guard **must** be dropped rather than forgotten. Dropping it calls
-    /// `vkDeviceWaitIdle`, ensuring the GPU is idle before the caller's Vulkan
-    /// resources are freed. Forgetting it (via `mem::forget`, `ManuallyDrop`,
-    /// etc.) skips that wait and may allow resources to be destroyed while
-    /// the GPU is still accessing them.
+    /// This guard must be dropped (not forgotten) to ensure
+    /// `vkDeviceWaitIdle` is called before resources are freed.
     unsafe fn new(device: Arc<Device>) -> Self {
         Self { device }
     }
@@ -579,6 +470,7 @@ struct InitializingState {
     self_dir: std::path::PathBuf,
     shader_debug_info: bool,
 }
+
 #[derive(Debug)]
 struct DebugCounters {
     swapchain: Cell<u64>,
@@ -613,19 +505,16 @@ struct RunningState {
     win: Arc<WinitWindow>,
     device: Arc<Device>,
     _surface: Arc<Surface<WinitWindow>>,
-    // `None` means the window/surface is currently zero-sized. We stay in
-    // Running and recreate on the next non-zero resize/scale event.
-    swapchain: Option<Arc<Swapchain<WinitWindow>>>,
-    /// One render-finished semaphore per swapchain image, indexed by the
-    /// image index from `vkAcquireNextImageKHR`. `None` iff `swapchain`
-    /// is `None`.
-    render_finished_semaphores: Option<Arc<Vec<Semaphore>>>,
-    /// One depth image per frame-in-flight, matched to swapchain extent.
-    /// Empty when `swapchain` is `None`.
-    depth_images: Vec<DepthImage>,
+    // Swapchain is not Arc-wrapped so we can call create_framebuffers
+    // (&mut self). `None` means the window is currently zero-sized.
+    swapchain: Option<Swapchain<WinitWindow>>,
+    /// One render-finished semaphore per swapchain image.
+    /// `None` iff `swapchain` is `None`.
+    render_finished_semaphores: Option<Vec<Semaphore>>,
     depth_format: vk::Format,
     shader: ShaderModule,
-    pipeline: DynamicPipeline,
+    render_pass: RenderPass,
+    pipeline: RenderPassPipeline,
     vertex_buffer: DeviceLocalBuffer,
     index_buffer: DeviceLocalBuffer,
     pipeline_color_format: vk::Format,
@@ -634,17 +523,10 @@ struct RunningState {
     current_frame: usize,
     debug_counters: DebugCounters,
     descriptor_set_layout: Arc<DescriptorSetLayout>,
-    /// Shared pipeline layout referencing `descriptor_set_layout`.
-    /// Reused when rebuilding the pipeline after a format change.
     pipeline_layout: Arc<PipelineLayout>,
     descriptor_pool: DescriptorPool,
-    /// One host-visible UBO buffer per frame in flight.
     ubo_buffers: Vec<HostVisibleBuffer>,
-    /// One descriptor set per frame in flight, each pointing at the
-    /// matching entry in `ubo_buffers`.
     descriptor_sets: Vec<DescriptorSet>,
-    /// Wall-clock time at which the app entered the Running state;
-    /// used to drive the rotation animation.
     start_time: Instant,
     asset_map: AssetMap,
     texture: Texture,
@@ -657,18 +539,8 @@ impl std::fmt::Debug for RunningState {
             .field("win", &self.win)
             .field("device", &self.device)
             .field("_surface", &self._surface)
-            .field("swapchain", &self.swapchain)
-            .field("shader", &self.shader)
-            .field("pipeline", &self.pipeline)
-            .field("vertex_buffer", &self.vertex_buffer)
-            .field("index_buffer", &self.index_buffer)
             .field("pipeline_color_format", &self.pipeline_color_format)
-            .field("command_pool", &self.command_pool)
-            .field("frames", &self.frames)
             .field("current_frame", &self.current_frame)
-            .field("debug_counters", &self.debug_counters)
-            .field("descriptor_set_layout", &self.descriptor_set_layout)
-            .field("descriptor_pool", &self.descriptor_pool)
             .finish_non_exhaustive()
     }
 }
@@ -678,7 +550,8 @@ struct SuspendedState {
     win: Arc<WinitWindow>,
     device: Arc<Device>,
     shader: ShaderModule,
-    pipeline: DynamicPipeline,
+    render_pass: RenderPass,
+    pipeline: RenderPassPipeline,
     vertex_buffer: DeviceLocalBuffer,
     index_buffer: DeviceLocalBuffer,
     pipeline_color_format: vk::Format,
@@ -695,6 +568,7 @@ struct SuspendedState {
     texture: Texture,
     sampler: Sampler,
 }
+
 #[derive(Debug)]
 struct ExitingState {}
 
@@ -740,6 +614,7 @@ impl ApplicationHandler for AppRunner {
             tracing::warn!("resumed() called while in Exiting state");
         }
     }
+
     fn suspended(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         assert!(self.0.is_some());
         if let Some(running_state) = self.take_running() {
@@ -757,9 +632,9 @@ impl ApplicationHandler for AppRunner {
                 _surface: _,
                 swapchain: _,
                 render_finished_semaphores: _,
-                depth_images: _,
                 depth_format: _,
                 shader,
+                render_pass,
                 pipeline,
                 vertex_buffer,
                 index_buffer,
@@ -781,7 +656,8 @@ impl ApplicationHandler for AppRunner {
 
             if let Err(e) = device.wait_idle() {
                 tracing::error!(
-                    "Error while waiting for device idle during suspend: {}",
+                    "Error while waiting for device idle during \
+                     suspend: {}",
                     e
                 );
                 self.transition_to_exiting("Running", event_loop);
@@ -792,6 +668,7 @@ impl ApplicationHandler for AppRunner {
                 win,
                 device,
                 shader,
+                render_pass,
                 pipeline,
                 vertex_buffer,
                 index_buffer,
@@ -906,13 +783,11 @@ enum DrawFrameOutcome {
 }
 
 impl AppRunner {
-    /// Create one binary semaphore per swapchain image for render→present
-    /// synchronisation. Semaphores are named `"render finished img[N]"`.
     fn make_render_finished_semaphores(
         device: &Arc<Device>,
         image_count: usize,
-    ) -> eyre::Result<Arc<Vec<Semaphore>>> {
-        let sems = (0..image_count)
+    ) -> eyre::Result<Vec<Semaphore>> {
+        (0..image_count)
             .map(|i| {
                 Semaphore::new(
                     device,
@@ -920,17 +795,18 @@ impl AppRunner {
                 )
                 .map_err(eyre::Report::from)
             })
-            .collect::<eyre::Result<Vec<_>>>()?;
-        Ok(Arc::new(sems))
+            .collect()
     }
 
-    /// Create one depth image per frame-in-flight for `extent`.
+    /// Create one depth image per swapchain image (indexed by image
+    /// index, not by frame-in-flight).
     fn make_depth_images(
         device: &Arc<Device>,
         extent: vk::Extent2D,
         depth_format: vk::Format,
+        count: usize,
     ) -> eyre::Result<Vec<DepthImage>> {
-        (0..MAX_FRAMES_IN_FLIGHT)
+        (0..count)
             .map(|i| {
                 DepthImage::new(
                     device,
@@ -945,7 +821,6 @@ impl AppRunner {
     }
 
     fn draw_frame(state: &mut RunningState) -> DrawFrameOutcome {
-        // Skip if the window is currently zero-sized (no swapchain).
         if state.swapchain.is_none() {
             return DrawFrameOutcome::Success;
         }
@@ -954,12 +829,8 @@ impl AppRunner {
         let frame_objs = &mut state.frames[frame_idx];
 
         if frame_objs.in_flight_fence.is_submitted() {
-            // Wait until this frame slot's previous GPU work is done, then
-            // reset the fence for reuse. This also guarantees image_available
-            // is unsignaled and the command buffer is no longer in use.
-            //
-            // SAFETY: fence was submitted with GPU work for this frame slot;
-            // the wait ensures all that work has completed.
+            // SAFETY: fence was submitted with GPU work for this slot;
+            // wait ensures all that work has completed.
             let fence_result =
                 unsafe { frame_objs.in_flight_fence.wait_and_reset(u64::MAX) };
             if let Err(e) = fence_result {
@@ -976,10 +847,7 @@ impl AppRunner {
         let swapchain_raw = sc.raw_swapchain();
         let image_available = frame_objs.image_available.raw_semaphore();
 
-        // Acquire the next presentable image.
-        //
-        // SAFETY: image_available is unsignaled (fence wait above ensures the
-        // previous acquire+submit cycle for this slot has completed).
+        // SAFETY: image_available is unsignaled (fence wait above).
         let acquire_result = unsafe {
             sc.acquire_next_image(u64::MAX, image_available, vk::Fence::null())
         };
@@ -996,10 +864,11 @@ impl AppRunner {
 
         let i = image_index as usize;
         let extent = sc.extent();
-        let image = sc.images()[i];
-        let image_view = sc
-            .image_views()
-            .expect("image views were created with the swapchain")[i];
+
+        // Framebuffers and depth images are indexed by swapchain image.
+        let framebuffer = sc
+            .framebuffers()
+            .expect("framebuffers created with swapchain")[i];
         let render_finished = state
             .render_finished_semaphores
             .as_ref()
@@ -1009,9 +878,6 @@ impl AppRunner {
         let elapsed = state.start_time.elapsed().as_secs_f32();
         let aspect = extent.width as f32 / extent.height as f32;
 
-        // Projection — uploaded to the per-frame UBO (changes on
-        // resize, but we simply recompute every frame for simplicity).
-        // 60° vertical FOV, depth range [0.1, 100].
         let ubo = Ubo {
             projection: perspective_rh_zo(PI32 / 3.0, aspect, 0.1, 100.0),
         };
@@ -1021,9 +887,6 @@ impl AppRunner {
             return DrawFrameOutcome::Fatal(format!("UBO write failed: {e}"));
         }
 
-        // Model-view — uploaded as a push constant each frame.
-        // Camera is fixed at world-space (2, -2, 1.5) looking at the
-        // origin; the model rotates around +Z (the world up axis).
         let model = Mat4::<f32>::rotation_z(elapsed * PI32 * 2.0 / 5.0);
         let view =
             look_at_rh(Vec3::new(2.0, -2.0, 1.5), Vec3::zero(), Vec3::unit_z());
@@ -1032,12 +895,9 @@ impl AppRunner {
         };
 
         let pipeline_handle = state.pipeline.raw_pipeline();
-        let frame_cmd = &mut frame_objs.command_buffer;
+        let frame_cmd = &mut state.frames[frame_idx].command_buffer;
 
-        // Reset and re-record the command buffer for this frame slot.
-        //
-        // SAFETY: fence wait above guarantees the buffer is not
-        // pending on the GPU.
+        // SAFETY: fence wait guarantees buffer is not pending on GPU.
         if let Err(e) = unsafe { frame_cmd.reset() } {
             return DrawFrameOutcome::Fatal(format!(
                 "Command buffer reset failed: {e}"
@@ -1049,55 +909,17 @@ impl AppRunner {
             ));
         }
 
-        let subresource_range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .base_mip_level(0)
-            .level_count(1)
-            .base_array_layer(0)
-            .layer_count(1);
+        // No explicit image barriers needed here.
+        //
+        // Color: initial_layout = UNDEFINED (render pass discards
+        // previous contents; compatible with LOAD_OP_CLEAR). The
+        // render pass end automatically transitions to PRESENT_SRC_KHR
+        // via final_layout.
+        //
+        // Depth: initial_layout = UNDEFINED (discards; compatible with
+        // LOAD_OP_CLEAR). The subpass dependency covers the required
+        // stage/access synchronisation for both attachments.
 
-        // Transition: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
-        let to_color = image_barrier2()
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-            .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .image(image)
-            .subresource_range(subresource_range);
-        let depth_image = state.depth_images[frame_idx].raw_image();
-        let depth_subresource_range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::DEPTH)
-            .base_mip_level(0)
-            .level_count(1)
-            .base_array_layer(0)
-            .layer_count(1);
-        // Transition: UNDEFINED → DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
-        // old_layout = UNDEFINED discards previous contents, which is
-        // safe because LOAD_OP_CLEAR overwrites them anyway.
-        let to_depth = image_barrier2()
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-            .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            )
-            .dst_access_mask(
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            )
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-            .image(depth_image)
-            .subresource_range(depth_subresource_range);
-        let barriers = [to_color, to_depth];
-        let dep_info =
-            vk::DependencyInfo::default().image_memory_barriers(&barriers);
-        // SAFETY: recording state; swapchain image and depth image valid.
-        unsafe { frame_cmd.pipeline_barrier2(&dep_info) };
-
-        // Begin dynamic rendering with a clear.
         let color_clear = vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [0.0, 0.0, 0.0, 1.0],
@@ -1109,37 +931,33 @@ impl AppRunner {
                 stencil: 0,
             },
         };
-        let color_attachment = vk::RenderingAttachmentInfo::default()
-            .image_view(image_view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(color_clear);
-        let depth_attachment = vk::RenderingAttachmentInfo::default()
-            .image_view(state.depth_images[frame_idx].raw_image_view())
-            .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .clear_value(depth_clear);
-        let rendering_info = vk::RenderingInfo::default()
+        let clear_values = [color_clear, depth_clear];
+
+        let render_pass_begin = vk::RenderPassBeginInfo::default()
+            .render_pass(state.render_pass.raw_render_pass())
+            .framebuffer(framebuffer)
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent,
             })
-            .layer_count(1)
-            .color_attachments(std::slice::from_ref(&color_attachment))
-            .depth_attachment(&depth_attachment);
-        // SAFETY: recording; color image in COLOR_ATTACHMENT_OPTIMAL;
-        // depth image in DEPTH_STENCIL_ATTACHMENT_OPTIMAL; views valid.
-        unsafe { frame_cmd.begin_rendering(&rendering_info) };
+            .clear_values(&clear_values);
 
-        // Bind pipeline, set dynamic viewport/scissor, draw.
-        // SAFETY: inside a dynamic render pass with a compatible
-        // color attachment.
+        // SAFETY: recording; render pass and framebuffer are valid and
+        // compatible; clear values match attachment count.
+        unsafe {
+            frame_cmd.begin_render_pass(
+                &render_pass_begin,
+                vk::SubpassContents::INLINE,
+            )
+        };
+
+        // SAFETY: inside render pass; pipeline is compatible with
+        // the active render pass.
         unsafe { frame_cmd.bind_graphics_pipeline(pipeline_handle) };
-        // SAFETY: recording state; pipeline_layout is compatible with the
-        // bound pipeline; descriptor set is valid and its buffer remains
-        // alive for the duration of this frame's GPU work.
+
+        // SAFETY: layout is compatible with the bound pipeline;
+        // descriptor set is valid and its buffer remains alive for
+        // this frame's GPU work.
         unsafe {
             frame_cmd.bind_descriptor_sets(
                 &state.pipeline_layout,
@@ -1147,9 +965,9 @@ impl AppRunner {
                 &[&state.descriptor_sets[frame_idx]],
             )
         };
-        // SAFETY: recording state; layout is compatible with the bound
-        // pipeline; VERTEX stage and offset 0 match the declared range;
-        // push is sized within the minimum 128-byte guarantee.
+
+        // SAFETY: layout compatible; VERTEX stage; offset 0 matches
+        // the declared range; push sized within 128-byte guarantee.
         unsafe {
             frame_cmd.push_constants(
                 &state.pipeline_layout,
@@ -1158,13 +976,11 @@ impl AppRunner {
                 std::slice::from_ref(&push),
             )
         };
-        // SAFETY: inside render pass recording; buffer is valid
+
+        // SAFETY: inside render pass; buffer is valid.
         unsafe { frame_cmd.bind_vertex_buffer(0, &state.vertex_buffer, 0) };
 
-        // Negative height flips the viewport Y axis (VK_KHR_maintenance1,
-        // core since Vulkan 1.1).  This maps NDC +Y to the top of the
-        // screen, keeping the projection matrix in standard RH form and
-        // preserving CCW world-space winding as screen-space CCW.
+        // Negative height flips the viewport Y axis (VK_KHR_maintenance1).
         let h = extent.height as f32;
         let viewport = vk::Viewport {
             x: 0.0,
@@ -1184,7 +1000,7 @@ impl AppRunner {
         // SAFETY: pipeline declares VK_DYNAMIC_STATE_SCISSOR.
         unsafe { frame_cmd.set_scissor(std::slice::from_ref(&scissor)) };
 
-        // SAFETY: inside render pass recording; buffer is valid.
+        // SAFETY: inside render pass; buffer is valid.
         unsafe {
             frame_cmd.bind_index_buffer(
                 &state.index_buffer,
@@ -1193,30 +1009,17 @@ impl AppRunner {
             )
         };
 
-        // Draw a rectangle using the index buffer.
-        // SAFETY: all required dynamic state has been set;
-        // render pass is active; index buffer is bound.
+        // SAFETY: all dynamic state set; render pass active; index
+        // buffer bound.
         unsafe {
             frame_cmd.draw_indexed(SCENE_INDICES.len() as u32, 1, 0, 0, 0)
         };
 
-        // SAFETY: inside a dynamic render pass.
-        unsafe { frame_cmd.end_rendering() };
+        // SAFETY: inside a render pass.
+        unsafe { frame_cmd.end_render_pass() };
 
-        // Transition: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
-        let to_present = image_barrier2()
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
-            .dst_access_mask(vk::AccessFlags2::NONE)
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-            .image(image)
-            .subresource_range(subresource_range);
-        let dep_info_present = vk::DependencyInfo::default()
-            .image_memory_barriers(std::slice::from_ref(&to_present));
-        // SAFETY: recording; image is in COLOR_ATTACHMENT_OPTIMAL.
-        unsafe { frame_cmd.pipeline_barrier2(&dep_info_present) };
+        // No post-render barrier needed: the render pass final_layout
+        // = PRESENT_SRC_KHR transitions the color image automatically.
 
         if let Err(e) = frame_cmd.end() {
             return DrawFrameOutcome::Fatal(format!(
@@ -1225,35 +1028,28 @@ impl AppRunner {
         }
 
         let cmd_handle = frame_cmd.raw_command_buffer();
-        // frame_cmd borrow ends here; subsequent accesses are on
-        // different fields.
 
-        // Submit — wait on image_available, signal render_finished,
-        // signal fence when done.
-        let wait_info = vk::SemaphoreSubmitInfo::default()
-            .semaphore(image_available)
-            .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
-        let signal_info = vk::SemaphoreSubmitInfo::default()
-            .semaphore(render_finished)
-            .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
-        let cmd_submit_info =
-            vk::CommandBufferSubmitInfo::default().command_buffer(cmd_handle);
-        let submit = vk::SubmitInfo2::default()
-            .wait_semaphore_infos(std::slice::from_ref(&wait_info))
-            .command_buffer_infos(std::slice::from_ref(&cmd_submit_info))
-            .signal_semaphore_infos(std::slice::from_ref(&signal_info));
+        // Old-style submit: wait on image_available at
+        // COLOR_ATTACHMENT_OUTPUT, signal render_finished.
+        let wait_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
+        let submit = vk::SubmitInfo::default()
+            .wait_semaphores(std::slice::from_ref(&image_available))
+            .wait_dst_stage_mask(std::slice::from_ref(&wait_stage))
+            .command_buffers(std::slice::from_ref(&cmd_handle))
+            .signal_semaphores(std::slice::from_ref(&render_finished));
+
         let queue_index = if state.device.queue_config().parallel {
             frame_idx
         } else {
             0
         };
-        // SAFETY: image_available is signaled by acquire; render_finished is
-        // unsignaled; fence is unsignaled (just reset above); cmd is in the
-        // executable state. Queue index is known to be in bounds
+
+        // SAFETY: image_available signaled by acquire; render_finished
+        // unsignaled; fence just reset; cmd in executable state.
         if let Err(e) = unsafe {
-            state.device.graphics_present_queue_submit2(
+            state.device.graphics_present_queue_submit(
                 std::slice::from_ref(&submit),
-                Some(&mut frame_objs.in_flight_fence),
+                Some(&mut state.frames[frame_idx].in_flight_fence),
                 queue_index,
             )
         } {
@@ -1262,13 +1058,12 @@ impl AppRunner {
             ));
         }
 
-        // Present — wait on render_finished.
         let present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(std::slice::from_ref(&render_finished))
             .swapchains(std::slice::from_ref(&swapchain_raw))
             .image_indices(std::slice::from_ref(&image_index));
-        // SAFETY: render_finished is signaled by submit; image is in
-        // PRESENT_SRC_KHR. queue_index is in bounds
+        // SAFETY: render_finished signaled by submit; image in
+        // PRESENT_SRC_KHR (via render pass final_layout transition).
         let present_result =
             unsafe { state.device.queue_present(&present_info, queue_index) };
 
@@ -1285,14 +1080,27 @@ impl AppRunner {
     }
 }
 
+fn build_render_pass(
+    device: &Arc<Device>,
+    color_format: vk::Format,
+    depth_format: vk::Format,
+) -> eyre::Result<RenderPass> {
+    Ok(RenderPass::new(
+        device,
+        &RenderPassDesc {
+            color_format,
+            depth_format,
+        },
+    )?)
+}
+
 fn build_pipeline<F>(
     device: &Arc<Device>,
     shader: &ShaderModule,
-    color_format: vk::Format,
-    depth_format: vk::Format,
+    render_pass: &RenderPass,
     layout: Option<Arc<PipelineLayout>>,
     name: Option<F>,
-) -> eyre::Result<DynamicPipeline>
+) -> eyre::Result<RenderPassPipeline>
 where
     F: FnOnce() -> String,
 {
@@ -1317,17 +1125,19 @@ where
             offset: std::mem::offset_of!(Vertex, tex_coord) as u32,
         },
     ];
-    Ok(DynamicPipeline::new(
+    Ok(RenderPassPipeline::new(
         device,
-        &DynamicPipelineDesc {
+        &RenderPassPipelineDesc {
             stages: &[vert, frag],
-            color_attachment_formats: &[color_format],
-            depth_attachment_format: Some(depth_format),
+            render_pass: render_pass.raw_render_pass(),
+            subpass: 0,
             vertex_bindings: &vertex_bindings,
             vertex_attributes: &vertex_attributes,
             layout,
             cull_mode: CullModeFlags::BACK,
             front_face: FrontFace::COUNTER_CLOCKWISE,
+            depth_test: true,
+            depth_write: true,
             ..Default::default()
         },
         name,
@@ -1341,18 +1151,16 @@ impl AppRunner {
     ) -> eyre::Result<RunningState> {
         let win = Arc::new(event_loop.create_window(
             WindowAttributes::default().with_inner_size(LogicalSize {
-                width: 1600,
-                height: 900,
+                width: 1600u32,
+                height: 900u32,
             }),
         )?);
 
-        // SAFETY: Surface must be destroyed only after all swapchains
-        // derived from it are destroyed and no GPU work accesses their
-        // images. Swapchain holds Arc<Surface>, so the surface outlives
-        // the swapchain. Swapchain replacement always calls wait_idle
-        // first, and RunningState drop calls wait_idle via
-        // _idle_guard — so the surface is never freed while GPU work
-        // is pending.
+        // SAFETY: Surface must be destroyed only after all derived
+        // swapchains are destroyed and no GPU work accesses them.
+        // Swapchain holds Arc<Surface> so the surface outlives it.
+        // wait_idle is always called before swapchain replacement and
+        // on RunningState drop.
         let surface = Arc::new(unsafe {
             Surface::new(&state.instance, Arc::clone(&win))
         }?);
@@ -1409,37 +1217,10 @@ impl AppRunner {
 
         let win_size = win.inner_size();
         let debug_counters = DebugCounters::new();
-        let swapchain = if win_size.width == 0 || win_size.height == 0 {
-            tracing::trace!(
-                "Skipping initial swapchain create because window \
-                 extent is zero: {}x{}",
-                win_size.width,
-                win_size.height
-            );
-            None
-        } else {
-            let sc_idx = debug_counters.next_swapchain();
-            let requested_extent = vk::Extent2D {
-                width: win_size.width,
-                height: win_size.height,
-            };
-            let swapchain_create_span = tracing::trace_span!(
-                "initial_swapchain_create",
-                requested_width = requested_extent.width,
-                requested_height = requested_extent.height
-            )
-            .entered();
-            let swapchain = Swapchain::new(
-                &device,
-                &surface,
-                requested_extent,
-                true,
-                None,
-                Some(move || format!("Swapchain {sc_idx}")),
-            )?;
-            drop(swapchain_create_span);
-            Some(Arc::new(swapchain))
-        };
+
+        let depth_format = device
+            .find_depth_format(DEPTH_FORMAT_CANDIDATES)
+            .ok_or_else(|| eyre::eyre!("No supported depth format found"))?;
 
         let asset_map_path =
             state.self_dir.join("assets").join("asset_map.toml");
@@ -1464,8 +1245,8 @@ impl AppRunner {
         let shader_path = if state.shader_debug_info && !shader_path.exists() {
             tracing::warn!(
                 path = %shader_path.display(),
-                "Shader debug info requested but debug shader was not \
-                 found; falling back to non-debug shader"
+                "Shader debug info requested but debug shader was \
+                 not found; falling back to non-debug shader"
             );
             let fallback = asset_map
                 .map
@@ -1490,11 +1271,6 @@ impl AppRunner {
             ShaderModule::new(&device, &shader_bytes, Some("shader"))?
         };
 
-        let pipeline_color_format = swapchain
-            .as_ref()
-            .map(|sc| sc.format())
-            .unwrap_or(vk::Format::B8G8R8A8_SRGB);
-
         let descriptor_set_layout = Arc::new(DescriptorSetLayout::new(
             &device,
             &[
@@ -1516,9 +1292,6 @@ impl AppRunner {
             &device,
             &PipelineLayoutDesc {
                 set_layouts: &[&descriptor_set_layout],
-                // One push constant range covering the full
-                // PushConstants struct (model_view: Mat4 = 64 bytes),
-                // accessible from the vertex stage only.
                 push_constant_ranges: &[vk::PushConstantRange {
                     stage_flags: vk::ShaderStageFlags::VERTEX,
                     offset: 0,
@@ -1527,9 +1300,21 @@ impl AppRunner {
             },
         )?);
 
-        let depth_format = device
-            .find_depth_format(DEPTH_FORMAT_CANDIDATES)
-            .ok_or_else(|| eyre::eyre!("No supported depth format found"))?;
+        // Pipeline color format is determined from the swapchain (or a
+        // sensible default when the window is zero-sized at startup).
+        let pipeline_color_format = if win_size.width > 0 && win_size.height > 0
+        {
+            // Peek at the preferred format without keeping the
+            // swapchain — the real swapchain is created below.
+            vk::Format::B8G8R8A8_SRGB
+        } else {
+            vk::Format::B8G8R8A8_SRGB
+        };
+
+        let render_pass = {
+            let _span = tracing::trace_span!("render_pass_create").entered();
+            build_render_pass(&device, pipeline_color_format, depth_format)?
+        };
 
         let pipeline = {
             let _span = tracing::trace_span!(
@@ -1540,8 +1325,7 @@ impl AppRunner {
             build_pipeline(
                 &device,
                 &shader,
-                pipeline_color_format,
-                depth_format,
+                &render_pass,
                 Some(Arc::clone(&pipeline_layout)),
                 Some({
                     let idx = debug_counters.next_pipeline();
@@ -1556,10 +1340,6 @@ impl AppRunner {
             Some("graphics command pool"),
         )?;
 
-        // Start each fence unsignaled; is_submitted() will be false on
-        // the first frame so we skip the wait and go straight to
-        // recording. Each frame slot owns its command buffer so the CPU
-        // can encode frame N while the GPU executes frame N-1.
         let frames = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|i| -> eyre::Result<FrameSync> {
                 Ok(FrameSync {
@@ -1576,24 +1356,6 @@ impl AppRunner {
                 })
             })
             .collect::<eyre::Result<Vec<_>>>()?;
-
-        let render_finished_semaphores = swapchain
-            .as_ref()
-            .map(|sc| {
-                Self::make_render_finished_semaphores(
-                    &device,
-                    sc.images().len(),
-                )
-            })
-            .transpose()?;
-
-        let depth_images = swapchain
-            .as_ref()
-            .map(|sc| {
-                Self::make_depth_images(&device, sc.extent(), depth_format)
-            })
-            .transpose()?
-            .unwrap_or_default();
 
         let ubo_size = size_of::<Ubo>() as vk::DeviceSize;
         let ubo_buffers = (0..MAX_FRAMES_IN_FLIGHT)
@@ -1627,9 +1389,8 @@ impl AppRunner {
             .collect();
         let descriptor_sets = descriptor_pool.allocate_sets(&layouts)?;
         for (set, buf) in descriptor_sets.iter().zip(ubo_buffers.iter()) {
-            // SAFETY: buf is a valid UNIFORM_BUFFER from device with
-            // size ubo_size; it remains alive for the lifetime of the
-            // descriptor set (both live in RunningState/SuspendedState).
+            // SAFETY: buf is a valid UNIFORM_BUFFER that remains alive
+            // for the lifetime of the descriptor set.
             unsafe { set.write_uniform_buffer(&device, 0, buf, ubo_size) };
         }
 
@@ -1667,12 +1428,11 @@ impl AppRunner {
             Some("statue-tex"),
         )?;
 
-        // Record all uploads into a single command buffer, then
-        // submit once and wait for completion before the staging
-        // buffers are dropped.
+        // Record all uploads into one command buffer, submit once, then
+        // wait for completion before dropping the staging buffers.
         //
-        // SAFETY: upload_cmd is in the recording state (begun above);
-        // all buffers remain alive until wait_idle below completes.
+        // SAFETY: upload_cmd is in the recording state; all buffers
+        // remain alive until wait_idle completes.
         unsafe {
             vertex_buffer
                 .record_copy_from(&mut upload_cmd, &staging_vertex_buffer)
@@ -1682,19 +1442,19 @@ impl AppRunner {
             index_buffer
                 .record_copy_from(&mut upload_cmd, &staging_index_buffer)
         }?;
-        // SAFETY: same as buffer copies above; image in recording state.
-        unsafe { texture.record_copy_from2(&mut upload_cmd, &tex_staging) }?;
+        // SAFETY: same as buffer copies above; image in recording
+        // state; uses VK 1.0 core barriers (no sync2 required).
+        unsafe { texture.record_copy_from(&mut upload_cmd, &tex_staging) }?;
 
         upload_cmd.end()?;
-        let cmd_info = vk::CommandBufferSubmitInfo::default()
-            .command_buffer(upload_cmd.raw_command_buffer());
-        let submit_info = vk::SubmitInfo2::default()
-            .command_buffer_infos(std::slice::from_ref(&cmd_info));
+        let cmd_handle = upload_cmd.raw_command_buffer();
+        let upload_submit = vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&cmd_handle));
         // SAFETY: command buffer is executable; referenced resources
         // remain alive until wait_idle below.
         unsafe {
-            device.graphics_present_queue_submit2(
-                std::slice::from_ref(&submit_info),
+            device.graphics_present_queue_submit(
+                std::slice::from_ref(&upload_submit),
                 None,
                 0,
             )
@@ -1711,14 +1471,63 @@ impl AppRunner {
 
         for set in &descriptor_sets {
             // SAFETY: texture and sampler live in RunningState /
-            // SuspendedState and outlive any command buffer that
-            // references these descriptor sets.
+            // SuspendedState and outlive any command buffer referencing
+            // these sets.
             unsafe {
                 set.write_texture_sampler(&device, 1, &texture, &sampler)
             };
         }
 
-        // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
+        // Create the initial swapchain (if the window is non-zero).
+        let (swapchain, render_finished_semaphores) = if win_size.width == 0
+            || win_size.height == 0
+        {
+            tracing::trace!(
+                "Skipping initial swapchain create because window \
+                     extent is zero: {}x{}",
+                win_size.width,
+                win_size.height
+            );
+            (None, None)
+        } else {
+            let sc_idx = debug_counters.next_swapchain();
+            let requested_extent = vk::Extent2D {
+                width: win_size.width,
+                height: win_size.height,
+            };
+            let _span = tracing::trace_span!(
+                "initial_swapchain_create",
+                requested_width = requested_extent.width,
+                requested_height = requested_extent.height
+            )
+            .entered();
+            let mut sc = Swapchain::new(
+                &device,
+                &surface,
+                requested_extent,
+                true,
+                None,
+                Some(move || format!("Swapchain {sc_idx}")),
+            )?;
+            let image_count = sc.images().len();
+            let depths = Self::make_depth_images(
+                &device,
+                sc.extent(),
+                depth_format,
+                image_count,
+            )?;
+            // SAFETY: depth_images has the same length as the
+            // swapchain image count; swapchain takes ownership.
+            unsafe {
+                sc.create_framebuffers(render_pass.raw_render_pass(), depths)
+            }?;
+            let sems =
+                Self::make_render_finished_semaphores(&device, image_count)?;
+            (Some(sc), Some(sems))
+        };
+
+        // SAFETY: guard will call wait_idle in Drop. Must not be
+        // forgotten.
         let idle_guard =
             unsafe { RunningStateTransitionGuard::new(Arc::clone(&device)) };
         Ok(RunningState {
@@ -1728,9 +1537,9 @@ impl AppRunner {
             _surface: surface,
             swapchain,
             render_finished_semaphores,
-            depth_images,
             depth_format,
             shader,
+            render_pass,
             pipeline,
             vertex_buffer,
             index_buffer,
@@ -1754,24 +1563,51 @@ impl AppRunner {
     fn suspended_to_running(
         state: SuspendedState,
     ) -> eyre::Result<RunningState> {
-        // SAFETY: The surface outlives all derived swapchains via Arc<Surface>.
+        // SAFETY: The surface outlives all derived swapchains via Arc.
         let surface = Arc::new(unsafe {
             Surface::new(state.device.parent(), Arc::clone(&state.win))
         }?);
 
         let win_size = state.win.inner_size();
         let debug_counters = state.debug_counters;
-        let swapchain = if win_size.width == 0 || win_size.height == 0 {
+        let depth_format = state
+            .device
+            .find_depth_format(DEPTH_FORMAT_CANDIDATES)
+            .ok_or_else(|| eyre::eyre!("No supported depth format found"))?;
+
+        let (mut render_pass, mut pipeline, mut pipeline_color_format) =
+            if win_size.width > 0 && win_size.height > 0 {
+                // Peek at the swapchain format by creating a temporary
+                // swapchain; if it matches, reuse existing pass/pipeline.
+                // We don't actually create the full swapchain here —
+                // that happens below. Reuse the stored pipeline_color_format
+                // as the hint; the driver will honor it if supported.
+                (
+                    state.render_pass,
+                    state.pipeline,
+                    state.pipeline_color_format,
+                )
+            } else {
+                (
+                    state.render_pass,
+                    state.pipeline,
+                    state.pipeline_color_format,
+                )
+            };
+
+        let (swapchain, render_finished_semaphores) = if win_size.width == 0
+            || win_size.height == 0
+        {
             tracing::trace!(
                 "Skipping swapchain create on resume because window \
-                 extent is zero: {}x{}",
+                     extent is zero: {}x{}",
                 win_size.width,
                 win_size.height
             );
-            None
+            (None, None)
         } else {
             let sc_idx = debug_counters.next_swapchain();
-            Some(Arc::new(Swapchain::new(
+            let mut sc = Swapchain::new(
                 &state.device,
                 &surface,
                 vk::Extent2D {
@@ -1781,76 +1617,53 @@ impl AppRunner {
                 true,
                 Some(state.pipeline_color_format),
                 Some(move || format!("Swapchain {sc_idx}")),
-            )?))
+            )?;
+
+            let new_format = sc.format();
+            if new_format != pipeline_color_format {
+                tracing::debug!(
+                    "Swapchain format changed on resume \
+                         ({:?} -> {:?}); recreating render pass \
+                         and pipeline",
+                    pipeline_color_format,
+                    new_format,
+                );
+                render_pass =
+                    build_render_pass(&state.device, new_format, depth_format)?;
+                pipeline = build_pipeline(
+                    &state.device,
+                    &state.shader,
+                    &render_pass,
+                    Some(Arc::clone(&state.pipeline_layout)),
+                    Some({
+                        let idx = debug_counters.next_pipeline();
+                        move || format!("main pipeline {idx}")
+                    }),
+                )?;
+                pipeline_color_format = new_format;
+            }
+
+            let image_count = sc.images().len();
+            let depths = Self::make_depth_images(
+                &state.device,
+                sc.extent(),
+                depth_format,
+                image_count,
+            )?;
+            // SAFETY: depth_images has the same length as the
+            // swapchain image count; swapchain takes ownership.
+            unsafe {
+                sc.create_framebuffers(render_pass.raw_render_pass(), depths)
+            }?;
+            let sems = Self::make_render_finished_semaphores(
+                &state.device,
+                image_count,
+            )?;
+            (Some(sc), Some(sems))
         };
 
-        let depth_format = state
-            .device
-            .find_depth_format(DEPTH_FORMAT_CANDIDATES)
-            .ok_or_else(|| eyre::eyre!("No supported depth format found"))?;
-
-        // Reuse the existing pipeline when the swapchain honored the
-        // preferred format. Recreate it only if the surface forced a
-        // different format.
-        let swapchain_format = swapchain.as_ref().map(|sc| sc.format());
-        let (pipeline, pipeline_color_format) =
-            if let Some(new_format) = swapchain_format {
-                if new_format == state.pipeline_color_format {
-                    (state.pipeline, state.pipeline_color_format)
-                } else {
-                    tracing::debug!(
-                        "Swapchain format changed on resume \
-                     ({:?} -> {:?}); recreating pipeline",
-                        state.pipeline_color_format,
-                        new_format,
-                    );
-                    let pipeline = {
-                        let _span = tracing::trace_span!(
-                            "pipeline_create",
-                            color_format = ?new_format,
-                        )
-                        .entered();
-                        build_pipeline(
-                            &state.device,
-                            &state.shader,
-                            new_format,
-                            depth_format,
-                            Some(Arc::clone(&state.pipeline_layout)),
-                            Some({
-                                let idx = debug_counters.next_pipeline();
-                                move || format!("main pipeline {idx}")
-                            }),
-                        )?
-                    };
-                    (pipeline, new_format)
-                }
-            } else {
-                (state.pipeline, state.pipeline_color_format)
-            };
-
-        let render_finished_semaphores = swapchain
-            .as_ref()
-            .map(|sc| {
-                Self::make_render_finished_semaphores(
-                    &state.device,
-                    sc.images().len(),
-                )
-            })
-            .transpose()?;
-
-        let depth_images = swapchain
-            .as_ref()
-            .map(|sc| {
-                Self::make_depth_images(
-                    &state.device,
-                    sc.extent(),
-                    depth_format,
-                )
-            })
-            .transpose()?
-            .unwrap_or_default();
-
-        // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
+        // SAFETY: guard will call wait_idle in Drop. Must not be
+        // forgotten.
         let idle_guard = unsafe {
             RunningStateTransitionGuard::new(Arc::clone(&state.device))
         };
@@ -1861,9 +1674,9 @@ impl AppRunner {
             _surface: surface,
             swapchain,
             render_finished_semaphores,
-            depth_images,
             depth_format,
             shader: state.shader,
+            render_pass,
             pipeline,
             vertex_buffer: state.vertex_buffer,
             index_buffer: state.index_buffer,
@@ -1885,8 +1698,8 @@ impl AppRunner {
     }
 
     fn recreate_swapchain_if_needed(
-        running_state: &mut RunningState,
-        desired_extent: rgpu_vk::ash::vk::Extent2D,
+        state: &mut RunningState,
+        desired_extent: vk::Extent2D,
     ) -> bool {
         if desired_extent.width == 0 || desired_extent.height == 0 {
             let _span = tracing::trace_span!(
@@ -1895,7 +1708,7 @@ impl AppRunner {
                 height = desired_extent.height,
             )
             .entered();
-            if let Err(e) = running_state.device.wait_idle() {
+            if let Err(e) = state.device.wait_idle() {
                 tracing::error!(
                     "Error while waiting for device idle on zero \
                      extent: {}",
@@ -1903,14 +1716,13 @@ impl AppRunner {
                 );
                 return false;
             }
-            running_state.swapchain = None;
-            running_state.render_finished_semaphores = None;
-            running_state.depth_images = Vec::new();
+            state.swapchain = None;
+            state.render_finished_semaphores = None;
             return true;
         }
 
-        if let Some(existing_swapchain) = running_state.swapchain.as_ref()
-            && existing_swapchain.extent() == desired_extent
+        if let Some(existing_sc) = state.swapchain.as_ref()
+            && existing_sc.extent() == desired_extent
         {
             tracing::trace!(
                 "Skipping swapchain recreate because extent is \
@@ -1931,7 +1743,7 @@ impl AppRunner {
         // Wait for all GPU work to complete before dropping the old
         // swapchain. Image views (and framebuffers in noext) must not
         // be destroyed while in-flight commands still reference them.
-        if let Err(e) = running_state.device.wait_idle() {
+        if let Err(e) = state.device.wait_idle() {
             tracing::error!(
                 "Error waiting for device idle before swapchain \
                  recreation: {}",
@@ -1940,119 +1752,138 @@ impl AppRunner {
             return false;
         }
 
-        running_state.swapchain.take();
+        state.swapchain.take();
 
-        let sc_idx = running_state.debug_counters.next_swapchain();
-        match Swapchain::new(
-            &running_state.device,
-            &running_state._surface,
+        let sc_idx = state.debug_counters.next_swapchain();
+        let sc_result = Swapchain::new(
+            &state.device,
+            &state._surface,
             desired_extent,
             true,
-            Some(running_state.pipeline_color_format),
+            Some(state.pipeline_color_format),
             Some(move || format!("Swapchain {sc_idx}")),
-        ) {
-            Ok(swapchain) => {
-                tracing::trace!(
-                    "Swapchain recreation succeeded for extent: {}x{}",
-                    desired_extent.width,
-                    desired_extent.height
-                );
-                let new_format = swapchain.format();
-                let new_extent = swapchain.extent();
-                let new_image_count = swapchain.images().len();
-                running_state.swapchain = Some(Arc::new(swapchain));
+        );
 
-                match Self::make_render_finished_semaphores(
-                    &running_state.device,
-                    new_image_count,
-                ) {
-                    Ok(sems) => {
-                        running_state.render_finished_semaphores = Some(sems);
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Error recreating render-finished \
-                             semaphores: {}",
-                            e
-                        );
-                        return false;
-                    }
-                }
-
-                match Self::make_depth_images(
-                    &running_state.device,
-                    new_extent,
-                    running_state.depth_format,
-                ) {
-                    Ok(images) => {
-                        running_state.depth_images = images;
-                    }
-                    Err(e) => {
-                        tracing::error!("Error recreating depth images: {}", e);
-                        return false;
-                    }
-                }
-
-                if new_format != running_state.pipeline_color_format {
-                    tracing::debug!(
-                        "Swapchain format changed on resize \
-                         ({:?} -> {:?}); recreating pipeline",
-                        running_state.pipeline_color_format,
-                        new_format,
-                    );
-                    let _span = tracing::trace_span!(
-                        "pipeline_create",
-                        color_format = ?new_format,
-                    )
-                    .entered();
-                    match build_pipeline(
-                        &running_state.device,
-                        &running_state.shader,
-                        new_format,
-                        running_state.depth_format,
-                        Some(Arc::clone(&running_state.pipeline_layout)),
-                        Some({
-                            let idx =
-                                running_state.debug_counters.next_pipeline();
-                            move || format!("main pipeline {idx}")
-                        }),
-                    ) {
-                        Ok(pipeline) => {
-                            running_state.pipeline = pipeline;
-                            running_state.pipeline_color_format = new_format;
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Error recreating pipeline after \
-                                 format change: {}",
-                                e
-                            );
-                            return false;
-                        }
-                    }
-                }
-
-                true
-            }
+        let mut sc = match sc_result {
+            Ok(sc) => sc,
             Err(e) => {
                 tracing::error!("Error while recreating swapchain: {}", e);
-                false
+                return false;
             }
+        };
+
+        tracing::trace!(
+            "Swapchain recreation succeeded for extent: {}x{}",
+            desired_extent.width,
+            desired_extent.height
+        );
+
+        let new_format = sc.format();
+        let new_extent = sc.extent();
+        let image_count = sc.images().len();
+
+        // Recreate render pass and pipeline if format changed.
+        if new_format != state.pipeline_color_format {
+            tracing::debug!(
+                "Swapchain format changed on resize \
+                 ({:?} -> {:?}); recreating render pass and pipeline",
+                state.pipeline_color_format,
+                new_format,
+            );
+            let new_rp = match build_render_pass(
+                &state.device,
+                new_format,
+                state.depth_format,
+            ) {
+                Ok(rp) => rp,
+                Err(e) => {
+                    tracing::error!(
+                        "Error recreating render pass after format \
+                         change: {}",
+                        e
+                    );
+                    return false;
+                }
+            };
+            let new_pipeline = match build_pipeline(
+                &state.device,
+                &state.shader,
+                &new_rp,
+                Some(Arc::clone(&state.pipeline_layout)),
+                Some({
+                    let idx = state.debug_counters.next_pipeline();
+                    move || format!("main pipeline {idx}")
+                }),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        "Error recreating pipeline after format \
+                         change: {}",
+                        e
+                    );
+                    return false;
+                }
+            };
+            state.render_pass = new_rp;
+            state.pipeline = new_pipeline;
+            state.pipeline_color_format = new_format;
         }
+
+        // Create depth images per swapchain image.
+        let depths = match Self::make_depth_images(
+            &state.device,
+            new_extent,
+            state.depth_format,
+            image_count,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!("Error recreating depth images: {}", e);
+                return false;
+            }
+        };
+
+        // SAFETY: depth_images has the same length as the swapchain
+        // image count; swapchain takes ownership.
+        if let Err(e) = unsafe {
+            sc.create_framebuffers(state.render_pass.raw_render_pass(), depths)
+        } {
+            tracing::error!("Error creating framebuffers: {}", e);
+            return false;
+        }
+
+        let sems = match Self::make_render_finished_semaphores(
+            &state.device,
+            image_count,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    "Error recreating render-finished semaphores: {}",
+                    e
+                );
+                return false;
+            }
+        };
+
+        state.render_finished_semaphores = Some(sems);
+        state.swapchain = Some(sc);
+        true
     }
 
     fn desired_extent_for_event(
         win: &WinitWindow,
         window_event: &WindowEvent,
-    ) -> Option<rgpu_vk::ash::vk::Extent2D> {
+    ) -> Option<vk::Extent2D> {
         match window_event {
-            WindowEvent::Resized(size) => Some(rgpu_vk::ash::vk::Extent2D {
+            WindowEvent::Resized(size) => Some(vk::Extent2D {
                 width: size.width,
                 height: size.height,
             }),
             WindowEvent::ScaleFactorChanged { .. } => {
                 let size = win.inner_size();
-                Some(rgpu_vk::ash::vk::Extent2D {
+                Some(vk::Extent2D {
                     width: size.width,
                     height: size.height,
                 })
@@ -2083,179 +1914,74 @@ impl AppRunner {
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) {
-        if let Some(running_state) = self.take_running() {
-            // _idle_guard drops first (first field), calling wait_idle before
-            // the swapchain, frames, semaphores, and fences are freed.
-            drop(running_state);
+        if self.take_running().is_some() {
+            // _idle_guard drops first (first field), calling wait_idle
+            // before all other resources are freed.
             self.transition_to_exiting("Running", event_loop);
-        } else {
-            tracing::warn!(
-                "Requested Running -> Exiting transition \
-                 while not in Running state"
-            );
-            event_loop.exit();
         }
-    }
-
-    fn is_running_window(&self, window_id: winit::window::WindowId) -> bool {
-        if let Some(running_state) = self.as_running()
-            && window_id == running_state.win.id()
-        {
-            true
-        } else {
-            false
-        }
-    }
-
-    fn is_initializing(&self) -> bool {
-        assert!(self.0.is_some());
-        matches!(self.0, Some(App::Initializing(_)))
     }
 
     fn take_initializing(&mut self) -> Option<InitializingState> {
-        assert!(self.0.is_some());
-        if matches!(self.0, Some(App::Initializing(_))) {
-            match self.0.take() {
-                Some(App::Initializing(s)) => Some(s),
-                _ => unreachable!(),
+        match self.0.take()? {
+            App::Initializing(s) => Some(s),
+            other => {
+                self.0 = Some(other);
+                None
             }
-        } else {
-            None
         }
-    }
-
-    fn as_initializing(&self) -> Option<&InitializingState> {
-        assert!(self.0.is_some());
-        match &self.0 {
-            Some(App::Initializing(s)) => Some(s),
-            _ => None,
-        }
-    }
-
-    fn as_initializing_mut(&mut self) -> Option<&mut InitializingState> {
-        assert!(self.0.is_some());
-        match &mut self.0 {
-            Some(App::Initializing(s)) => Some(s),
-            _ => None,
-        }
-    }
-
-    fn set_initializing(&mut self, state: InitializingState) {
-        assert!(self.0.is_none());
-        self.0 = Some(App::Initializing(state));
-    }
-
-    fn is_running(&self) -> bool {
-        assert!(self.0.is_some());
-        matches!(self.0, Some(App::Running(_)))
     }
 
     fn take_running(&mut self) -> Option<RunningState> {
-        assert!(self.0.is_some());
-        if matches!(self.0, Some(App::Running(_))) {
-            match self.0.take() {
-                Some(App::Running(s)) => Some(s),
-                _ => unreachable!(),
+        match self.0.take()? {
+            App::Running(s) => Some(s),
+            other => {
+                self.0 = Some(other);
+                None
             }
-        } else {
-            None
+        }
+    }
+
+    fn take_suspended(&mut self) -> Option<SuspendedState> {
+        match self.0.take()? {
+            App::Suspended(s) => Some(s),
+            other => {
+                self.0 = Some(other);
+                None
+            }
         }
     }
 
     fn as_running(&self) -> Option<&RunningState> {
-        assert!(self.0.is_some());
-        match &self.0 {
-            Some(App::Running(s)) => Some(s),
+        match self.0.as_ref()? {
+            App::Running(s) => Some(s),
             _ => None,
         }
     }
 
     fn as_running_mut(&mut self) -> Option<&mut RunningState> {
-        assert!(self.0.is_some());
-        match &mut self.0 {
-            Some(App::Running(s)) => Some(s),
+        match self.0.as_mut()? {
+            App::Running(s) => Some(s),
             _ => None,
         }
     }
 
     fn set_running(&mut self, state: RunningState) {
-        assert!(self.0.is_none());
         self.0 = Some(App::Running(state));
     }
 
-    fn is_suspended(&self) -> bool {
-        assert!(self.0.is_some());
-        matches!(self.0, Some(App::Suspended(_)))
-    }
-
-    fn take_suspended(&mut self) -> Option<SuspendedState> {
-        assert!(self.0.is_some());
-        if matches!(self.0, Some(App::Suspended(_))) {
-            match self.0.take() {
-                Some(App::Suspended(s)) => Some(s),
-                _ => unreachable!(),
-            }
-        } else {
-            None
-        }
-    }
-
-    fn as_suspended(&self) -> Option<&SuspendedState> {
-        assert!(self.0.is_some());
-        match &self.0 {
-            Some(App::Suspended(s)) => Some(s),
-            _ => None,
-        }
-    }
-
-    fn as_suspended_mut(&mut self) -> Option<&mut SuspendedState> {
-        assert!(self.0.is_some());
-        match &mut self.0 {
-            Some(App::Suspended(s)) => Some(s),
-            _ => None,
-        }
-    }
-
     fn set_suspended(&mut self, state: SuspendedState) {
-        assert!(self.0.is_none());
         self.0 = Some(App::Suspended(state));
     }
 
-    fn is_exiting(&self) -> bool {
-        assert!(self.0.is_some());
-        matches!(self.0, Some(App::Exiting(_)))
-    }
-
-    fn take_exiting(&mut self) -> Option<ExitingState> {
-        assert!(self.0.is_some());
-        if matches!(self.0, Some(App::Exiting(_))) {
-            match self.0.take() {
-                Some(App::Exiting(s)) => Some(s),
-                _ => unreachable!(),
-            }
-        } else {
-            None
-        }
-    }
-
-    fn as_exiting(&self) -> Option<&ExitingState> {
-        assert!(self.0.is_some());
-        match &self.0 {
-            Some(App::Exiting(s)) => Some(s),
-            _ => None,
-        }
-    }
-
-    fn as_exiting_mut(&mut self) -> Option<&mut ExitingState> {
-        assert!(self.0.is_some());
-        match &mut self.0 {
-            Some(App::Exiting(s)) => Some(s),
-            _ => None,
-        }
-    }
-
     fn set_exiting(&mut self, state: ExitingState) {
-        assert!(self.0.is_none());
         self.0 = Some(App::Exiting(state));
+    }
+
+    fn is_running_window(&self, window_id: winit::window::WindowId) -> bool {
+        self.as_running().is_some_and(|s| s.win.id() == window_id)
+    }
+
+    fn is_exiting(&self) -> bool {
+        matches!(self.0, Some(App::Exiting(_)))
     }
 }

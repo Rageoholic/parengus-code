@@ -16,7 +16,8 @@
 //!     ├── Sampler
 //!     ├── DescriptorSetLayout → DescriptorPool → DescriptorSet
 //!     ├── PipelineLayout (with DescriptorSetLayout refs)
-//!     ├── ShaderModule → EntryPoint → DynamicPipeline
+//!     ├── ShaderModule → EntryPoint → DynamicPipeline / RenderPassPipeline
+//!     ├── RenderPass (classic Vulkan render pass)
 //!     ├── ResettableCommandPool → ResettableCommandBuffer
 //!     └── Fence / Semaphore
 //! ```
@@ -42,6 +43,7 @@ pub mod image;
 pub mod instance;
 pub mod memory;
 pub mod pipeline;
+pub mod renderpass;
 pub mod sampler;
 pub mod shader;
 pub mod surface;

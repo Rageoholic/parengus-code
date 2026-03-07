@@ -1,12 +1,12 @@
 mod assets;
 
 use std::{
-    env,
-    ffi::OsStr,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
 };
+
+use asset_pipeline::{AssetType, Manifest};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -57,6 +57,11 @@ fn all_tasks() -> Vec<Task> {
             run: cargo_build,
         },
         Task {
+            name: "cargo-build-noext",
+            deps: &[],
+            run: cargo_build_noext,
+        },
+        Task {
             name: "compile-shaders",
             deps: &[],
             run: compile_shaders,
@@ -67,9 +72,19 @@ fn all_tasks() -> Vec<Task> {
             run: copy_exe,
         },
         Task {
+            name: "copy-exe-noext",
+            deps: &["cargo-build-noext"],
+            run: copy_exe_noext,
+        },
+        Task {
             name: "copy-assets",
-            deps: &[],
+            deps: &["compile-shaders"],
             run: copy_assets,
+        },
+        Task {
+            name: "copy-assets-noext",
+            deps: &["compile-shaders"],
+            run: copy_assets_noext,
         },
         Task {
             name: "build",
@@ -79,6 +94,21 @@ fn all_tasks() -> Vec<Task> {
                 "copy-exe",
                 "copy-assets",
             ],
+            run: noop,
+        },
+        Task {
+            name: "build-noext",
+            deps: &[
+                "cargo-build-noext",
+                "compile-shaders",
+                "copy-exe-noext",
+                "copy-assets-noext",
+            ],
+            run: noop,
+        },
+        Task {
+            name: "build-all",
+            deps: &["build", "build-noext"],
             run: noop,
         },
     ]
@@ -203,66 +233,6 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn cargo_build() -> Result<()> {
-    let root = workspace_root();
-    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    run(Command::new(cargo)
-        .args(["build", "-p", "samp-app"])
-        .current_dir(&root))
-}
-
-fn compile_shaders() -> Result<()> {
-    let root = workspace_root();
-    let src_dir = root.join("samp-app").join("shaders");
-    let out_dir = root
-        .join("out")
-        .join("samp-app")
-        .join("debug")
-        .join("shaders");
-    fs::create_dir_all(&out_dir)?;
-
-    // (output suffix, extra slangc args)
-    let variants: &[(&str, &[&str])] = &[("", &[]), (".debug", &["-g"])];
-
-    let mut compiled = 0u32;
-    let mut skipped = 0u32;
-
-    for entry in fs::read_dir(&src_dir)? {
-        let entry = entry?;
-        let src = entry.path();
-        if src.extension() != Some(OsStr::new("slang")) {
-            continue;
-        }
-        let stem = src.file_stem().unwrap().to_string_lossy().into_owned();
-
-        for &(suffix, extra_args) in variants {
-            let dst = out_dir.join(format!("{stem}{suffix}.spv"));
-
-            if is_up_to_date(&src, &dst) {
-                skipped += 1;
-                continue;
-            }
-
-            println!(
-                "Compiling {} -> {}",
-                src.file_name().unwrap().to_string_lossy(),
-                dst.file_name().unwrap().to_string_lossy(),
-            );
-
-            run(Command::new("slangc")
-                .arg(&src)
-                .args(["-target", "spirv", "-o"])
-                .arg(&dst)
-                .args(extra_args))?;
-
-            compiled += 1;
-        }
-    }
-
-    println!("Shaders: {compiled} compiled, {skipped} up-to-date");
-    Ok(())
-}
-
 fn copy_if_changed(src: &Path, dst: &Path) -> Result<bool> {
     if is_up_to_date(src, dst) {
         return Ok(false);
@@ -271,13 +241,23 @@ fn copy_if_changed(src: &Path, dst: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn copy_exe() -> Result<()> {
+// ---- Per-app helpers --------------------------------------------
+
+fn cargo_build_pkg(pkg: &str) -> Result<()> {
     let root = workspace_root();
-    let out_dir = root.join("out").join("samp-app").join("debug");
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    run(Command::new(cargo)
+        .args(["build", "-p", pkg])
+        .current_dir(&root))
+}
+
+fn copy_exe_for(app_name: &str) -> Result<()> {
+    let root = workspace_root();
+    let out_dir = root.join("out").join(app_name).join("debug");
     fs::create_dir_all(&out_dir)?;
 
     let exe_suffix = env::consts::EXE_SUFFIX;
-    let exe_name = format!("samp-app{exe_suffix}");
+    let exe_name = format!("{app_name}{exe_suffix}");
     let src_exe = root.join("target").join("debug").join(&exe_name);
     let dst_exe = out_dir.join(&exe_name);
 
@@ -289,24 +269,95 @@ fn copy_exe() -> Result<()> {
 
     #[cfg(windows)]
     {
-        let src_pdb = root.join("target").join("debug").join("samp_app.pdb");
-        let dst_pdb = out_dir.join("samp_app.pdb");
+        let pdb_name = format!("{}.pdb", app_name.replace('-', "_"));
+        let src_pdb = root.join("target").join("debug").join(&pdb_name);
+        let dst_pdb = out_dir.join(&pdb_name);
         copy_if_changed(&src_pdb, &dst_pdb)?;
     }
 
     Ok(())
 }
 
-fn copy_assets() -> Result<()> {
+fn copy_assets_for(app_name: &str) -> Result<()> {
     let root = workspace_root();
     assets::copy_assets(
         &root.join("assets").join("manifest.toml"),
-        &root.join("samp-app").join("src").join("assets.toml"),
+        &root.join(app_name).join("src").join("assets.toml"),
         &root.join("assets"),
-        &root
-            .join("out")
-            .join("samp-app")
-            .join("debug")
-            .join("assets"),
+        &root.join("cache").join("shaders"),
+        &root.join("out").join(app_name).join("debug").join("assets"),
     )
+}
+
+// ---- Task entry points ------------------------------------------
+
+fn cargo_build() -> Result<()> {
+    cargo_build_pkg("samp-app")
+}
+
+fn cargo_build_noext() -> Result<()> {
+    cargo_build_pkg("samp-app-noext")
+}
+
+fn compile_shaders() -> Result<()> {
+    let root = workspace_root();
+    let assets_dir = root.join("assets");
+    let cache_dir = root.join("cache").join("shaders");
+    fs::create_dir_all(&cache_dir)?;
+
+    let manifest: Manifest =
+        toml::from_str(&fs::read_to_string(assets_dir.join("manifest.toml"))?)?;
+
+    let mut compiled = 0u32;
+    let mut skipped = 0u32;
+
+    for entry in &manifest.asset {
+        if entry.asset_type != AssetType::Shader {
+            continue;
+        }
+        let Some(source_file) = &entry.source_file else {
+            continue;
+        };
+
+        let src = assets_dir.join(source_file);
+        let dst = cache_dir.join(&entry.file);
+
+        if is_up_to_date(&src, &dst) {
+            skipped += 1;
+            continue;
+        }
+
+        println!(
+            "Compiling {} -> {}",
+            source_file.display(),
+            entry.file.display(),
+        );
+
+        run(Command::new("slangc")
+            .arg(&src)
+            .args(["-target", "spirv", "-o"])
+            .arg(&dst)
+            .args(&entry.compile_args))?;
+
+        compiled += 1;
+    }
+
+    println!("Shaders: {compiled} compiled, {skipped} up-to-date");
+    Ok(())
+}
+
+fn copy_exe() -> Result<()> {
+    copy_exe_for("samp-app")
+}
+
+fn copy_exe_noext() -> Result<()> {
+    copy_exe_for("samp-app-noext")
+}
+
+fn copy_assets() -> Result<()> {
+    copy_assets_for("samp-app")
+}
+
+fn copy_assets_noext() -> Result<()> {
+    copy_assets_for("samp-app-noext")
 }

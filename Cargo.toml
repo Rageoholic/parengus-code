@@ -1,4 +1,4 @@
 [workspace]
-members = ["asset-pipeline", "rgpu-vk", "samp-app", "xtask"]
-default-members = ["rgpu-vk", "samp-app"]
+members = ["asset-pipeline", "rgpu-vk", "samp-app", "samp-app-noext", "xtask"]
+default-members = ["rgpu-vk", "samp-app", "samp-app-noext"]
 resolver = "3"

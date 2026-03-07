@@ -422,6 +422,67 @@ impl ResettableCommandBuffer {
         unsafe { self.parent.cmd_end_raw_rendering(self.handle) }
     }
 
+    /// Record an old-style pipeline barrier (`vkCmdPipelineBarrier`).
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state. All handles and
+    /// image layouts in `image_memory_barriers` must be valid and
+    /// consistent with current state.
+    pub unsafe fn pipeline_barrier(
+        &mut self,
+        src_stage_mask: vk::PipelineStageFlags,
+        dst_stage_mask: vk::PipelineStageFlags,
+        dependency_flags: vk::DependencyFlags,
+        image_memory_barriers: &[vk::ImageMemoryBarrier<'_>],
+    ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
+        // SAFETY: Caller guarantees recording state and
+        // barrier validity.
+        unsafe {
+            self.parent.cmd_pipeline_barrier(
+                self.handle,
+                src_stage_mask,
+                dst_stage_mask,
+                dependency_flags,
+                image_memory_barriers,
+            )
+        }
+    }
+
+    /// Begin a render pass.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state. All objects
+    /// referenced by `render_pass_begin` must be valid and derived
+    /// from the same device as this buffer.
+    pub unsafe fn begin_render_pass(
+        &mut self,
+        render_pass_begin: &vk::RenderPassBeginInfo<'_>,
+        contents: vk::SubpassContents,
+    ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
+        // SAFETY: Caller guarantees recording state and
+        // render_pass_begin validity.
+        unsafe {
+            self.parent.cmd_begin_render_pass(
+                self.handle,
+                render_pass_begin,
+                contents,
+            )
+        }
+    }
+
+    /// End the current render pass.
+    ///
+    /// # Safety
+    /// The buffer must be inside a render pass begun with
+    /// [`begin_render_pass`](Self::begin_render_pass).
+    pub unsafe fn end_render_pass(&mut self) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
+        // SAFETY: Caller guarantees active render pass state.
+        unsafe { self.parent.cmd_end_render_pass(self.handle) }
+    }
+
     /// Bind a graphics pipeline for subsequent draw commands.
     ///
     /// # Safety

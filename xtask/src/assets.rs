@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use asset_pipeline::{AppAssets, AssetMap, Manifest, ManifestEntry};
+use asset_pipeline::{AppAssets, AssetMap, AssetType, Manifest, ManifestEntry};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -12,6 +12,7 @@ pub(crate) fn copy_assets(
     manifest_path: &Path,
     app_assets_path: &Path,
     assets_src_dir: &Path,
+    shader_cache_dir: &Path,
     dst_dir: &Path,
 ) -> Result<()> {
     let manifest: Manifest =
@@ -44,7 +45,17 @@ pub(crate) fn copy_assets(
             .into());
         }
 
-        let src = assets_src_dir.join(&entry.file);
+        let src = match entry.asset_type {
+            AssetType::Image => assets_src_dir.join(&entry.file),
+            AssetType::Shader => shader_cache_dir.join(&entry.file),
+            _ => {
+                return Err(format!(
+                    "asset `{}`: unsupported type `{}`",
+                    req.name, entry.asset_type,
+                )
+                .into());
+            }
+        };
         let dst = dst_dir.join(&entry.file);
 
         if is_up_to_date(&src, &dst) {

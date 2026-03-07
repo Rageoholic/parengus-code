@@ -405,8 +405,8 @@ impl DeviceLocalImage {
         self.inner.format
     }
 
-    /// Record the commands to upload pixel data from a staging buffer to this
-    /// image in `command_buffer`.
+    /// Record the commands to upload pixel data from a staging buffer to
+    /// this image in `command_buffer` using VK 1.0 core barriers.
     ///
     /// Records:
     /// - barrier: `UNDEFINED` → `TRANSFER_DST_OPTIMAL`
@@ -418,13 +418,121 @@ impl DeviceLocalImage {
     ///
     /// # Safety
     /// - `command_buffer` must be in the recording state.
-    /// - `src` must be created with `TRANSFER_SRC` usage and contain exactly
-    ///   `width * height * bytes_per_pixel` bytes of packed pixel data.
+    /// - `src` must be created with `TRANSFER_SRC` usage and contain
+    ///   exactly `width * height * bytes_per_pixel` bytes of packed
+    ///   pixel data.
     /// - `self` must be created with at least `TRANSFER_DST | SAMPLED`
     ///   usage.
     /// - The caller must ensure `src` and `self` remain alive until GPU
     ///   execution of the submitted commands has completed.
     pub(crate) unsafe fn record_upload_from(
+        &self,
+        command_buffer: &mut ResettableCommandBuffer,
+        src: &HostVisibleBuffer,
+    ) -> Result<(), RecordCopyFromError> {
+        debug_assert_eq!(
+            command_buffer.state(),
+            crate::command::CommandBufferState::Recording
+        );
+        let texel_size = format_texel_size(self.inner.format)
+            .ok_or(RecordCopyFromError::UnknownFormat(self.inner.format))?;
+        let extent = self.inner.extent;
+        let required = u64::from(extent.width)
+            * u64::from(extent.height)
+            * u64::from(extent.depth)
+            * u64::from(texel_size);
+        let actual = src.size();
+        if actual < required {
+            return Err(RecordCopyFromError::StagingTooSmall {
+                required,
+                actual,
+            });
+        }
+
+        let raw_cmd = command_buffer.raw_command_buffer();
+        let device = &self.inner.parent;
+        let image = self.inner.handle;
+
+        let subresource_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+
+        // Barrier: UNDEFINED → TRANSFER_DST_OPTIMAL
+        let to_transfer = crate::memory::image_barrier()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(image)
+            .subresource_range(subresource_range);
+        // SAFETY: caller guarantees recording state; image is valid.
+        unsafe {
+            device.cmd_pipeline_barrier(
+                raw_cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&to_transfer),
+            )
+        };
+
+        // Copy buffer → image
+        let subresource_layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .base_array_layer(0)
+            .layer_count(1);
+        let copy_region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(subresource_layers)
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(extent);
+        // SAFETY: caller guarantees recording state; src buffer and
+        // image are valid and in the correct layouts.
+        unsafe {
+            device.cmd_copy_buffer_to_image(
+                raw_cmd,
+                src.raw_buffer(),
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&copy_region),
+            )
+        };
+
+        // Barrier: TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
+        let to_shader = crate::memory::image_barrier()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(image)
+            .subresource_range(subresource_range);
+        // SAFETY: caller guarantees recording state; image is valid.
+        unsafe {
+            device.cmd_pipeline_barrier(
+                raw_cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                std::slice::from_ref(&to_shader),
+            )
+        };
+
+        Ok(())
+    }
+
+    /// Like [`record_upload_from`] but uses synchronization2 barriers
+    /// (`vkCmdPipelineBarrier2`). Requires `synchronization2` to be
+    /// enabled in [`DeviceConfig`].
+    ///
+    /// # Safety
+    /// Same preconditions as [`record_upload_from`].
+    pub(crate) unsafe fn record_upload_from2(
         &self,
         command_buffer: &mut ResettableCommandBuffer,
         src: &HostVisibleBuffer,
@@ -661,23 +769,24 @@ impl Texture {
         Ok(Self { view, image })
     }
 
-    /// Record the commands to upload pixel data from a staging buffer to this
-    /// texture into `command_buffer`.
+    /// Record upload commands using VK 1.0 core barriers.
     ///
     /// Records a layout transition to `TRANSFER_DST_OPTIMAL`, copies the
-    /// buffer, then transitions to `SHADER_READ_ONLY_OPTIMAL`. The caller is
-    /// responsible for begin/end/submit and CPU/GPU synchronization.
+    /// buffer, then transitions to `SHADER_READ_ONLY_OPTIMAL`. The caller
+    /// is responsible for begin/end/submit and CPU/GPU synchronization.
     ///
-    /// Returns [`RecordCopyFromError::UnknownFormat`] if the texel size cannot
-    /// be determined for the texture's format, or
-    /// [`RecordCopyFromError::StagingTooSmall`] if `src` is smaller than the
-    /// image requires.
+    /// Returns [`RecordCopyFromError::UnknownFormat`] if the texel size
+    /// cannot be determined, or [`RecordCopyFromError::StagingTooSmall`]
+    /// if `src` is smaller than the image requires.
     ///
     /// # Safety
+    ///
     /// - `command_buffer` must be in the recording state.
-    /// - `src` must be created with `TRANSFER_SRC` usage.
-    /// - `self` must have been created with at least `TRANSFER_DST | SAMPLED`
-    ///   usage.
+    /// - `src` must be created with `TRANSFER_SRC` usage and contain
+    ///   exactly `width * height * bytes_per_pixel` bytes of packed
+    ///   pixel data.
+    /// - `self` must have been created with at least
+    ///   `TRANSFER_DST | SAMPLED` usage.
     /// - The caller must ensure `src` and `self` remain alive until GPU
     ///   execution of the submitted commands has completed.
     pub unsafe fn record_copy_from(
@@ -687,6 +796,20 @@ impl Texture {
     ) -> Result<(), RecordCopyFromError> {
         // SAFETY: caller upholds the same preconditions.
         unsafe { self.image.record_upload_from(command_buffer, src) }
+    }
+
+    /// Like [`record_copy_from`] but uses synchronization2 barriers.
+    /// Requires `synchronization2` to be enabled in [`DeviceConfig`].
+    ///
+    /// # Safety
+    /// Same preconditions as [`record_copy_from`].
+    pub unsafe fn record_copy_from2(
+        &self,
+        command_buffer: &mut ResettableCommandBuffer,
+        src: &HostVisibleBuffer,
+    ) -> Result<(), RecordCopyFromError> {
+        // SAFETY: caller upholds the same preconditions.
+        unsafe { self.image.record_upload_from2(command_buffer, src) }
     }
 
     /// Returns the extent of the underlying image.

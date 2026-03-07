@@ -291,6 +291,12 @@ pub struct DeviceConfig {
     pub dynamic_rendering: bool,
     pub synchronization2: bool,
     pub maintenance1: bool,
+    /// When `true`, enable `VK_KHR_shader_non_semantic_info` on
+    /// pre-1.3 devices that support it (core in 1.3, no-op on 1.3+).
+    /// Required when loading SPIR-V compiled with non-semantic debug
+    /// info (e.g. `shader.debug.spv`). Not a hard device filter:
+    /// if the extension is unavailable the field is silently ignored.
+    pub shader_non_semantic_info: bool,
     pub queue_config: QueueConfig,
     /// When `true`, [`Device::create_compatible`] returns
     /// [`CreateCompatibleError::QueueConfigUnsatisfied`] if any
@@ -450,9 +456,10 @@ impl Device {
             };
 
             // VK_KHR_shader_non_semantic_info: core in 1.3; optional
-            // on older devices.
-            let enable_shader_non_semantic =
-                is_pre_1_3 && has_ext(ash::khr::shader_non_semantic_info::NAME);
+            // on older devices when requested.
+            let enable_shader_non_semantic = config.shader_non_semantic_info
+                && is_pre_1_3
+                && has_ext(ash::khr::shader_non_semantic_info::NAME);
 
             // VK_EXT_memory_budget: optional device extension.
             // Enables accurate heap-usage/budget queries via
@@ -1498,7 +1505,7 @@ impl Device {
     }
 }
 
-// Queue submit functionality
+// Synchronization2
 impl Device {
     /// Submit work to the graphics/present queue using the
     /// synchronization2 API.
@@ -1552,12 +1559,12 @@ impl Device {
         fence: Option<&mut sync::Fence>,
         queue_index: usize,
     ) -> Result<(), QueueSubmitError> {
-        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(false) {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
             Err(QueueSubmitError::FenceNotReady)
         } else if fence
             .as_ref()
             .map(|f| f.parent().raw_device() != self.raw_device())
-            .unwrap_or(true)
+            .unwrap_or(false)
         {
             Err(QueueSubmitError::MismatchedObjects)
         } else {
@@ -1589,10 +1596,7 @@ impl Device {
             Ok(())
         }
     }
-}
 
-// Recording commands
-impl Device {
     /// Record a pipeline barrier using the synchronization2 API.
     ///
     /// # Safety
@@ -1624,7 +1628,10 @@ impl Device {
             },
         }
     }
+}
 
+// Recording commands
+impl Device {
     /// Bind a graphics pipeline for subsequent draw commands.
     ///
     /// # Safety
@@ -1830,6 +1837,126 @@ impl Device {
                 first_instance,
             )
         }
+    }
+}
+
+// Queue submission (VK 1.0 core)
+impl Device {
+    /// Submit work to the graphics/present queue using the core
+    /// Vulkan 1.0 `vkQueueSubmit` API.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be
+    /// unsignaled. `fence`, when `Some`, must be in the ready state
+    /// (unsignaled, not pending).
+    pub unsafe fn graphics_present_queue_submit(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+        queue_index: usize,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| f.parent().raw_device() != self.raw_device())
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            let queue = self
+                .graphics_present_queues
+                .get(queue_index)
+                .ok_or(QueueSubmitError::QueueIndexOutOfBounds(queue_index))?
+                .lock()
+                .expect("graphics/present queue lock poisoned");
+            // SAFETY: Caller guarantees all handle validity and state.
+            unsafe { self.handle.queue_submit(*queue, submits, raw_fence) }
+                .map_err(QueueSubmitError::SubmissionFailed)?;
+            if let Some(f) = fence {
+                // SAFETY: fence was just submitted above.
+                _ = unsafe { f.mark_submitted() };
+            }
+            Ok(())
+        }
+    }
+}
+
+// Render pass recording (VK 1.0 core)
+impl Device {
+    /// Record an old-style pipeline barrier (`vkCmdPipelineBarrier`).
+    ///
+    /// # Safety
+    /// `command_buffer` must be in the recording state. All handles
+    /// and image layouts in the barrier arrays must be valid and
+    /// consistent with the command buffer's current state.
+    pub unsafe fn cmd_pipeline_barrier(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        src_stage_mask: vk::PipelineStageFlags,
+        dst_stage_mask: vk::PipelineStageFlags,
+        dependency_flags: vk::DependencyFlags,
+        image_memory_barriers: &[vk::ImageMemoryBarrier<'_>],
+    ) {
+        // SAFETY: Caller guarantees command_buffer state and
+        // barrier validity.
+        unsafe {
+            self.handle.cmd_pipeline_barrier(
+                command_buffer,
+                src_stage_mask,
+                dst_stage_mask,
+                dependency_flags,
+                &[],
+                &[],
+                image_memory_barriers,
+            )
+        }
+    }
+
+    /// Begin a render pass (`vkCmdBeginRenderPass`).
+    ///
+    /// # Safety
+    /// `command_buffer` must be in the recording state. All objects
+    /// referenced by `render_pass_begin` must be valid and derived
+    /// from this device. The framebuffer's attachments must be in
+    /// the layouts declared in the render pass attachment
+    /// descriptions, or `UNDEFINED` when `initial_layout` is
+    /// `UNDEFINED`.
+    pub unsafe fn cmd_begin_render_pass(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        render_pass_begin: &vk::RenderPassBeginInfo<'_>,
+        contents: vk::SubpassContents,
+    ) {
+        // SAFETY: Caller guarantees command_buffer state and
+        // render_pass_begin validity.
+        unsafe {
+            self.handle.cmd_begin_render_pass(
+                command_buffer,
+                render_pass_begin,
+                contents,
+            )
+        }
+    }
+
+    /// End the current render pass (`vkCmdEndRenderPass`).
+    ///
+    /// # Safety
+    /// `command_buffer` must be in the recording state inside a
+    /// render pass begun with
+    /// [`cmd_begin_render_pass`](Self::cmd_begin_render_pass).
+    pub unsafe fn cmd_end_render_pass(
+        &self,
+        command_buffer: vk::CommandBuffer,
+    ) {
+        // SAFETY: Caller guarantees active render pass state.
+        unsafe { self.handle.cmd_end_render_pass(command_buffer) }
     }
 }
 

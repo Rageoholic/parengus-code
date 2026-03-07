@@ -1477,6 +1477,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "samp-app-noext"
+version = "0.1.0"
+dependencies = [
+ "asset-pipeline",
+ "bytemuck",
+ "clap",
+ "directories",
+ "eyre",
+ "image",
+ "rgpu-vk",
+ "supports-color",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "vek",
+ "winit",
+]
+
+[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

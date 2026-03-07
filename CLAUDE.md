@@ -10,10 +10,20 @@ git config core.hooksPath .githooks
 
 ## Structure
 - Cargo workspace with `resolver = "3"`, `edition = "2024"`
-- Members: `rgpu` (Vulkan wrapper lib using ash),
-  `samp-app` (sample app using winit)
+- Members: `rgpu-vk` (Vulkan wrapper lib using ash),
+  `samp-app` (sample app using winit),
+  `samp-app-noext` (same scene, VK 1.0 core APIs only)
 - CI: GitHub Actions at `.github/workflows/ci.yml` —
   per-package clippy + workspace build + tests
+
+## Sibling Apps: samp-app and samp-app-noext
+
+`samp-app` and `samp-app-noext` render the same scene and share the
+same structure; they differ only in which Vulkan APIs they use
+(`samp-app` uses dynamic rendering + sync2; `samp-app-noext` uses
+render passes + VK 1.0 submit). Bugs and structural patterns in one
+very likely apply to the other. When modifying either app, always
+check whether the same change is needed in its sibling.
 
 ## Coding Conventions
 - `#![deny(unsafe_op_in_unsafe_fn)]` is set — all unsafe operations
