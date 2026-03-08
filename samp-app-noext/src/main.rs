@@ -392,7 +392,7 @@ fn main() -> eyre::Result<()> {
         swapchain: true,
         dynamic_rendering: false,
         synchronization2: false,
-        maintenance1: true,
+        maintenance1: false,
         shader_non_semantic_info: true,
         queue_config: QueueConfig {
             dedicated_transfer: cli_args.dedicated_transfer.unwrap_or(true),
@@ -980,13 +980,14 @@ impl AppRunner {
         // SAFETY: inside render pass; buffer is valid.
         unsafe { frame_cmd.bind_vertex_buffer(0, &state.vertex_buffer, 0) };
 
-        // Negative height flips the viewport Y axis (VK_KHR_maintenance1).
+        // Standard Vulkan 1.0 viewport: Y points down in NDC, no
+        // VK_KHR_maintenance1 needed.
         let h = extent.height as f32;
         let viewport = vk::Viewport {
             x: 0.0,
-            y: h,
+            y: 0.0,
             width: extent.width as f32,
-            height: -h,
+            height: h,
             min_depth: 0.0,
             max_depth: 1.0,
         };
@@ -1135,7 +1136,13 @@ where
             vertex_attributes: &vertex_attributes,
             layout,
             cull_mode: CullModeFlags::BACK,
-            front_face: FrontFace::COUNTER_CLOCKWISE,
+            // Without the negative-height viewport (VK_KHR_maintenance1),
+            // Vulkan's Y-down framebuffer coordinates mean world-space CCW
+            // triangles appear CW to the rasterizer. Declaring CLOCKWISE as
+            // front-facing preserves correct back-face culling without
+            // changing the index buffer (kept CCW for consistency with
+            // samp-app, which uses the maintenance1 Y-flip).
+            front_face: FrontFace::CLOCKWISE,
             depth_test: true,
             depth_write: true,
             ..Default::default()
