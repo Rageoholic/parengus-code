@@ -174,9 +174,13 @@ fn perspective_rh_zo(
     let f = 1.0 / (fov_y * 0.5).tan();
     let a = far / (near - far);
     let b = far * near / (near - far);
+    // Negate Y to compensate for Vulkan's Y-down NDC convention.
+    // Without VK_KHR_maintenance1's negative-height viewport trick,
+    // Vulkan maps NDC Y+ to the bottom of the screen. Negating Y in
+    // the projection restores the expected Y-up orientation.
     Mat4::from_col_arrays([
         [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
+        [0.0, -f, 0.0, 0.0],
         [0.0, 0.0, a, -1.0],
         [0.0, 0.0, b, 0.0],
     ])
@@ -1136,13 +1140,10 @@ where
             vertex_attributes: &vertex_attributes,
             layout,
             cull_mode: CullModeFlags::BACK,
-            // Without the negative-height viewport (VK_KHR_maintenance1),
-            // Vulkan's Y-down framebuffer coordinates mean world-space CCW
-            // triangles appear CW to the rasterizer. Declaring CLOCKWISE as
-            // front-facing preserves correct back-face culling without
-            // changing the index buffer (kept CCW for consistency with
-            // samp-app, which uses the maintenance1 Y-flip).
-            front_face: FrontFace::CLOCKWISE,
+            // Negating Y in the projection matrix (col 1 = -f) cancels
+            // Vulkan's Y-down framebuffer convention, so world-space CCW
+            // winding remains CCW in screen space.
+            front_face: FrontFace::COUNTER_CLOCKWISE,
             depth_test: true,
             depth_write: true,
             ..Default::default()
@@ -1156,12 +1157,17 @@ impl AppRunner {
         state: InitializingState,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) -> eyre::Result<RunningState> {
-        let win = Arc::new(event_loop.create_window(
-            WindowAttributes::default().with_inner_size(LogicalSize {
-                width: 1600u32,
-                height: 900u32,
-            }),
-        )?);
+        let win = Arc::new(
+            event_loop.create_window(
+                WindowAttributes::default()
+                    .with_title("samp-app-noext")
+                    .with_visible(false)
+                    .with_inner_size(LogicalSize {
+                        width: 1600u32,
+                        height: 900u32,
+                    }),
+            )?,
+        );
 
         // SAFETY: Surface must be destroyed only after all derived
         // swapchains are destroyed and no GPU work accesses them.
@@ -1537,6 +1543,7 @@ impl AppRunner {
         // forgotten.
         let idle_guard =
             unsafe { RunningStateTransitionGuard::new(Arc::clone(&device)) };
+        win.set_visible(true);
         Ok(RunningState {
             _idle_guard: idle_guard,
             win,

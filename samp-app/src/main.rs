@@ -202,11 +202,9 @@ fn look_at_rh(
 /// The camera is assumed to look down **−Z** in view space (see
 /// [`look_at_rh`]).
 ///
-/// Uses a standard right-handed projection (positive Y up in clip space).
-/// Pair with a flipped viewport (`y = height, height = -height`,
-/// enabled by VK_KHR_maintenance1 / Vulkan 1.1) so the image appears
-/// right-side-up and CCW world-space winding maps to CCW screen-space
-/// winding without any sign baked into this matrix.
+/// Negates Y (col 1 = [0, −f, 0, 0]) to account for Vulkan's Y-down
+/// NDC convention, so world-space Y-up maps to screen top and CCW
+/// world-space winding stays CCW in framebuffer coordinates.
 fn perspective_rh_zo(
     fov_y: f32,
     aspect: f32,
@@ -229,12 +227,12 @@ fn perspective_rh_zo(
 
     // Column-major layout (vek convention, 16-scalar Mat4::new):
     //   col 0 = [ f/aspect,  0,   0,  0 ]
-    //   col 1 = [ 0,        f,   0,  0 ]
+    //   col 1 = [ 0,       -f,   0,  0 ]
     //   col 2 = [ 0,         0,   a, -1 ]  ← w_clip = -z_view
     //   col 3 = [ 0,         0,   b,  0 ]
     Mat4::from_col_arrays([
         [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
+        [0.0, -f, 0.0, 0.0],
         [0.0, 0.0, a, -1.0],
         [0.0, 0.0, b, 0.0],
     ])
@@ -481,7 +479,7 @@ fn main() -> eyre::Result<()> {
         swapchain: true,
         dynamic_rendering: true,
         synchronization2: true,
-        maintenance1: true,
+        maintenance1: false,
         shader_non_semantic_info: true,
         queue_config: QueueConfig {
             dedicated_transfer: cli_args.dedicated_transfer.unwrap_or(true),
@@ -1161,16 +1159,14 @@ impl AppRunner {
         // SAFETY: inside render pass recording; buffer is valid
         unsafe { frame_cmd.bind_vertex_buffer(0, &state.vertex_buffer, 0) };
 
-        // Negative height flips the viewport Y axis (VK_KHR_maintenance1,
-        // core since Vulkan 1.1).  This maps NDC +Y to the top of the
-        // screen, keeping the projection matrix in standard RH form and
-        // preserving CCW world-space winding as screen-space CCW.
+        // Standard Vulkan viewport; Y is already corrected in the
+        // projection matrix (col 1 = -f).
         let h = extent.height as f32;
         let viewport = vk::Viewport {
             x: 0.0,
-            y: h,
+            y: 0.0,
             width: extent.width as f32,
-            height: -h,
+            height: h,
             min_depth: 0.0,
             max_depth: 1.0,
         };
@@ -1339,12 +1335,17 @@ impl AppRunner {
         state: InitializingState,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) -> eyre::Result<RunningState> {
-        let win = Arc::new(event_loop.create_window(
-            WindowAttributes::default().with_inner_size(LogicalSize {
-                width: 1600,
-                height: 900,
-            }),
-        )?);
+        let win = Arc::new(
+            event_loop.create_window(
+                WindowAttributes::default()
+                    .with_title("samp-app")
+                    .with_visible(false)
+                    .with_inner_size(LogicalSize {
+                        width: 1600,
+                        height: 900,
+                    }),
+            )?,
+        );
 
         // SAFETY: Surface must be destroyed only after all swapchains
         // derived from it are destroyed and no GPU work accesses their
@@ -1721,6 +1722,7 @@ impl AppRunner {
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
         let idle_guard =
             unsafe { RunningStateTransitionGuard::new(Arc::clone(&device)) };
+        win.set_visible(true);
         Ok(RunningState {
             _idle_guard: idle_guard,
             win,
