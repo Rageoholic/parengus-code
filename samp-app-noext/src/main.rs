@@ -174,9 +174,13 @@ fn perspective_rh_zo(
     let f = 1.0 / (fov_y * 0.5).tan();
     let a = far / (near - far);
     let b = far * near / (near - far);
+    // Negate Y to compensate for Vulkan's Y-down NDC convention.
+    // Without VK_KHR_maintenance1's negative-height viewport trick,
+    // Vulkan maps NDC Y+ to the bottom of the screen. Negating Y in
+    // the projection restores the expected Y-up orientation.
     Mat4::from_col_arrays([
         [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
+        [0.0, -f, 0.0, 0.0],
         [0.0, 0.0, a, -1.0],
         [0.0, 0.0, b, 0.0],
     ])
@@ -392,7 +396,7 @@ fn main() -> eyre::Result<()> {
         swapchain: true,
         dynamic_rendering: false,
         synchronization2: false,
-        maintenance1: true,
+        maintenance1: false,
         shader_non_semantic_info: true,
         queue_config: QueueConfig {
             dedicated_transfer: cli_args.dedicated_transfer.unwrap_or(true),
@@ -980,13 +984,14 @@ impl AppRunner {
         // SAFETY: inside render pass; buffer is valid.
         unsafe { frame_cmd.bind_vertex_buffer(0, &state.vertex_buffer, 0) };
 
-        // Negative height flips the viewport Y axis (VK_KHR_maintenance1).
+        // Standard Vulkan 1.0 viewport: Y points down in NDC, no
+        // VK_KHR_maintenance1 needed.
         let h = extent.height as f32;
         let viewport = vk::Viewport {
             x: 0.0,
-            y: h,
+            y: 0.0,
             width: extent.width as f32,
-            height: -h,
+            height: h,
             min_depth: 0.0,
             max_depth: 1.0,
         };
@@ -1135,6 +1140,9 @@ where
             vertex_attributes: &vertex_attributes,
             layout,
             cull_mode: CullModeFlags::BACK,
+            // Negating Y in the projection matrix (col 1 = -f) cancels
+            // Vulkan's Y-down framebuffer convention, so world-space CCW
+            // winding remains CCW in screen space.
             front_face: FrontFace::COUNTER_CLOCKWISE,
             depth_test: true,
             depth_write: true,
@@ -1149,12 +1157,17 @@ impl AppRunner {
         state: InitializingState,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) -> eyre::Result<RunningState> {
-        let win = Arc::new(event_loop.create_window(
-            WindowAttributes::default().with_inner_size(LogicalSize {
-                width: 1600u32,
-                height: 900u32,
-            }),
-        )?);
+        let win = Arc::new(
+            event_loop.create_window(
+                WindowAttributes::default()
+                    .with_title("samp-app-noext")
+                    .with_visible(false)
+                    .with_inner_size(LogicalSize {
+                        width: 1600u32,
+                        height: 900u32,
+                    }),
+            )?,
+        );
 
         // SAFETY: Surface must be destroyed only after all derived
         // swapchains are destroyed and no GPU work accesses them.
@@ -1530,6 +1543,7 @@ impl AppRunner {
         // forgotten.
         let idle_guard =
             unsafe { RunningStateTransitionGuard::new(Arc::clone(&device)) };
+        win.set_visible(true);
         Ok(RunningState {
             _idle_guard: idle_guard,
             win,
