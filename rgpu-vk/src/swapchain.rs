@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use crate::device::Device;
-use crate::image::DepthImage;
+use crate::image::{DepthImage, MsaaImage};
 use crate::surface::Surface;
 
 #[derive(Debug, Error)]
@@ -203,6 +203,12 @@ pub struct Swapchain<T: HasDisplayHandle + HasWindowHandle> {
     images: Vec<vk::Image>,
     image_views: Option<Vec<vk::ImageView>>,
     framebuffers: Option<Vec<vk::Framebuffer>>,
+    /// MSAA colour images owned by the swapchain after
+    /// [`create_framebuffers`] (when MSAA is active).
+    /// Dropped after framebuffers, before color image views.
+    ///
+    /// [`create_framebuffers`]: Self::create_framebuffers
+    msaa_images: Option<Vec<MsaaImage>>,
     /// Depth images owned by the swapchain after [`create_framebuffers`].
     /// Dropped after framebuffers (their views are referenced by the
     /// framebuffers), but before color image views.
@@ -581,6 +587,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
             images,
             image_views,
             framebuffers: None,
+            msaa_images: None,
             depth_images: None,
             acquire_lock: Mutex::new(()),
         }
@@ -611,14 +618,23 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         self.image_views.as_deref()
     }
 
-    /// Create one `VkFramebuffer` per swapchain image and take
-    /// ownership of the corresponding [`DepthImage`]s.
+    /// Create one `VkFramebuffer` per swapchain image, taking optional
+    /// ownership of [`DepthImage`]s and [`MsaaImage`]s.
     ///
-    /// Each framebuffer pairs `self.image_views[i]` (color attachment)
-    /// with `depth_images[i]` (depth attachment) at `self.extent`. The
-    /// swapchain takes ownership of `depth_images`, ensuring the depth
-    /// image views cannot be destroyed while the framebuffers that
-    /// reference them are alive.
+    /// The attachment layout per framebuffer matches the render pass
+    /// created with the same configuration:
+    ///
+    /// | `msaa_images` | `depth_images` | Attachment slots |
+    /// |---|---|---|
+    /// | `None` | `None` | `[swapchain_color]` |
+    /// | `None` | `Some` | `[swapchain_color, depth]` |
+    /// | `Some` | `None` | `[msaa_color, swapchain_resolve]` |
+    /// | `Some` | `Some` | `[msaa_color, depth, swapchain_resolve]` |
+    ///
+    /// When MSAA is active the swapchain image view becomes the resolve
+    /// attachment (last slot). The swapchain takes ownership of all
+    /// provided image collections so their views remain valid for the
+    /// lifetime of the framebuffers.
     ///
     /// # Panics
     /// Panics when `create_image_views` was `false` at construction
@@ -626,35 +642,43 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
     ///
     /// # Errors
     /// Returns the first `vk::Result` error encountered; any partially
-    /// created framebuffers are destroyed before returning. The
-    /// incoming `depth_images` are dropped on any error path.
+    /// created framebuffers are destroyed before returning.
     ///
     /// # Safety
     /// - `render_pass` must be a valid handle derived from the same
     ///   device as this swapchain and must outlive all created
-    ///   framebuffers (i.e. outlive this swapchain or the next call to
-    ///   [`create_framebuffers`](Self::create_framebuffers)).
-    /// - `depth_images` must have the same length as
-    ///   [`images`](Self::images) and each element must have been
-    ///   created from the same device.
+    ///   framebuffers.
+    /// - Each non-`None` image collection must have the same length as
+    ///   [`images`](Self::images) and be created from the same device.
     pub unsafe fn create_framebuffers(
         &mut self,
         render_pass: vk::RenderPass,
-        depth_images: Vec<DepthImage>,
+        depth_images: Option<Vec<DepthImage>>,
+        msaa_images: Option<Vec<MsaaImage>>,
     ) -> Result<(), vk::Result> {
         let color_views = self
             .image_views
             .as_deref()
             .expect("create_framebuffers requires image views");
+        let n = color_views.len();
 
-        debug_assert_eq!(
-            color_views.len(),
-            depth_images.len(),
-            "depth_images length must match swapchain image count"
-        );
+        if let Some(ref d) = depth_images {
+            debug_assert_eq!(
+                d.len(),
+                n,
+                "depth_images length must match swapchain image count"
+            );
+        }
+        if let Some(ref m) = msaa_images {
+            debug_assert_eq!(
+                m.len(),
+                n,
+                "msaa_images length must match swapchain image count"
+            );
+        }
 
         // Destroy any previously created framebuffers (they reference
-        // both color views and the old depth image views).
+        // color views, depth views, and MSAA views).
         for fb in self.framebuffers.take().into_iter().flatten() {
             // SAFETY: fb was created from parent_device and is no
             // longer referenced.
@@ -664,16 +688,31 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
                     .destroy_framebuffer(fb, None)
             };
         }
-        // Drop previous depth images after the framebuffers that
+        // Drop previous aux images after the framebuffers that
         // referenced their views have been destroyed.
+        self.msaa_images = None;
         self.depth_images = None;
 
-        let mut framebuffers: Vec<vk::Framebuffer> =
-            Vec::with_capacity(color_views.len());
+        let mut framebuffers: Vec<vk::Framebuffer> = Vec::with_capacity(n);
 
-        for (color, depth_image) in color_views.iter().zip(depth_images.iter())
-        {
-            let attachments = [*color, depth_image.raw_image_view()];
+        for i in 0..n {
+            // Build attachment list for this framebuffer slot.
+            // Slots must match the render pass attachment order:
+            //   no MSAA: [color, (depth)]
+            //   MSAA:    [msaa_color, (depth), resolve]
+            let mut attachments: Vec<vk::ImageView> = Vec::with_capacity(3);
+            if let Some(ref m) = msaa_images {
+                attachments.push(m[i].raw_image_view()); // slot 0: MSAA color
+            } else {
+                attachments.push(color_views[i]); // slot 0: swapchain color
+            }
+            if let Some(ref d) = depth_images {
+                attachments.push(d[i].raw_image_view()); // slot 1: depth
+            }
+            if msaa_images.is_some() {
+                attachments.push(color_views[i]); // last: resolve
+            }
+
             let create_info = vk::FramebufferCreateInfo::default()
                 .render_pass(render_pass)
                 .attachments(&attachments)
@@ -705,7 +744,8 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         }
 
         self.framebuffers = Some(framebuffers);
-        self.depth_images = Some(depth_images);
+        self.msaa_images = msaa_images;
+        self.depth_images = depth_images;
         Ok(())
     }
 
@@ -772,8 +812,9 @@ impl<T: HasDisplayHandle + HasWindowHandle> Drop for Swapchain<T> {
                     .destroy_framebuffer(fb, None)
             };
         }
-        // Drop depth images (and their views) after framebuffers but
-        // before color image views are destroyed.
+        // Drop MSAA and depth images (and their views) after framebuffers
+        // but before color image views are destroyed.
+        self.msaa_images = None;
         self.depth_images = None;
         for image_view in self.image_views.iter_mut().flat_map(|v| v.drain(..))
         {

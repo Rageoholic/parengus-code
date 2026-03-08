@@ -22,7 +22,7 @@ use rgpu_vk::{
         DescriptorSetLayout,
     },
     device::{Device, DeviceConfig, QueueConfig},
-    image::{DepthImage, Texture},
+    image::{DepthImage, MsaaImage, Texture},
     instance::{Instance, InstanceConfig},
     memory::image_barrier2,
     pipeline::{
@@ -282,6 +282,30 @@ impl From<TracingLogLevel> for LevelFilter {
     }
 }
 
+/// Anti-aliasing mode selected via `--aa`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AntiAliasing {
+    /// No anti-aliasing (`VK_SAMPLE_COUNT_1_BIT`).
+    Off,
+    /// 2× MSAA.
+    Msaa2,
+    /// 4× MSAA (default).
+    Msaa4,
+    /// 8× MSAA.
+    Msaa8,
+}
+
+impl AntiAliasing {
+    fn sample_count(self) -> vk::SampleCountFlags {
+        match self {
+            Self::Off => vk::SampleCountFlags::TYPE_1,
+            Self::Msaa2 => vk::SampleCountFlags::TYPE_2,
+            Self::Msaa4 => vk::SampleCountFlags::TYPE_4,
+            Self::Msaa8 => vk::SampleCountFlags::TYPE_8,
+        }
+    }
+}
+
 #[derive(clap::Parser, Debug)]
 #[command(about = "Sample Vulkan app", long_about = None)]
 struct CliArgs {
@@ -321,6 +345,14 @@ struct CliArgs {
     /// Disable ANSI color codes in stdout log output.
     #[arg(long)]
     no_color: bool,
+
+    /// Anti-aliasing mode (off, msaa2, msaa4, msaa8).
+    #[arg(long, default_value = "msaa4")]
+    aa: AntiAliasing,
+
+    /// Error if the device does not support the requested AA mode.
+    #[arg(long)]
+    aa_strict: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -487,6 +519,8 @@ fn main() -> eyre::Result<()> {
             parallel: cli_args.parallel.unwrap_or(true),
         },
         queue_config_strict: cli_args.queue_config_strict,
+        min_sample_count: cli_args.aa.sample_count(),
+        min_sample_count_strict: cli_args.aa_strict,
     };
 
     let mut app = AppRunner(Some(App::Initializing(InitializingState {
@@ -494,6 +528,7 @@ fn main() -> eyre::Result<()> {
         device_config,
         self_dir: self_dir.to_owned(),
         shader_debug_info: cli_args.shader_debug_info,
+        requested_sample_count: cli_args.aa.sample_count(),
     })));
 
     tracing::trace!("Entering main event loop");
@@ -576,6 +611,7 @@ struct InitializingState {
     device_config: DeviceConfig,
     self_dir: std::path::PathBuf,
     shader_debug_info: bool,
+    requested_sample_count: vk::SampleCountFlags,
 }
 #[derive(Debug)]
 struct DebugCounters {
@@ -621,6 +657,10 @@ struct RunningState {
     /// One depth image per frame-in-flight, matched to swapchain extent.
     /// Empty when `swapchain` is `None`.
     depth_images: Vec<DepthImage>,
+    /// One MSAA colour image per frame-in-flight.
+    /// Empty when `sample_count == TYPE_1` or `swapchain` is `None`.
+    msaa_images: Vec<MsaaImage>,
+    sample_count: vk::SampleCountFlags,
     depth_format: vk::Format,
     shader: ShaderModule,
     pipeline: DynamicPipeline,
@@ -680,6 +720,7 @@ struct SuspendedState {
     vertex_buffer: DeviceLocalBuffer,
     index_buffer: DeviceLocalBuffer,
     pipeline_color_format: vk::Format,
+    sample_count: vk::SampleCountFlags,
     command_pool: ResettableCommandPool,
     frames: Vec<FrameSync>,
     debug_counters: DebugCounters,
@@ -756,6 +797,8 @@ impl ApplicationHandler for AppRunner {
                 swapchain: _,
                 render_finished_semaphores: _,
                 depth_images: _,
+                msaa_images: _,
+                sample_count,
                 depth_format: _,
                 shader,
                 pipeline,
@@ -794,6 +837,7 @@ impl ApplicationHandler for AppRunner {
                 vertex_buffer,
                 index_buffer,
                 pipeline_color_format,
+                sample_count,
                 command_pool,
                 frames,
                 debug_counters,
@@ -927,6 +971,7 @@ impl AppRunner {
         device: &Arc<Device>,
         extent: vk::Extent2D,
         depth_format: vk::Format,
+        sample_count: vk::SampleCountFlags,
     ) -> eyre::Result<Vec<DepthImage>> {
         (0..MAX_FRAMES_IN_FLIGHT)
             .map(|i| {
@@ -935,11 +980,61 @@ impl AppRunner {
                     extent.width,
                     extent.height,
                     depth_format,
+                    sample_count,
                     Some(&format!("depth [{i}]")),
                 )
                 .map_err(eyre::Report::from)
             })
             .collect()
+    }
+
+    /// Create one MSAA colour image per frame-in-flight for `extent`.
+    /// Returns an empty Vec when `sample_count == TYPE_1`.
+    fn make_msaa_images(
+        device: &Arc<Device>,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        sample_count: vk::SampleCountFlags,
+    ) -> eyre::Result<Vec<MsaaImage>> {
+        if sample_count == vk::SampleCountFlags::TYPE_1 {
+            return Ok(Vec::new());
+        }
+        (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|i| {
+                MsaaImage::new(
+                    device,
+                    extent.width,
+                    extent.height,
+                    format,
+                    sample_count,
+                    Some(&format!("msaa [{i}]")),
+                )
+                .map_err(eyre::Report::from)
+            })
+            .collect()
+    }
+
+    /// Pick the highest supported sample count ≤ `requested`.
+    ///
+    /// Falls back through TYPE_8 → TYPE_4 → TYPE_2 → TYPE_1.
+    fn resolve_sample_count(
+        device: &Device,
+        requested: vk::SampleCountFlags,
+    ) -> vk::SampleCountFlags {
+        let props = device.properties();
+        let supported = props.limits.framebuffer_color_sample_counts
+            & props.limits.framebuffer_depth_sample_counts;
+        for &count in &[
+            vk::SampleCountFlags::TYPE_8,
+            vk::SampleCountFlags::TYPE_4,
+            vk::SampleCountFlags::TYPE_2,
+        ] {
+            if count.as_raw() <= requested.as_raw() && supported.contains(count)
+            {
+                return count;
+            }
+        }
+        vk::SampleCountFlags::TYPE_1
     }
 
     fn draw_frame(state: &mut RunningState) -> DrawFrameOutcome {
@@ -1089,10 +1184,27 @@ impl AppRunner {
             .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
             .image(depth_image)
             .subresource_range(depth_subresource_range);
-        let barriers = [to_color, to_depth];
+        let mut barriers = vec![to_color, to_depth];
+        if state.sample_count != vk::SampleCountFlags::TYPE_1 {
+            let msaa_raw = state.msaa_images[frame_idx].raw_image();
+            barriers.push(
+                image_barrier2()
+                    .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    )
+                    .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(msaa_raw)
+                    .subresource_range(subresource_range),
+            );
+        }
         let dep_info =
             vk::DependencyInfo::default().image_memory_barriers(&barriers);
-        // SAFETY: recording state; swapchain image and depth image valid.
+        // SAFETY: recording state; swapchain image, depth image, and
+        // MSAA image (when present) are valid.
         unsafe { frame_cmd.pipeline_barrier2(&dep_info) };
 
         // Begin dynamic rendering with a clear.
@@ -1107,12 +1219,28 @@ impl AppRunner {
                 stencil: 0,
             },
         };
-        let color_attachment = vk::RenderingAttachmentInfo::default()
-            .image_view(image_view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(color_clear);
+        let color_attachment = if state.sample_count
+            != vk::SampleCountFlags::TYPE_1
+        {
+            let msaa_view = state.msaa_images[frame_idx].raw_image_view();
+            // MSAA: render into the MSAA image, resolve to swapchain.
+            vk::RenderingAttachmentInfo::default()
+                .image_view(msaa_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .clear_value(color_clear)
+                .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                .resolve_image_view(image_view)
+                .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        } else {
+            vk::RenderingAttachmentInfo::default()
+                .image_view(image_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(color_clear)
+        };
         let depth_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(state.depth_images[frame_idx].raw_image_view())
             .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
@@ -1286,6 +1414,7 @@ fn build_pipeline<F>(
     shader: &ShaderModule,
     color_format: vk::Format,
     depth_format: vk::Format,
+    sample_count: vk::SampleCountFlags,
     layout: Option<Arc<PipelineLayout>>,
     name: Option<F>,
 ) -> eyre::Result<DynamicPipeline>
@@ -1324,6 +1453,7 @@ where
             layout,
             cull_mode: CullModeFlags::BACK,
             front_face: FrontFace::COUNTER_CLOCKWISE,
+            sample_count,
             ..Default::default()
         },
         name,
@@ -1363,6 +1493,17 @@ impl AppRunner {
             &surface,
             state.device_config,
         )?);
+
+        let sample_count =
+            Self::resolve_sample_count(&device, state.requested_sample_count);
+        if sample_count != state.requested_sample_count {
+            tracing::warn!(
+                "Requested sample count {:?} not supported; \
+                 using {:?}",
+                state.requested_sample_count,
+                sample_count,
+            );
+        }
 
         let vertex_buffer_size =
             (SCENE_VERTICES.len() * size_of::<Vertex>()) as vk::DeviceSize;
@@ -1543,6 +1684,7 @@ impl AppRunner {
                 &shader,
                 pipeline_color_format,
                 depth_format,
+                sample_count,
                 Some(Arc::clone(&pipeline_layout)),
                 Some({
                     let idx = debug_counters.next_pipeline();
@@ -1591,7 +1733,25 @@ impl AppRunner {
         let depth_images = swapchain
             .as_ref()
             .map(|sc| {
-                Self::make_depth_images(&device, sc.extent(), depth_format)
+                Self::make_depth_images(
+                    &device,
+                    sc.extent(),
+                    depth_format,
+                    sample_count,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        let msaa_images = swapchain
+            .as_ref()
+            .map(|sc| {
+                Self::make_msaa_images(
+                    &device,
+                    sc.extent(),
+                    pipeline_color_format,
+                    sample_count,
+                )
             })
             .transpose()?
             .unwrap_or_default();
@@ -1706,7 +1866,7 @@ impl AppRunner {
             &device,
             vk::Filter::LINEAR,
             vk::Filter::LINEAR,
-            vk::SamplerAddressMode::REPEAT,
+            vk::SamplerAddressMode::CLAMP_TO_EDGE,
             Some("statue-tex sampler"),
         )?;
 
@@ -1731,6 +1891,8 @@ impl AppRunner {
             swapchain,
             render_finished_semaphores,
             depth_images,
+            msaa_images,
+            sample_count,
             depth_format,
             shader,
             pipeline,
@@ -1817,6 +1979,7 @@ impl AppRunner {
                             &state.shader,
                             new_format,
                             depth_format,
+                            state.sample_count,
                             Some(Arc::clone(&state.pipeline_layout)),
                             Some({
                                 let idx = debug_counters.next_pipeline();
@@ -1847,6 +2010,20 @@ impl AppRunner {
                     &state.device,
                     sc.extent(),
                     depth_format,
+                    state.sample_count,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        let msaa_images = swapchain
+            .as_ref()
+            .map(|sc| {
+                Self::make_msaa_images(
+                    &state.device,
+                    sc.extent(),
+                    pipeline_color_format,
+                    state.sample_count,
                 )
             })
             .transpose()?
@@ -1864,6 +2041,8 @@ impl AppRunner {
             swapchain,
             render_finished_semaphores,
             depth_images,
+            msaa_images,
+            sample_count: state.sample_count,
             depth_format,
             shader: state.shader,
             pipeline,
@@ -1908,6 +2087,7 @@ impl AppRunner {
             running_state.swapchain = None;
             running_state.render_finished_semaphores = None;
             running_state.depth_images = Vec::new();
+            running_state.msaa_images = Vec::new();
             return true;
         }
 
@@ -1985,12 +2165,28 @@ impl AppRunner {
                     &running_state.device,
                     new_extent,
                     running_state.depth_format,
+                    running_state.sample_count,
                 ) {
                     Ok(images) => {
                         running_state.depth_images = images;
                     }
                     Err(e) => {
                         tracing::error!("Error recreating depth images: {}", e);
+                        return false;
+                    }
+                }
+
+                match Self::make_msaa_images(
+                    &running_state.device,
+                    new_extent,
+                    new_format,
+                    running_state.sample_count,
+                ) {
+                    Ok(images) => {
+                        running_state.msaa_images = images;
+                    }
+                    Err(e) => {
+                        tracing::error!("Error recreating MSAA images: {}", e);
                         return false;
                     }
                 }
@@ -2012,6 +2208,7 @@ impl AppRunner {
                         &running_state.shader,
                         new_format,
                         running_state.depth_format,
+                        running_state.sample_count,
                         Some(Arc::clone(&running_state.pipeline_layout)),
                         Some({
                             let idx =

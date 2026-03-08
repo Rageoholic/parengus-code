@@ -200,6 +200,12 @@ pub enum CreateCompatibleError {
 
     #[error("Failed to create GPU allocator: {0}")]
     AllocatorCreation(AllocationError),
+
+    #[error(
+        "No suitable device supports the requested sample count \
+         and strict mode is enabled"
+    )]
+    SampleCountUnsupported,
 }
 
 #[derive(Debug, Error)]
@@ -304,6 +310,17 @@ pub struct DeviceConfig {
     /// When `false` (the default), the device uses the best
     /// configuration the hardware supports.
     pub queue_config_strict: bool,
+    /// Preferred minimum MSAA sample count for colour and depth
+    /// framebuffer attachments. Devices that support this count
+    /// score higher during selection. Defaults to `TYPE_1`
+    /// (no preference).
+    pub min_sample_count: vk::SampleCountFlags,
+    /// When `true`, [`Device::create_compatible`] returns
+    /// [`CreateCompatibleError::SampleCountUnsupported`] if no
+    /// device supports `min_sample_count`. When `false` (the
+    /// default), unsupported devices are still considered but
+    /// score lower.
+    pub min_sample_count_strict: bool,
 }
 
 impl Device {
@@ -348,7 +365,7 @@ impl Device {
             props: vk::PhysicalDeviceProperties,
             queue_families: Vec<vk::QueueFamilyProperties>,
             graphics_present_family: u32,
-            score: (u32, u32),
+            score: (u32, u32, u32),
             /// True when sync2 must use the extension loader.
             use_sync2_ext: bool,
             /// True when dynamic rendering must use the extension loader.
@@ -365,6 +382,7 @@ impl Device {
         }
 
         let mut candidates: Vec<DeviceCandidate> = Vec::new();
+        let mut skipped_for_sample_count = false;
 
         'dev: for &dev in &physical_devices {
             // SAFETY: dev was derived from instance.
@@ -519,8 +537,29 @@ impl Device {
 
             let dedicated_count =
                 has_dedicated_transfer as u32 + has_dedicated_compute as u32;
-            let score =
-                (dedicated_count, device_type_priority(props.device_type));
+
+            // Sample count support: intersect colour and depth limits.
+            let supported_samples =
+                props.limits.framebuffer_color_sample_counts
+                    & props.limits.framebuffer_depth_sample_counts;
+            let supports_sample_count =
+                supported_samples.contains(config.min_sample_count);
+            if config.min_sample_count_strict && !supports_sample_count {
+                tracing::debug!(
+                    "Skipping {:?}: does not support \
+                     requested sample count {:?}",
+                    props.device_name_as_c_str().unwrap_or(c"unknown"),
+                    config.min_sample_count,
+                );
+                skipped_for_sample_count = true;
+                continue 'dev;
+            }
+
+            let score = (
+                dedicated_count,
+                device_type_priority(props.device_type),
+                supports_sample_count as u32,
+            );
 
             candidates.push(DeviceCandidate {
                 handle: dev,
@@ -536,10 +575,13 @@ impl Device {
             });
         }
 
-        let best = candidates
-            .iter()
-            .max_by_key(|c| c.score)
-            .ok_or(CreateCompatibleError::NoSuitableDevice)?;
+        let best = candidates.iter().max_by_key(|c| c.score).ok_or(
+            if skipped_for_sample_count {
+                CreateCompatibleError::SampleCountUnsupported
+            } else {
+                CreateCompatibleError::NoSuitableDevice
+            },
+        )?;
 
         let physical_device = best.handle;
         let queue_families = &best.queue_families;

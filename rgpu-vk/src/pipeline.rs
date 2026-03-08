@@ -228,6 +228,12 @@ pub struct DynamicPipelineDesc<'a> {
 
     /// Winding order considered front-facing.
     pub front_face: vk::FrontFace,
+
+    /// MSAA sample count for the color and depth attachments.
+    /// Must match the sample count used by the render target images
+    /// and the `VkRenderingInfo` at draw time.
+    /// Use `TYPE_1` to disable multisampling.
+    pub sample_count: vk::SampleCountFlags,
 }
 
 impl Default for DynamicPipelineDesc<'_> {
@@ -243,6 +249,7 @@ impl Default for DynamicPipelineDesc<'_> {
             polygon_mode: vk::PolygonMode::FILL,
             cull_mode: vk::CullModeFlags::NONE,
             front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+            sample_count: vk::SampleCountFlags::TYPE_1,
         }
     }
 }
@@ -354,7 +361,7 @@ impl DynamicPipeline {
 
         let multisample_state =
             vk::PipelineMultisampleStateCreateInfo::default()
-                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+                .rasterization_samples(desc.sample_count);
 
         let depth_stencil_state = if desc.depth_attachment_format.is_some() {
             vk::PipelineDepthStencilStateCreateInfo::default()
@@ -518,6 +525,11 @@ pub struct RenderPassPipelineDesc<'a> {
 
     /// Winding order considered front-facing.
     pub front_face: vk::FrontFace,
+
+    /// MSAA sample count. Must match the render pass `sample_count`
+    /// (i.e. the number of samples used by its attachments).
+    /// Use `TYPE_1` to disable multisampling.
+    pub sample_count: vk::SampleCountFlags,
 }
 
 impl Default for RenderPassPipelineDesc<'_> {
@@ -535,6 +547,7 @@ impl Default for RenderPassPipelineDesc<'_> {
             polygon_mode: vk::PolygonMode::FILL,
             cull_mode: vk::CullModeFlags::NONE,
             front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+            sample_count: vk::SampleCountFlags::TYPE_1,
         }
     }
 }
@@ -648,7 +661,7 @@ impl RenderPassPipeline {
 
         let multisample_state =
             vk::PipelineMultisampleStateCreateInfo::default()
-                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+                .rasterization_samples(desc.sample_count);
 
         let depth_stencil_state =
             vk::PipelineDepthStencilStateCreateInfo::default()
