@@ -287,6 +287,7 @@ impl AllocatedImage {
         extent: vk::Extent3D,
         format: vk::Format,
         usage: vk::ImageUsageFlags,
+        samples: vk::SampleCountFlags,
         name: Option<&str>,
     ) -> Result<Self, CreateImageError> {
         let create_info = vk::ImageCreateInfo::default()
@@ -295,7 +296,7 @@ impl AllocatedImage {
             .extent(extent)
             .mip_levels(1)
             .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
+            .samples(samples)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -385,6 +386,7 @@ impl DeviceLocalImage {
         height: u32,
         format: vk::Format,
         usage: vk::ImageUsageFlags,
+        samples: vk::SampleCountFlags,
         name: Option<&str>,
     ) -> Result<Self, CreateImageError> {
         let extent = vk::Extent3D {
@@ -393,7 +395,9 @@ impl DeviceLocalImage {
             depth: 1,
         };
         Ok(Self {
-            inner: AllocatedImage::new(device, extent, format, usage, name)?,
+            inner: AllocatedImage::new(
+                device, extent, format, usage, samples, name,
+            )?,
         })
     }
 
@@ -763,8 +767,15 @@ impl Texture {
         usage: vk::ImageUsageFlags,
         name: Option<&str>,
     ) -> Result<Self, CreateTextureError> {
-        let image =
-            DeviceLocalImage::new(device, width, height, format, usage, name)?;
+        let image = DeviceLocalImage::new(
+            device,
+            width,
+            height,
+            format,
+            usage,
+            vk::SampleCountFlags::TYPE_1,
+            name,
+        )?;
         let view = ImageView::new(device, &image, name)?;
         Ok(Self { view, image })
     }
@@ -859,6 +870,7 @@ impl DepthImage {
         width: u32,
         height: u32,
         format: vk::Format,
+        samples: vk::SampleCountFlags,
         name: Option<&str>,
     ) -> Result<Self, CreateTextureError> {
         let image = DeviceLocalImage::new(
@@ -867,6 +879,7 @@ impl DepthImage {
             height,
             format,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            samples,
             name,
         )?;
         let view = ImageView::new_depth(device, &image, name)?;
@@ -879,6 +892,69 @@ impl DepthImage {
     }
 
     /// Returns the raw `VkImageView` handle for use as a depth
+    /// attachment.
+    pub fn raw_image_view(&self) -> vk::ImageView {
+        self.view.raw_image_view()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MsaaImage
+// ---------------------------------------------------------------------------
+
+/// A GPU-only 2-D MSAA colour render target: a multisampled
+/// [`DeviceLocalImage`] with a colour [`ImageView`].
+///
+/// Created with `COLOR_ATTACHMENT | TRANSIENT_ATTACHMENT` usage.
+/// `TRANSIENT_ATTACHMENT` hints to the driver that the contents need
+/// not be written to main memory — only the resolved single-sample
+/// result is kept.
+///
+/// # Drop order
+///
+/// `view` is declared before `image` so Rust drops the view first,
+/// satisfying the Vulkan requirement that all image views must be
+/// destroyed before the image they reference.
+#[derive(Debug)]
+pub struct MsaaImage {
+    // IMPORTANT: `view` must be declared before `image`.
+    view: ImageView,
+    image: DeviceLocalImage,
+}
+
+impl MsaaImage {
+    /// Create a 2-D MSAA colour image (image + colour view).
+    ///
+    /// `format` should match the swapchain surface format.
+    /// `samples` must be greater than `TYPE_1`.
+    pub fn new(
+        device: &Arc<Device>,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        samples: vk::SampleCountFlags,
+        name: Option<&str>,
+    ) -> Result<Self, CreateTextureError> {
+        let image = DeviceLocalImage::new(
+            device,
+            width,
+            height,
+            format,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
+            samples,
+            name,
+        )?;
+        let view = ImageView::new(device, &image, name)?;
+        Ok(Self { view, image })
+    }
+
+    /// Returns the raw `VkImage` handle.
+    pub fn raw_image(&self) -> vk::Image {
+        self.image.raw_image()
+    }
+
+    /// Returns the raw `VkImageView` handle for use as a colour
     /// attachment.
     pub fn raw_image_view(&self) -> vk::ImageView {
         self.view.raw_image_view()
