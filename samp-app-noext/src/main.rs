@@ -255,14 +255,14 @@ struct CliArgs {
     #[arg(long)]
     rgpu_log_level: Option<TracingLogLevel>,
 
-    #[arg(long)]
-    dedicated_transfer: Option<bool>,
+    #[arg(long, default_value = "true")]
+    dedicated_transfer: bool,
 
-    #[arg(long)]
-    dedicated_compute: Option<bool>,
+    #[arg(long, default_value = "true")]
+    dedicated_compute: bool,
 
-    #[arg(long)]
-    parallel: Option<bool>,
+    #[arg(long, default_value = "true")]
+    parallel: bool,
 
     #[arg(long)]
     queue_config_strict: bool,
@@ -408,18 +408,6 @@ fn main() -> eyre::Result<()> {
         )
     }?);
 
-    if cli_args.queue_config_strict
-        && (cli_args.dedicated_transfer.is_none()
-            || cli_args.dedicated_compute.is_none()
-            || cli_args.parallel.is_none())
-    {
-        eyre::bail!(
-            "--queue-config-strict requires all three of \
-             --dedicated-transfer, --dedicated-compute, \
-             and --parallel to be explicitly specified"
-        );
-    }
-
     let device_config = DeviceConfig {
         swapchain: true,
         dynamic_rendering: false,
@@ -427,9 +415,9 @@ fn main() -> eyre::Result<()> {
         maintenance1: false,
         shader_non_semantic_info: true,
         queue_config: QueueConfig {
-            dedicated_transfer: cli_args.dedicated_transfer.unwrap_or(true),
-            dedicated_compute: cli_args.dedicated_compute.unwrap_or(true),
-            parallel: cli_args.parallel.unwrap_or(true),
+            dedicated_transfer: cli_args.dedicated_transfer,
+            dedicated_compute: cli_args.dedicated_compute,
+            parallel: cli_args.parallel,
         },
         queue_config_strict: cli_args.queue_config_strict,
         min_sample_count: cli_args.aa.sample_count(),
