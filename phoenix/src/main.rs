@@ -1104,12 +1104,13 @@ impl AppRunner {
         // view_proj — uploaded to the per-frame UBO. Baked on the CPU
         // so the shader only needs one matrix multiply per vertex.
         // 60° vertical FOV, depth range [1, 1000].
-        // Camera at (0, 80, 300) looking at origin, Y-up.
-        // Duck rotates around the origin; its vertices reach ~200 units
-        // out, so the far plane must exceed that.
+        // Eye above and behind, aimed at the duck's vertical midpoint
+        // (Y=87), giving a downward angle with the duck centered.
+        // Duck rotates around Y at origin; vertices reach ~200 units
+        // out, so far plane must exceed that.
         let view = look_at_rh(
-            Vec3::new(0.0, 200.0, 300.0),
-            Vec3::zero(),
+            Vec3::new(0.0, 220.0, 300.0),
+            Vec3::new(0.0, 87.0, 0.0),
             Vec3::unit_y(),
         );
         let proj = perspective_rh_zo(PI32 / 3.0, aspect, 1.0, 1000.0);
