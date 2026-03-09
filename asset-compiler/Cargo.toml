@@ -1,0 +1,15 @@
+[package]
+name = "asset-compiler"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "asset-compiler"
+path = "src/main.rs"
+
+[dependencies]
+asset-shared = { path = "../asset-shared" }
+bevy_mikktspace = "1.0"
+gltf = "1"
+lz4_flex = "0.12"

@@ -48,7 +48,7 @@ no endianness assumption.
 |-------|------|-------|
 | `kind` | `u32` | `SectionKind` discriminant |
 | `compression` | `u32` | `Compression` discriminant |
-| `attribs` | `u32` | `VertexAttribs` bitmask; only meaningful for `MeshVertices` sections |
+| `_reserved` | `u32` | always 0; reserved for future use |
 | `byte_offset` | `u32` | offset into file |
 | `byte_len` | `u32` | uncompressed size; use for allocation |
 | `compressed_byte_len` | `u32` | compressed size; use for seeking. Equal to `byte_len` if uncompressed |
@@ -61,47 +61,32 @@ no endianness assumption.
 | `None` | 0 | section data stored as-is |
 | `Lz4` | 1 | LZ4 block format |
 
-**Section kinds for mesh:**
+**Section kinds for mesh** (structure of arrays — one section per
+attribute):
 
-| `SectionKind` | Contents | Default compression |
-|---------------|----------|---------------------|
-| `MeshVertices` | `[MeshVertex]` — typed, little-endian | `Lz4` |
-| `MeshIndices` | `[u16]` — little-endian | `Lz4` |
-| `MeshTexRef` | logical asset name (UTF-8, no null terminator) | `None` |
+| `SectionKind` | Contents | Required | Default compression |
+|---------------|----------|----------|---------------------|
+| `MeshPositions` | `[[f32; 3]]` — Z-up, little-endian | yes | `Lz4` |
+| `MeshNormals` | `[[f32; 3]]` — Z-up, little-endian | yes | `Lz4` |
+| `MeshTangents` | `[[f32; 4]]` — xyz + w handedness sign, little-endian | yes | `Lz4` |
+| `MeshTexCoord0` | `[[f32; 2]]` — UV0, little-endian | yes | `Lz4` |
+| `MeshTexCoord1` | `[[f32; 2]]` — UV1, little-endian | no | `Lz4` |
+| `MeshIndices16` | `[u16]` — little-endian | one of these | `Lz4` |
+| `MeshIndices32` | `[u32]` — little-endian | is required | `Lz4` |
+| `MeshTexRef` | logical asset name (UTF-8, no null terminator) | no | `None` |
 
-**`VertexAttribs` bitmask** (stored in `SectionHeader::attribs`):
+Optional attributes (`MeshTexCoord1`) are signaled by section
+presence alone — no bitmask needed. Loaders skip unknown section
+kinds, so new optional attributes can be added without a version bump
+as long as they don't change the layout of existing sections.
 
-| Bit | Attribute | Notes |
-|-----|-----------|-------|
-| 0 | `TEX_COORD_1` | UV1; optional |
+All per-vertex sections have the same `element_count` (vertex count).
+`MeshIndices` `element_count` is the index count.
 
-`position`, `normal`, `tangent`, and `tex_coord` (UV0) are always
-present and not represented in the bitmask. The bitmask is reserved
-for future optional attributes.
-
-**In-memory vertex type:**
-
-```rust
-pub struct MeshVertex {
-    pub position:   [f32; 3],         // Z-up
-    pub normal:     [f32; 3],         // Z-up; generated if absent
-                                      // in source
-    pub tangent:    [f32; 4],         // xyz + w handedness sign;
-                                      // bitangent =
-                                      //   cross(normal, tangent.xyz)
-                                      //   * tangent.w
-                                      // generated via Mikktspace if
-                                      // absent in source
-    pub tex_coord:  [f32; 2],         // UV0
-    pub tex_coord1: Option<[f32; 2]>, // UV1; absent if not in source
-}
-```
-
-The compiler always generates `normal` and `tangent` if absent in
-the glTF primitive (averaged face normals; Mikktspace tangents).
-`tex_coord1` is written only if `TEXCOORD_1` is present in the
-primitive; the `TEX_COORD_1` bit in `attribs` signals its presence
-to the loader.
+The compiler always generates `MeshNormals` and `MeshTangents` if
+absent in the glTF primitive (averaged face normals; Mikktspace
+tangents). The coordinate transform `(x,y,z) → (x,z,-y)` (Y-up to
+Z-up) is applied at compile time.
 
 Index width is `u16` for now. Widening to `u32` requires a new
 `SectionKind::MeshIndices32` variant and a `version` bump.
@@ -180,9 +165,7 @@ Contains:
 - `AssetKind` enum
 - `SectionKind` enum
 - `Compression` enum
-- `VertexAttribs` bitmask type
 - `FileHeader` and `SectionHeader` structs
-- `MeshVertex` struct
 - `TexFormat` enum
 - `ColorSpace` enum
 
@@ -211,19 +194,21 @@ Exit 0 on success, error text on stderr, non-zero exit on failure.
 1. `gltf::import(src)`
 2. Read first mesh, first primitive
 3. Read `POSITION` → apply Y-up to Z-up transform: `(x,y,z) → (x,z,-y)`
+   → `Vec<[f32; 3]>`
 4. Read `NORMAL` if present (transform to Z-up); otherwise generate
-   averaged face normals
+   averaged face normals → `Vec<[f32; 3]>`
 5. Read `TANGENT` if present (transform to Z-up); otherwise generate
-   via Mikktspace
-6. Read `TEXCOORD_0`
-7. Read `TEXCOORD_1` if present; set `TEX_COORD_1` bit in `attribs`
-8. Zip into `Vec<MeshVertex>`
-9. Read indices → `Vec<u16>` (fail if any index exceeds `u16::MAX`)
-10. Write texture logical name as `MeshTexRef` section (from manifest,
-    not from the glTF URI)
-11. LZ4-compress vertex and index sections
-12. Write `FileHeader`, `[SectionHeader; N]` (with `attribs` set on
-    the `MeshVertices` header), compressed section data
+   via Mikktspace → `Vec<[f32; 4]>`
+6. Read `TEXCOORD_0` → `Vec<[f32; 2]>`
+7. Read `TEXCOORD_1` if present → `Vec<[f32; 2]>`
+8. Read indices → `Vec<u16>` if max index ≤ `u16::MAX`, else `Vec<u32>`
+9. Write texture logical name as `MeshTexRef` section (from manifest,
+   not from the glTF URI)
+10. LZ4-compress each attribute section and the index section
+    independently
+11. Write `FileHeader`, `[SectionHeader; N]`, compressed section data.
+    One `SectionHeader` per attribute section present, plus indices
+    and tex ref.
 
 Note: the coordinate transform is applied here, not at runtime.
 `load_duck()` in phoenix currently loads raw glTF positions without
@@ -251,36 +236,53 @@ added as `Compression` variants are introduced.
 pub mod mesh;
 pub mod tex;
 
-pub use mesh::{MeshAsset, VertexIter, IndexIter, TexRefIter};
+pub use mesh::{
+    MeshAsset, Indices,
+    PositionIter, NormalIter, TangentIter,
+    TexCoordIter, IndexIter, TexRefIter,
+};
 pub use tex::TexAsset;
 ```
 
 **`MeshAsset`:**
 
 ```rust
-pub struct MeshAsset { /* owns Vec<u8> of file bytes */ }
+pub struct MeshAsset { /* owns decompressed attribute vecs */ }
 
 impl MeshAsset {
     pub fn open(path: &Path) -> Result<Self, LoadError>;
 
-    pub fn vertices(&self) -> VertexIter<'_>;
-    pub fn indices(&self)  -> IndexIter<'_>;
-    pub fn tex_refs(&self) -> TexRefIter<'_>;
+    pub fn positions(&self)   -> PositionIter<'_>;  // [f32; 3]
+    pub fn normals(&self)     -> NormalIter<'_>;    // [f32; 3]
+    pub fn tangents(&self)    -> TangentIter<'_>;   // [f32; 4]
+    pub fn tex_coords(&self)  -> TexCoordIter<'_>;  // [f32; 2]
+    pub fn tex_coords1(&self) -> Option<TexCoordIter<'_>>; // UV1
+    pub fn indices(&self)     -> Indices<'_>;
+    pub fn tex_refs(&self)    -> TexRefIter<'_>;    // &str
+}
+
+pub enum Indices<'a> {
+    U16(IndexIter<'a, u16>),
+    U32(IndexIter<'a, u32>),
 }
 ```
 
-All iterators implement `ExactSizeIterator` and yield typed values
-(`MeshVertex`, `u16`). `iter.len()` drives staging buffer allocation:
+All iterators implement `ExactSizeIterator`. `iter.len()` drives
+staging buffer allocation:
 
 ```rust
 let mesh = MeshAsset::open(&path)?;
-let verts = mesh.vertices();
-let staging_size = verts.len() * size_of::<MeshVertex>();
+let n = mesh.positions().len();
+let staging_size = n * size_of::<[f32; 3]>();
 ```
 
-Vertex and index sections are LZ4-decompressed on `open()` into
-`Vec<MeshVertex>` / `Vec<u16>` (with `from_le_bytes` per field).
-The iterators are slices over those owned vecs.
+Each attribute section is LZ4-decompressed on `open()` into its own
+typed `Vec` (with `from_le_bytes` per element). The iterators are
+slices over those owned vecs. `tex_coords1()` returns `None` if the
+`MeshTexCoord1` section is absent. `indices()` returns `Indices::U16`
+or `Indices::U32` depending on which section kind is present.
+
+Apps interleave attribute arrays into their own vertex type on upload.
 
 **`TexAsset`:**
 
@@ -290,12 +292,13 @@ pub struct TexAsset { /* owns decompressed mip data */ }
 impl TexAsset {
     pub fn open(path: &Path) -> Result<Self, LoadError>;
 
-    pub fn format(&self)     -> TexFormat;
+    pub fn format(&self)      -> TexFormat;
     pub fn color_space(&self) -> ColorSpace;
-    pub fn width(&self)      -> u32;
-    pub fn height(&self)     -> u32;
-    pub fn mip_count(&self)  -> u32;
-    pub fn mip(&self, level: u32) -> MipIter<'_>; // ExactSizeIterator<Item = u8>
+    pub fn width(&self)       -> u32;
+    pub fn height(&self)      -> u32;
+    pub fn mip_count(&self)   -> u32;
+    // ExactSizeIterator<Item = u8>
+    pub fn mip(&self, level: u32) -> MipIter<'_>;
 }
 ```
 
@@ -356,9 +359,9 @@ Remove `gltf = "1"` from `xtask/Cargo.toml`.
 3. `MeshAsset::open` replaces the tuple return
 4. Texture: `tex_refs()` yields the logical name `"duck-tex"`;
    look it up in the asset map, open with `TexAsset::open`
-5. Phoenix converts `MeshVertex` to its own `Vertex` type. For now
-   it uses only `position` and `tex_coord`; normal and tangent are
-   present but unused until lighting is added.
+5. Phoenix interleaves `positions()` and `tex_coords()` into its own
+   `Vertex` type on upload. Normals and tangents are present in the
+   file but unused until lighting is added.
 
 ---
 
@@ -368,8 +371,6 @@ Remove `gltf = "1"` from `xtask/Cargo.toml`.
   data. A future arena or slab allocator would require a different
   shape; current design does not foreclose it.
 - **Multi-primitive meshes** — compiler takes first primitive only
-- **Index width** — `u16` now; widening path is
-  `SectionKind::MeshIndices32` + version bump
 - **Texture reference resolution** — mesh stores logical asset name;
   exact resolution path (through asset map at runtime) TBD
 - **`MeshTexRef` and multiple textures per mesh** — currently one

@@ -1,0 +1,9 @@
+[package]
+name = "asset-loader"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+asset-shared = { path = "../asset-shared" }
+lz4_flex = "0.12"
