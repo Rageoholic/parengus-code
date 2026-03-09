@@ -81,69 +81,73 @@ struct PushConstants {
     model: Mat4<f32>,
 }
 
-/// Three overlapping 0.8×0.8 quads at increasing Z heights.
-///
-/// World convention: +Z up, right-handed. The camera sits at
-/// (2, −2, 1.5) looking at the origin, so higher-Z vertices are
-/// closer to it.
-///
-/// The quads are ordered **nearest-first** in the buffer: without
-/// depth testing the farthest quad (drawn last) would incorrectly
-/// overdraw the nearest one, making the depth buffer's effect
-/// immediately obvious.
-const SCENE_VERTICES: [Vertex; 12] = [
-    // Nearest (z = 0.7), centre at (−0.25, 0)
-    Vertex {
-        position: Vec3::new(-0.65, -0.4, 0.7),
-        tex_coord: Vec2::new(0.0, 0.0),
-    },
-    Vertex {
-        position: Vec3::new(0.15, 0.4, 0.7),
-        tex_coord: Vec2::new(1.0, 1.0),
-    },
-    Vertex {
-        position: Vec3::new(0.15, -0.4, 0.7),
-        tex_coord: Vec2::new(1.0, 0.0),
-    },
-    Vertex {
-        position: Vec3::new(-0.65, 0.4, 0.7),
-        tex_coord: Vec2::new(0.0, 1.0),
-    },
-    // Middle (z = 0.35), centre at (0.25, 0)
-    Vertex {
-        position: Vec3::new(-0.15, -0.4, 0.35),
-        tex_coord: Vec2::new(0.0, 0.0),
-    },
-    Vertex {
-        position: Vec3::new(0.65, 0.4, 0.35),
-        tex_coord: Vec2::new(1.0, 1.0),
-    },
-    Vertex {
-        position: Vec3::new(0.65, -0.4, 0.35),
-        tex_coord: Vec2::new(1.0, 0.0),
-    },
-    Vertex {
-        position: Vec3::new(-0.15, 0.4, 0.35),
-        tex_coord: Vec2::new(0.0, 1.0),
-    },
-    // Farthest (z = 0.0), centre at (0, 0)
-    Vertex {
-        position: Vec3::new(-0.4, -0.4, 0.0),
-        tex_coord: Vec2::new(0.0, 0.0),
-    },
-    Vertex {
-        position: Vec3::new(0.4, 0.4, 0.0),
-        tex_coord: Vec2::new(1.0, 1.0),
-    },
-    Vertex {
-        position: Vec3::new(0.4, -0.4, 0.0),
-        tex_coord: Vec2::new(1.0, 0.0),
-    },
-    Vertex {
-        position: Vec3::new(-0.4, 0.4, 0.0),
-        tex_coord: Vec2::new(0.0, 1.0),
-    },
-];
+// ---------------------------------------------------------------------------
+// glTF loading
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::type_complexity)]
+fn load_duck(
+    gltf_path: &std::path::Path,
+) -> eyre::Result<(Vec<Vertex>, Vec<u16>, u32, u32, Vec<u8>)> {
+    let (doc, buffers, images) = gltf::import(gltf_path)?;
+    let mesh = doc
+        .meshes()
+        .next()
+        .ok_or_else(|| eyre::eyre!("glTF has no meshes"))?;
+    let prim = mesh
+        .primitives()
+        .next()
+        .ok_or_else(|| eyre::eyre!("mesh has no primitives"))?;
+    let reader =
+        prim.reader(|buf| buffers.get(buf.index()).map(|b| b.0.as_slice()));
+
+    let positions: Vec<[f32; 3]> = reader
+        .read_positions()
+        .ok_or_else(|| eyre::eyre!("primitive has no POSITION"))?
+        .collect();
+    let tex_coords: Vec<[f32; 2]> = reader
+        .read_tex_coords(0)
+        .ok_or_else(|| eyre::eyre!("primitive has no TEXCOORD_0"))?
+        .into_f32()
+        .collect();
+
+    let vertices: Vec<Vertex> = positions
+        .into_iter()
+        .zip(tex_coords)
+        .map(|(p, t)| Vertex {
+            position: Vec3::new(p[0], p[1], p[2]),
+            tex_coord: Vec2::new(t[0], t[1]),
+        })
+        .collect();
+
+    let indices: Vec<u16> = reader
+        .read_indices()
+        .ok_or_else(|| eyre::eyre!("primitive has no indices"))?
+        .into_u32()
+        .map(|i| u16::try_from(i).expect("Duck index fits u16"))
+        .collect();
+
+    let img_data = images
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre::eyre!("glTF has no images"))?;
+
+    // gltf::import decodes the image; normalise to RGBA8.
+    use gltf::image::Format;
+    let pixels = match img_data.format {
+        Format::R8G8B8A8 => img_data.pixels,
+        Format::R8G8B8 => img_data
+            .pixels
+            .chunks_exact(3)
+            .flat_map(|c| [c[0], c[1], c[2], 255])
+            .collect(),
+        fmt => {
+            return Err(eyre::eyre!("unsupported glTF image format: {fmt:?}"));
+        }
+    };
+
+    Ok((vertices, indices, img_data.width, img_data.height, pixels))
+}
 
 // ---------------------------------------------------------------------------
 // Matrix math — right-handed, +Z up
@@ -238,14 +242,6 @@ fn perspective_rh_zo(
         [0.0, 0.0, b, 0.0],
     ])
 }
-
-// Each group of 6 uses the same CCW winding as the original
-// single-quad layout: [base, base+2, base+1, base, base+1, base+3].
-const SCENE_INDICES: [u16; 18] = [
-    0, 2, 1, 0, 1, 3, // nearest
-    4, 6, 5, 4, 5, 7, // middle
-    8, 10, 9, 8, 9, 11, // farthest
-];
 
 #[rustfmt::skip]
 #[derive(
@@ -655,6 +651,7 @@ struct RunningState {
     pipeline: DynamicPipeline,
     vertex_buffer: DeviceLocalBuffer,
     index_buffer: DeviceLocalBuffer,
+    index_count: u32,
     pipeline_color_format: vk::Format,
     command_pool: ResettableCommandPool,
     frames: Vec<FrameSync>,
@@ -712,6 +709,7 @@ struct SuspendedState {
     pipeline: DynamicPipeline,
     vertex_buffer: DeviceLocalBuffer,
     index_buffer: DeviceLocalBuffer,
+    index_count: u32,
     pipeline_color_format: vk::Format,
     sample_count: vk::SampleCountFlags,
     command_pool: ResettableCommandPool,
@@ -799,6 +797,7 @@ impl ApplicationHandler for AppRunner {
                 pipeline,
                 vertex_buffer,
                 index_buffer,
+                index_count,
                 pipeline_color_format,
                 command_pool,
                 frames,
@@ -833,6 +832,7 @@ impl ApplicationHandler for AppRunner {
                 pipeline,
                 vertex_buffer,
                 index_buffer,
+                index_count,
                 pipeline_color_format,
                 sample_count,
                 command_pool,
@@ -1103,11 +1103,17 @@ impl AppRunner {
 
         // view_proj — uploaded to the per-frame UBO. Baked on the CPU
         // so the shader only needs one matrix multiply per vertex.
-        // 60° vertical FOV, depth range [0.1, 100].
-        // Camera is fixed at world-space (2, -2, 1.5) looking at origin.
-        let view =
-            look_at_rh(Vec3::new(2.0, -2.0, 1.5), Vec3::zero(), Vec3::unit_z());
-        let proj = perspective_rh_zo(PI32 / 3.0, aspect, 0.1, 100.0);
+        // 60° vertical FOV, depth range [1, 1000].
+        // Eye above and behind, aimed at the duck's vertical midpoint
+        // (Y=87), giving a downward angle with the duck centered.
+        // Duck rotates around Y at origin; vertices reach ~200 units
+        // out, so far plane must exceed that.
+        let view = look_at_rh(
+            Vec3::new(0.0, 220.0, 300.0),
+            Vec3::new(0.0, 87.0, 0.0),
+            Vec3::unit_y(),
+        );
+        let proj = perspective_rh_zo(PI32 / 3.0, aspect, 1.0, 1000.0);
         let ubo = Ubo {
             view_proj: proj * view,
         };
@@ -1118,8 +1124,8 @@ impl AppRunner {
         }
 
         // Model — uploaded as a push constant each frame.
-        // The model rotates around +Z (the world up axis).
-        let model = Mat4::<f32>::rotation_z(elapsed * PI32 * 2.0 / 5.0);
+        // The model rotates around +Y (glTF world up axis).
+        let model = Mat4::<f32>::rotation_y(elapsed * PI32 * 2.0 / 5.0);
         let push = PushConstants { model };
 
         let pipeline_handle = state.pipeline.raw_pipeline();
@@ -1321,9 +1327,7 @@ impl AppRunner {
         // Draw a rectangle using the index buffer.
         // SAFETY: all required dynamic state has been set;
         // render pass is active; index buffer is bound.
-        unsafe {
-            frame_cmd.draw_indexed(SCENE_INDICES.len() as u32, 1, 0, 0, 0)
-        };
+        unsafe { frame_cmd.draw_indexed(state.index_count, 1, 0, 0, 0) };
 
         // SAFETY: inside a dynamic render pass.
         unsafe { frame_cmd.end_rendering() };
@@ -1506,40 +1510,60 @@ impl AppRunner {
             );
         }
 
+        let asset_map_path =
+            state.self_dir.join("assets").join("asset_map.toml");
+        let asset_map: AssetMap = toml::from_str(
+            &std::fs::read_to_string(&asset_map_path).map_err(|e| {
+                eyre::eyre!("Failed to read {}: {e}", asset_map_path.display(),)
+            })?,
+        )?;
+        tracing::debug!(asset_map = ?asset_map.map, "Loaded asset map");
+
+        let assets_dir = state.self_dir.join("assets");
+
+        let duck_filename = asset_map
+            .map
+            .get("duck")
+            .ok_or_else(|| eyre::eyre!("asset 'duck' not in map"))?;
+        let duck_path = assets_dir.join(duck_filename);
+        let (scene_vertices, scene_indices, tex_width, tex_height, tex_bytes) =
+            load_duck(&duck_path)?;
+        let index_count = scene_indices.len() as u32;
+
         let vertex_buffer_size =
-            (SCENE_VERTICES.len() * size_of::<Vertex>()) as vk::DeviceSize;
+            (scene_vertices.len() * size_of::<Vertex>()) as vk::DeviceSize;
         let mut staging_vertex_buffer = HostVisibleBuffer::new(
             &device,
             vertex_buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
-            Some("rect staging vertex buffer"),
+            Some("duck staging vertex buffer"),
         )?;
-        staging_vertex_buffer.write_pod(&SCENE_VERTICES)?;
+        staging_vertex_buffer.write_pod(&scene_vertices)?;
 
         let mut vertex_buffer = DeviceLocalBuffer::new(
             &device,
             vertex_buffer_size,
             vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST,
-            Some("rect vertex buffer"),
+            Some("duck vertex buffer"),
         )?;
 
         let index_buffer_size =
-            (SCENE_INDICES.len() * size_of::<u16>()) as vk::DeviceSize;
+            (scene_indices.len() * size_of::<u16>()) as vk::DeviceSize;
         let mut staging_index_buffer = HostVisibleBuffer::new(
             &device,
             index_buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
-            Some("rect staging index buffer"),
+            Some("duck staging index buffer"),
         )?;
-        staging_index_buffer.write_pod(&SCENE_INDICES)?;
+        staging_index_buffer.write_pod(&scene_indices)?;
 
         let mut index_buffer = DeviceLocalBuffer::new(
             &device,
             index_buffer_size,
             vk::BufferUsageFlags::INDEX_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST,
-            Some("rect index buffer"),
+            Some("duck index buffer"),
         )?;
 
         let upload_command_pool = ResettableCommandPool::new(
@@ -1584,16 +1608,6 @@ impl AppRunner {
             Some(Arc::new(swapchain))
         };
 
-        let asset_map_path =
-            state.self_dir.join("assets").join("asset_map.toml");
-        let asset_map: AssetMap = toml::from_str(
-            &std::fs::read_to_string(&asset_map_path).map_err(|e| {
-                eyre::eyre!("Failed to read {}: {e}", asset_map_path.display())
-            })?,
-        )?;
-        tracing::debug!(asset_map = ?asset_map.map, "Loaded asset map");
-
-        let assets_dir = state.self_dir.join("assets");
         let shader_name = if state.shader_debug_info {
             "phoenix-shader-debug"
         } else {
@@ -1820,28 +1834,13 @@ impl AppRunner {
             .expect("allocated exactly one material set");
         material_descriptor_set.set_name(&device, Some("material set"));
 
-        let tex_filename = asset_map
-            .map
-            .get("statue-tex")
-            .ok_or_else(|| eyre::eyre!("asset 'statue-tex' not in map"))?;
-        let tex_path = assets_dir.join(tex_filename);
-        let tex_img = image::open(&tex_path)
-            .map_err(|e| {
-                eyre::eyre!(
-                    "Failed to open texture {}: {e}",
-                    tex_path.display()
-                )
-            })?
-            .into_rgba8();
-        let (tex_width, tex_height) = tex_img.dimensions();
-        let tex_bytes = tex_img.into_raw();
         let tex_staging_size = tex_bytes.len() as vk::DeviceSize;
 
         let mut tex_staging = HostVisibleBuffer::new(
             &device,
             tex_staging_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
-            Some("statue-tex staging"),
+            Some("duck-tex staging"),
         )?;
         tex_staging.write_pod(tex_bytes.as_slice())?;
 
@@ -1851,7 +1850,7 @@ impl AppRunner {
             tex_height,
             vk::Format::R8G8B8A8_SRGB,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            Some("statue-tex"),
+            Some("duck-tex"),
         )?;
 
         // Record all uploads into a single command buffer, then
@@ -1893,7 +1892,7 @@ impl AppRunner {
             vk::Filter::LINEAR,
             vk::Filter::LINEAR,
             vk::SamplerAddressMode::CLAMP_TO_EDGE,
-            Some("statue-tex sampler"),
+            Some("duck-tex sampler"),
         )?;
 
         // SAFETY: texture and sampler live in RunningState /
@@ -1923,6 +1922,7 @@ impl AppRunner {
             pipeline,
             vertex_buffer,
             index_buffer,
+            index_count,
             pipeline_color_format,
             command_pool,
             frames,
@@ -2075,6 +2075,7 @@ impl AppRunner {
             pipeline,
             vertex_buffer: state.vertex_buffer,
             index_buffer: state.index_buffer,
+            index_count: state.index_count,
             pipeline_color_format,
             command_pool: state.command_pool,
             frames: state.frames,

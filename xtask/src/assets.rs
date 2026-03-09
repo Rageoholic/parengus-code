@@ -5,6 +5,7 @@ use std::{
 };
 
 use asset_pipeline::{AppAssets, AssetMap, AssetType, Manifest, ManifestEntry};
+use gltf::Gltf;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -48,6 +49,41 @@ pub(crate) fn copy_assets(
         let src = match entry.asset_type {
             AssetType::Image => assets_src_dir.join(&entry.file),
             AssetType::Shader => shader_cache_dir.join(&entry.file),
+            AssetType::Mesh => {
+                let gltf_src = assets_src_dir.join(&entry.file);
+                let src_dir = gltf_src.parent().unwrap_or(assets_src_dir);
+                let doc = Gltf::open(&gltf_src)?;
+
+                for buf in doc.buffers() {
+                    if let gltf::buffer::Source::Uri(uri) = buf.source() {
+                        let s = src_dir.join(uri);
+                        let d = dst_dir.join(uri);
+                        if let Some(p) = d.parent() {
+                            fs::create_dir_all(p)?;
+                        }
+                        if !is_up_to_date(&s, &d) {
+                            fs::copy(&s, &d)?;
+                            println!("Copied {uri}");
+                        }
+                    }
+                }
+
+                for img in doc.images() {
+                    if let gltf::image::Source::Uri { uri, .. } = img.source() {
+                        let s = src_dir.join(uri);
+                        let d = dst_dir.join(uri);
+                        if let Some(p) = d.parent() {
+                            fs::create_dir_all(p)?;
+                        }
+                        if !is_up_to_date(&s, &d) {
+                            fs::copy(&s, &d)?;
+                            println!("Copied {uri}");
+                        }
+                    }
+                }
+
+                gltf_src
+            }
             _ => {
                 return Err(format!(
                     "asset `{}`: unsupported type `{}`",

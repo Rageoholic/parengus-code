@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "kebab-case")]
 pub enum AssetType {
     Image,
+    Mesh,
     Shader,
 }
 
@@ -16,6 +17,7 @@ impl fmt::Display for AssetType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AssetType::Image => write!(f, "image"),
+            AssetType::Mesh => write!(f, "mesh"),
             AssetType::Shader => write!(f, "shader"),
         }
     }

@@ -25,6 +25,14 @@ source_file = "shaders/phoenix.slang"
 compile_args = ["-g"]
 
 [[asset]]
+name = "duck"
+file = "Duck.gltf"
+type = "mesh"
+source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
+author = "Khronos Group"
+license = "CC-BY 4.0"
+
+[[asset]]
 name = "statue-tex"
 file = "statue-tex.png"
 source = "https://pixabay.com/photos/statue-sculpture-figure-1275469/"
