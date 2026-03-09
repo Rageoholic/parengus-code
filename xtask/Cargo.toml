@@ -6,4 +6,5 @@ publish = false
 
 [dependencies]
 asset-pipeline = { path = "../asset-pipeline" }
+gltf = "1"
 toml = "1.0"

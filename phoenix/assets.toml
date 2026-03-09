@@ -7,5 +7,5 @@ name = "phoenix-shader-debug"
 type = "shader"
 
 [[asset]]
-name = "statue-tex"
-type = "image"
+name = "duck"
+type = "mesh"
