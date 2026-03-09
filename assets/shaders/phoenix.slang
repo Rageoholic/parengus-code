@@ -2,13 +2,13 @@
 typedef column_major float4x4 VekMat4;
 
 // Set 0 — camera: combined view-projection matrix, updated per frame.
-struct Ubo
+struct CameraUbo
 {
     VekMat4 view_proj;
 };
 
 [[vk::binding(0, 0)]]
-ConstantBuffer<Ubo> ubo;
+ConstantBuffer<CameraUbo> camera;
 
 // Set 1 — material: texture sampler, bound once at load time.
 [[vk::binding(0, 1)]]
@@ -45,7 +45,7 @@ VertexOutput vert_main(VertexInput input)
     // model is a push constant (cheap per-draw update);
     // view_proj comes from the UBO (updated each frame).
     output.sv_position = mul(
-        ubo.view_proj,
+        camera.view_proj,
         mul(push.model, float4(input.position, 1.0)));
     output.tex_coord = input.tex_coord;
     return output;

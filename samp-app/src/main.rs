@@ -58,26 +58,25 @@ struct Vertex {
     tex_coord: Vec2<f32>,
 }
 
-/// Uniform buffer object — projection matrix only.
+/// Uniform buffer object — combined view-projection matrix.
 ///
-/// Projection is separated from model-view because it only changes
-/// on window resize; keeping it in the UBO lets the descriptor set
-/// carry it without a push-constant update each frame.
+/// View and projection are folded into one matrix (proj × view) and
+/// uploaded once per frame. The per-draw model matrix goes into push
+/// constants instead.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct Ubo {
-    projection: Mat4<f32>,
+    view_proj: Mat4<f32>,
 }
 
-/// Push-constant block — model-view matrix.
+/// Push-constant block — model matrix.
 ///
-/// Model-view changes every frame (the model rotates, camera is
-/// fixed) so it is supplied as a push constant: baked directly into
-/// the command buffer with no descriptor set update needed.
+/// The model rotates every frame; uploading the model matrix as a
+/// push constant avoids a descriptor set update each frame.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct PushConstants {
-    model_view: Mat4<f32>,
+    model: Mat4<f32>,
 }
 
 /// Three overlapping 0.8×0.8 quads at increasing Z heights.
@@ -659,16 +658,19 @@ struct RunningState {
     frames: Vec<FrameSync>,
     current_frame: usize,
     debug_counters: DebugCounters,
-    descriptor_set_layout: Arc<DescriptorSetLayout>,
-    /// Shared pipeline layout referencing `descriptor_set_layout`.
+    camera_set_layout: Arc<DescriptorSetLayout>,
+    material_set_layout: Arc<DescriptorSetLayout>,
+    /// Shared pipeline layout referencing both set layouts.
     /// Reused when rebuilding the pipeline after a format change.
     pipeline_layout: Arc<PipelineLayout>,
     descriptor_pool: DescriptorPool,
     /// One host-visible UBO buffer per frame in flight.
     ubo_buffers: Vec<HostVisibleBuffer>,
-    /// One descriptor set per frame in flight, each pointing at the
-    /// matching entry in `ubo_buffers`.
-    descriptor_sets: Vec<DescriptorSet>,
+    /// One camera descriptor set per frame in flight, each pointing
+    /// at the matching entry in `ubo_buffers`.
+    camera_descriptor_sets: Vec<DescriptorSet>,
+    /// Single material descriptor set — texture never changes.
+    material_descriptor_set: DescriptorSet,
     /// Wall-clock time at which the app entered the Running state;
     /// used to drive the rotation animation.
     start_time: Instant,
@@ -693,7 +695,8 @@ impl std::fmt::Debug for RunningState {
             .field("frames", &self.frames)
             .field("current_frame", &self.current_frame)
             .field("debug_counters", &self.debug_counters)
-            .field("descriptor_set_layout", &self.descriptor_set_layout)
+            .field("camera_set_layout", &self.camera_set_layout)
+            .field("material_set_layout", &self.material_set_layout)
             .field("descriptor_pool", &self.descriptor_pool)
             .finish_non_exhaustive()
     }
@@ -712,11 +715,13 @@ struct SuspendedState {
     command_pool: ResettableCommandPool,
     frames: Vec<FrameSync>,
     debug_counters: DebugCounters,
-    descriptor_set_layout: Arc<DescriptorSetLayout>,
+    camera_set_layout: Arc<DescriptorSetLayout>,
+    material_set_layout: Arc<DescriptorSetLayout>,
     pipeline_layout: Arc<PipelineLayout>,
     descriptor_pool: DescriptorPool,
     ubo_buffers: Vec<HostVisibleBuffer>,
-    descriptor_sets: Vec<DescriptorSet>,
+    camera_descriptor_sets: Vec<DescriptorSet>,
+    material_descriptor_set: DescriptorSet,
     start_time: Instant,
     asset_map: AssetMap,
     texture: Texture,
@@ -797,11 +802,13 @@ impl ApplicationHandler for AppRunner {
                 frames,
                 current_frame: _,
                 debug_counters,
-                descriptor_set_layout,
+                camera_set_layout,
+                material_set_layout,
                 pipeline_layout,
                 descriptor_pool,
                 ubo_buffers,
-                descriptor_sets,
+                camera_descriptor_sets,
+                material_descriptor_set,
                 start_time,
                 asset_map,
                 texture,
@@ -829,11 +836,13 @@ impl ApplicationHandler for AppRunner {
                 command_pool,
                 frames,
                 debug_counters,
-                descriptor_set_layout,
+                camera_set_layout,
+                material_set_layout,
                 pipeline_layout,
                 descriptor_pool,
                 ubo_buffers,
-                descriptor_sets,
+                camera_descriptor_sets,
+                material_descriptor_set,
                 start_time,
                 asset_map,
                 texture,
@@ -1090,11 +1099,13 @@ impl AppRunner {
         let elapsed = state.start_time.elapsed().as_secs_f32();
         let aspect = extent.width as f32 / extent.height as f32;
 
-        // Projection — uploaded to the per-frame UBO (changes on
-        // resize, but we simply recompute every frame for simplicity).
-        // 60° vertical FOV, depth range [0.1, 100].
+        // View-projection — uploaded to the per-frame UBO.
+        // Camera is fixed at world-space (2, -2, 1.5); projection
+        // uses 60° vertical FOV, depth range [0.1, 100].
+        let view =
+            look_at_rh(Vec3::new(2.0, -2.0, 1.5), Vec3::zero(), Vec3::unit_z());
         let ubo = Ubo {
-            projection: perspective_rh_zo(PI32 / 3.0, aspect, 0.1, 100.0),
+            view_proj: perspective_rh_zo(PI32 / 3.0, aspect, 0.1, 100.0) * view,
         };
         if let Err(e) =
             state.ubo_buffers[frame_idx].write_pod(std::slice::from_ref(&ubo))
@@ -1102,15 +1113,10 @@ impl AppRunner {
             return DrawFrameOutcome::Fatal(format!("UBO write failed: {e}"));
         }
 
-        // Model-view — uploaded as a push constant each frame.
-        // Camera is fixed at world-space (2, -2, 1.5) looking at the
-        // origin; the model rotates around +Z (the world up axis).
+        // Model — uploaded as a push constant each frame.
+        // The model rotates around +Z (the world up axis).
         let model = Mat4::<f32>::rotation_z(elapsed * PI32 * 2.0 / 5.0);
-        let view =
-            look_at_rh(Vec3::new(2.0, -2.0, 1.5), Vec3::zero(), Vec3::unit_z());
-        let push = PushConstants {
-            model_view: view * model,
-        };
+        let push = PushConstants { model };
 
         let pipeline_handle = state.pipeline.raw_pipeline();
         let frame_cmd = &mut frame_objs.command_buffer;
@@ -1251,14 +1257,17 @@ impl AppRunner {
         // SAFETY: inside a dynamic render pass with a compatible
         // color attachment.
         unsafe { frame_cmd.bind_graphics_pipeline(pipeline_handle) };
-        // SAFETY: recording state; pipeline_layout is compatible with the
-        // bound pipeline; descriptor set is valid and its buffer remains
-        // alive for the duration of this frame's GPU work.
+        // SAFETY: recording state; pipeline_layout is compatible with
+        // the bound pipeline; both descriptor sets are valid and their
+        // resources remain alive for this frame's GPU work.
         unsafe {
             frame_cmd.bind_descriptor_sets(
                 &state.pipeline_layout,
                 0,
-                &[&state.descriptor_sets[frame_idx]],
+                &[
+                    &state.camera_descriptor_sets[frame_idx],
+                    &state.material_descriptor_set,
+                ],
             )
         };
         // SAFETY: recording state; layout is compatible with the bound
@@ -1625,29 +1634,32 @@ impl AppRunner {
             .map(|sc| sc.format())
             .unwrap_or(vk::Format::B8G8R8A8_SRGB);
 
-        let descriptor_set_layout = Arc::new(DescriptorSetLayout::new(
+        let camera_set_layout = Arc::new(DescriptorSetLayout::new(
             &device,
-            &[
-                DescriptorBindingDesc {
-                    binding: 0,
-                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-                    count: 1,
-                    stage_flags: vk::ShaderStageFlags::VERTEX,
-                },
-                DescriptorBindingDesc {
-                    binding: 1,
-                    descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    count: 1,
-                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
-                },
-            ],
+            &[DescriptorBindingDesc {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                count: 1,
+                stage_flags: vk::ShaderStageFlags::VERTEX,
+            }],
+            Some("camera set layout"),
+        )?);
+        let material_set_layout = Arc::new(DescriptorSetLayout::new(
+            &device,
+            &[DescriptorBindingDesc {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                count: 1,
+                stage_flags: vk::ShaderStageFlags::FRAGMENT,
+            }],
+            Some("material set layout"),
         )?);
         let pipeline_layout = Arc::new(PipelineLayout::new(
             &device,
             &PipelineLayoutDesc {
-                set_layouts: &[&descriptor_set_layout],
+                set_layouts: &[&camera_set_layout, &material_set_layout],
                 // One push constant range covering the full
-                // PushConstants struct (model_view: Mat4 = 64 bytes),
+                // PushConstants struct (model: Mat4 = 64 bytes),
                 // accessible from the vertex stage only.
                 push_constant_ranges: &[vk::PushConstantRange {
                     stage_flags: vk::ShaderStageFlags::VERTEX,
@@ -1756,9 +1768,10 @@ impl AppRunner {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        // One camera set per frame + one material set = FIF + 1 total.
         let descriptor_pool = DescriptorPool::new(
             &device,
-            MAX_FRAMES_IN_FLIGHT as u32,
+            (MAX_FRAMES_IN_FLIGHT + 1) as u32,
             &[
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -1766,21 +1779,40 @@ impl AppRunner {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+                    descriptor_count: 1,
                 },
             ],
+            Some("descriptor pool"),
         )?;
 
-        let layouts: Vec<&DescriptorSetLayout> = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|_| descriptor_set_layout.as_ref())
+        let camera_layouts: Vec<&DescriptorSetLayout> = (0
+            ..MAX_FRAMES_IN_FLIGHT)
+            .map(|_| camera_set_layout.as_ref())
             .collect();
-        let descriptor_sets = descriptor_pool.allocate_sets(&layouts)?;
-        for (set, buf) in descriptor_sets.iter().zip(ubo_buffers.iter()) {
+        // SAFETY: descriptor_pool outlives camera_descriptor_sets and
+        // material_descriptor_set (all stored in the same state struct,
+        // dropped in declaration order — sets before pool).
+        let camera_descriptor_sets =
+            unsafe { descriptor_pool.allocate_sets(&camera_layouts) }?;
+        for (i, (set, buf)) in camera_descriptor_sets
+            .iter()
+            .zip(ubo_buffers.iter())
+            .enumerate()
+        {
+            set.set_name(&device, Some(&format!("camera set {i}")));
             // SAFETY: buf is a valid UNIFORM_BUFFER from device with
             // size ubo_size; it remains alive for the lifetime of the
             // descriptor set (both live in RunningState/SuspendedState).
             unsafe { set.write_uniform_buffer(&device, 0, buf, ubo_size) };
         }
+        // SAFETY: same guarantee as camera_descriptor_sets above.
+        let mut material_sets = unsafe {
+            descriptor_pool.allocate_sets(&[material_set_layout.as_ref()])
+        }?;
+        let material_descriptor_set = material_sets
+            .pop()
+            .expect("allocated exactly one material set");
+        material_descriptor_set.set_name(&device, Some("material set"));
 
         let tex_filename = asset_map
             .map
@@ -1858,14 +1890,13 @@ impl AppRunner {
             Some("statue-tex sampler"),
         )?;
 
-        for set in &descriptor_sets {
-            // SAFETY: texture and sampler live in RunningState /
-            // SuspendedState and outlive any command buffer that
-            // references these descriptor sets.
-            unsafe {
-                set.write_texture_sampler(&device, 1, &texture, &sampler)
-            };
-        }
+        // SAFETY: texture and sampler live in RunningState /
+        // SuspendedState and outlive any command buffer that
+        // references this descriptor set.
+        unsafe {
+            material_descriptor_set
+                .write_texture_sampler(&device, 0, &texture, &sampler)
+        };
 
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
         let idle_guard =
@@ -1891,11 +1922,13 @@ impl AppRunner {
             frames,
             current_frame: 0,
             debug_counters,
-            descriptor_set_layout,
+            camera_set_layout,
+            material_set_layout,
             pipeline_layout,
             descriptor_pool,
             ubo_buffers,
-            descriptor_sets,
+            camera_descriptor_sets,
+            material_descriptor_set,
             start_time: Instant::now(),
             asset_map,
             texture,
@@ -2041,11 +2074,13 @@ impl AppRunner {
             frames: state.frames,
             current_frame: 0,
             debug_counters,
-            descriptor_set_layout: state.descriptor_set_layout,
+            camera_set_layout: state.camera_set_layout,
+            material_set_layout: state.material_set_layout,
             pipeline_layout: state.pipeline_layout,
             descriptor_pool: state.descriptor_pool,
             ubo_buffers: state.ubo_buffers,
-            descriptor_sets: state.descriptor_sets,
+            camera_descriptor_sets: state.camera_descriptor_sets,
+            material_descriptor_set: state.material_descriptor_set,
             start_time: state.start_time,
             asset_map: state.asset_map,
             texture: state.texture,

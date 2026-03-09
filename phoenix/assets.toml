@@ -1,9 +1,9 @@
 [[asset]]
-name = "shader"
+name = "phoenix-shader"
 type = "shader"
 
 [[asset]]
-name = "shader-debug"
+name = "phoenix-shader-debug"
 type = "shader"
 
 [[asset]]
