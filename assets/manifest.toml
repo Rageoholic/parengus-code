@@ -12,6 +12,19 @@ source_file = "shaders/shader.slang"
 compile_args = ["-g"]
 
 [[asset]]
+name = "phoenix-shader"
+file = "phoenix.spv"
+type = "shader"
+source_file = "shaders/phoenix.slang"
+
+[[asset]]
+name = "phoenix-shader-debug"
+file = "phoenix.debug.spv"
+type = "shader"
+source_file = "shaders/phoenix.slang"
+compile_args = ["-g"]
+
+[[asset]]
 name = "statue-tex"
 file = "statue-tex.png"
 source = "https://pixabay.com/photos/statue-sculpture-figure-1275469/"

@@ -381,7 +381,9 @@ impl Device {
             enable_memory_budget: bool,
         }
 
-        let mut candidates: Vec<DeviceCandidate> = Vec::new();
+        //Capacity here is upper bound
+        let mut candidates: Vec<DeviceCandidate> =
+            Vec::with_capacity(physical_devices.len());
         let mut skipped_for_sample_count = false;
 
         'dev: for &dev in &physical_devices {

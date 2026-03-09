@@ -41,6 +41,7 @@ pub mod descriptor;
 pub mod device;
 pub mod image;
 pub mod instance;
+mod marker;
 pub mod memory;
 pub mod pipeline;
 pub mod renderpass;

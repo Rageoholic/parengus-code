@@ -65,6 +65,7 @@ impl DescriptorSetLayout {
     pub fn new(
         device: &Arc<Device>,
         bindings: &[DescriptorBindingDesc],
+        name: Option<&str>,
     ) -> Result<Self, vk::Result> {
         let vk_bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> =
             bindings.iter().copied().map(Into::into).collect();
@@ -74,6 +75,14 @@ impl DescriptorSetLayout {
         // for the duration of this call.
         let handle =
             unsafe { device.create_raw_descriptor_set_layout(&create_info) }?;
+        // SAFETY: handle is a valid descriptor set layout from device.
+        let name_result = unsafe { device.set_object_name_str(handle, name) };
+        if let Err(e) = name_result {
+            tracing::warn!(
+                "Failed to name descriptor set layout {:?}: {e}",
+                handle
+            );
+        }
         Ok(Self {
             parent: Arc::clone(device),
             handle,
@@ -101,11 +110,21 @@ impl Drop for DescriptorSetLayout {
 
 /// An owned wrapper around a `VkDescriptorPool`.
 ///
-/// Allocates [`DescriptorSet`] handles. All sets allocated from a pool
-/// are freed implicitly when the pool is dropped.
+/// Allocates [`DescriptorSet`] handles. Each set holds an
+/// [`Arc`] back to its parent pool, so the pool is kept alive for
+/// at least as long as any set allocated from it. The pool is freed
+/// when the last [`Arc`] referencing it is dropped.
+///
+/// `VkDescriptorPool` requires external synchronization for all
+/// allocation and free operations; this type is `!Sync` so that a
+/// shared `&DescriptorPool` cannot be obtained across threads.
 pub struct DescriptorPool {
     parent: Arc<Device>,
     handle: vk::DescriptorPool,
+    /// `vkAllocateDescriptorSets` and `vkFreeDescriptorSets` require
+    /// external synchronization of the pool; `!Sync` prevents sharing
+    /// `&DescriptorPool` across threads.
+    _not_sync: crate::marker::PhantomUnsync,
 }
 
 impl std::fmt::Debug for DescriptorPool {
@@ -126,6 +145,7 @@ impl DescriptorPool {
         device: &Arc<Device>,
         max_sets: u32,
         pool_sizes: &[vk::DescriptorPoolSize],
+        name: Option<&str>,
     ) -> Result<Self, vk::Result> {
         let create_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(max_sets)
@@ -134,18 +154,25 @@ impl DescriptorPool {
         // SAFETY: create_info is valid and references only stack data.
         let handle =
             unsafe { device.create_raw_descriptor_pool(&create_info) }?;
+        // SAFETY: handle is a valid descriptor pool from device.
+        let name_result = unsafe { device.set_object_name_str(handle, name) };
+        if let Err(e) = name_result {
+            tracing::warn!("Failed to name descriptor pool {:?}: {e}", handle);
+        }
         Ok(Self {
             parent: Arc::clone(device),
             handle,
+            _not_sync: crate::marker::PhantomUnsync::default(),
         })
     }
 
     /// Allocate one descriptor set per provided layout.
     ///
-    /// The returned sets are freed implicitly when this pool is
-    /// dropped. The caller must not use them after the pool has been
-    /// destroyed.
-    pub fn allocate_sets(
+    /// # Safety
+    /// The caller must ensure that this pool outlives all descriptor
+    /// sets allocated from it. Descriptor sets become invalid when
+    /// their pool is reset or destroyed.
+    pub unsafe fn allocate_sets(
         &self,
         layouts: &[&DescriptorSetLayout],
     ) -> Result<Vec<DescriptorSet>, vk::Result> {
@@ -182,20 +209,42 @@ impl Drop for DescriptorPool {
 // DescriptorSet
 // ---------------------------------------------------------------------------
 
-/// A typed handle to a descriptor set allocated from a
-/// [`DescriptorPool`].
+/// A descriptor set allocated from a [`DescriptorPool`].
 ///
-/// Descriptor sets do not own their memory — they are freed implicitly
-/// when their parent pool is dropped. The caller is responsible for
-/// ensuring this handle is not used after the pool has been destroyed.
-#[derive(Debug)]
+/// The pool must outlive all descriptor sets allocated from it;
+/// this contract is documented on [`DescriptorPool::allocate_sets`].
 pub struct DescriptorSet {
     handle: vk::DescriptorSet,
+}
+
+impl std::fmt::Debug for DescriptorSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DescriptorSet")
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DescriptorSet {
     pub fn raw_descriptor_set(&self) -> vk::DescriptorSet {
         self.handle
+    }
+
+    /// Assign a debug name to this descriptor set.
+    ///
+    /// The name is visible in validation layer output and GPU
+    /// debuggers. Naming is best-effort; failures are logged and
+    /// ignored.
+    pub fn set_name(&self, device: &Arc<Device>, name: Option<&str>) {
+        // SAFETY: handle is a valid descriptor set from device.
+        let name_result =
+            unsafe { device.set_object_name_str(self.handle, name) };
+        if let Err(e) = name_result {
+            tracing::warn!(
+                "Failed to name descriptor set {:?}: {e}",
+                self.handle
+            );
+        }
     }
 
     /// Update this descriptor set's binding with a combined image sampler.
