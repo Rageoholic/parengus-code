@@ -36,112 +36,125 @@ fn try_main() -> Result<()> {
 }
 
 // ----------------------------------------------------------------
+// App registry
+// ----------------------------------------------------------------
+
+struct App {
+    name: &'static str,
+}
+
+const APPS: &[App] = &[
+    App { name: "samp-app" },
+    App {
+        name: "samp-app-noext",
+    },
+    App { name: "phoenix" },
+];
+
+// ----------------------------------------------------------------
 // Task graph
 // ----------------------------------------------------------------
 
 struct Task {
-    name: &'static str,
-    deps: &'static [&'static str],
-    run: fn() -> Result<()>,
+    name: String,
+    deps: Vec<String>,
+    run: Box<dyn Fn() -> Result<()>>,
 }
 
-fn noop() -> Result<()> {
-    Ok(())
-}
+// Task name prefixes for generated per-app tasks.
+const TASK_CARGO_BUILD: &str = "cargo-build";
+const TASK_COPY_EXE: &str = "copy-exe";
+const TASK_COPY_ASSETS: &str = "copy-assets";
+const TASK_BUILD: &str = "build";
+
+// Names of shared / root tasks.
+const TASK_COMPILE_SHADERS: &str = "compile-shaders";
+const TASK_BUILD_ALL: &str = "build-all";
+
+const TASKS_SHARED: usize = 1; // compile-shaders
+const TASKS_PER_APP: usize = 4; // cargo-build, copy-exe, copy-assets, build-{app}
+const TASKS_ROOT: usize = 2; // build, build-all
+const TASK_COUNT: usize =
+    TASKS_SHARED + TASKS_PER_APP * APPS.len() + TASKS_ROOT;
 
 fn all_tasks() -> Vec<Task> {
-    vec![
-        Task {
-            name: "cargo-build",
-            deps: &[],
-            run: cargo_build,
-        },
-        Task {
-            name: "cargo-build-noext",
-            deps: &[],
-            run: cargo_build_noext,
-        },
-        Task {
-            name: "compile-shaders",
-            deps: &[],
-            run: compile_shaders,
-        },
-        Task {
-            name: "copy-exe",
-            deps: &["cargo-build"],
-            run: copy_exe,
-        },
-        Task {
-            name: "copy-exe-noext",
-            deps: &["cargo-build-noext"],
-            run: copy_exe_noext,
-        },
-        Task {
-            name: "copy-assets",
-            deps: &["compile-shaders"],
-            run: copy_assets,
-        },
-        Task {
-            name: "copy-assets-noext",
-            deps: &["compile-shaders"],
-            run: copy_assets_noext,
-        },
-        Task {
-            name: "build-samp-app",
-            deps: &[
-                "cargo-build",
-                "compile-shaders",
-                "copy-exe",
-                "copy-assets",
+    let mut tasks: Vec<Task> = Vec::with_capacity(TASK_COUNT);
+
+    tasks.push(Task {
+        name: TASK_COMPILE_SHADERS.into(),
+        deps: vec![],
+        run: Box::new(compile_shaders),
+    });
+
+    assert!(tasks.len() == TASKS_SHARED, "Shared task count incorrect");
+
+    for app in APPS {
+        let n = app.name;
+        let cargo_build = format!("{TASK_CARGO_BUILD}-{n}");
+        let copy_exe = format!("{TASK_COPY_EXE}-{n}");
+        let copy_assets = format!("{TASK_COPY_ASSETS}-{n}");
+        let build = format!("{TASK_BUILD}-{n}");
+
+        let pre_app_task_count = tasks.len();
+
+        tasks.push(Task {
+            name: cargo_build.clone(),
+            deps: vec![],
+            run: Box::new(move || cargo_build_pkg(n)),
+        });
+        tasks.push(Task {
+            name: copy_exe.clone(),
+            deps: vec![cargo_build.clone()],
+            run: Box::new(move || copy_exe_for(n)),
+        });
+        tasks.push(Task {
+            name: copy_assets.clone(),
+            deps: vec![TASK_COMPILE_SHADERS.into()],
+            run: Box::new(move || copy_assets_for(n)),
+        });
+        tasks.push(Task {
+            name: build,
+            deps: vec![
+                cargo_build,
+                TASK_COMPILE_SHADERS.into(),
+                copy_exe,
+                copy_assets,
             ],
-            run: noop,
-        },
-        Task {
-            name: "build-noext",
-            deps: &[
-                "cargo-build-noext",
-                "compile-shaders",
-                "copy-exe-noext",
-                "copy-assets-noext",
-            ],
-            run: noop,
-        },
-        Task {
-            name: "cargo-build-phoenix",
-            deps: &[],
-            run: cargo_build_phoenix,
-        },
-        Task {
-            name: "copy-exe-phoenix",
-            deps: &["cargo-build-phoenix"],
-            run: copy_exe_phoenix,
-        },
-        Task {
-            name: "copy-assets-phoenix",
-            deps: &["compile-shaders"],
-            run: copy_assets_phoenix,
-        },
-        Task {
-            name: "build-phoenix",
-            deps: &[
-                "cargo-build-phoenix",
-                "compile-shaders",
-                "copy-exe-phoenix",
-                "copy-assets-phoenix",
-            ],
-            run: noop,
-        },
-        Task {
-            name: "build",
-            deps: &["build-samp-app", "build-noext", "build-phoenix"],
-            run: noop,
-        },
-        Task {
-            name: "build-all",
-            deps: &["build"],
-            run: noop,
-        },
-    ]
+            run: Box::new(|| Ok(())),
+        });
+
+        assert!(
+            tasks.len() - pre_app_task_count == TASKS_PER_APP,
+            "per app task count incorrect"
+        );
+    }
+
+    let build_deps: Vec<String> = APPS
+        .iter()
+        .map(|a| format!("{TASK_BUILD}-{}", a.name))
+        .collect();
+
+    let pre_root_task_count = tasks.len();
+
+    tasks.push(Task {
+        name: TASK_BUILD.into(),
+        deps: build_deps,
+        run: Box::new(|| Ok(())),
+    });
+    tasks.push(Task {
+        name: TASK_BUILD_ALL.into(),
+        deps: vec![TASK_BUILD.into()],
+        run: Box::new(|| Ok(())),
+    });
+
+    assert!(
+        tasks.len() - pre_root_task_count == TASKS_ROOT,
+        "Root task count incorrect"
+    );
+
+    assert!(tasks.len() == TASK_COUNT, "Total task count incorrect");
+
+    tasks
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -169,8 +182,9 @@ fn collect_topo(
         return Ok(());
     }
     visited[idx] = true;
-    let deps = tasks[idx].deps;
-    for &dep in deps {
+    // Collect deps into a temporary vec to avoid borrow conflicts.
+    let deps: Vec<String> = tasks[idx].deps.clone();
+    for dep in &deps {
         collect_topo(tasks, dep, visited, order)?;
     }
     order.push(idx);
@@ -187,8 +201,8 @@ fn execute_graph(target: &str) -> Result<()> {
 
     for &idx in &order {
         let task = &tasks[idx];
-        let blocked = task.deps.iter().any(|&dep| {
-            let dep_idx = tasks.iter().position(|t| t.name == dep).unwrap();
+        let blocked = task.deps.iter().any(|dep| {
+            let dep_idx = tasks.iter().position(|t| t.name == *dep).unwrap();
             matches!(statuses[dep_idx], Some(Status::Failed | Status::Skipped))
         });
 
@@ -210,7 +224,7 @@ fn execute_graph(target: &str) -> Result<()> {
     let failed: Vec<&str> = order
         .iter()
         .filter(|&&i| statuses[i] == Some(Status::Failed))
-        .map(|&i| tasks[i].name)
+        .map(|&i| tasks[i].name.as_str())
         .collect();
 
     if failed.is_empty() {
@@ -319,16 +333,6 @@ fn copy_assets_for(app_name: &str) -> Result<()> {
     )
 }
 
-// ---- Task entry points ------------------------------------------
-
-fn cargo_build() -> Result<()> {
-    cargo_build_pkg("samp-app")
-}
-
-fn cargo_build_noext() -> Result<()> {
-    cargo_build_pkg("samp-app-noext")
-}
-
 fn compile_shaders() -> Result<()> {
     let root = workspace_root();
     let assets_dir = root.join("assets");
@@ -374,32 +378,4 @@ fn compile_shaders() -> Result<()> {
 
     println!("Shaders: {compiled} compiled, {skipped} up-to-date");
     Ok(())
-}
-
-fn copy_exe() -> Result<()> {
-    copy_exe_for("samp-app")
-}
-
-fn copy_exe_noext() -> Result<()> {
-    copy_exe_for("samp-app-noext")
-}
-
-fn copy_assets() -> Result<()> {
-    copy_assets_for("samp-app")
-}
-
-fn copy_assets_noext() -> Result<()> {
-    copy_assets_for("samp-app-noext")
-}
-
-fn cargo_build_phoenix() -> Result<()> {
-    cargo_build_pkg("phoenix")
-}
-
-fn copy_exe_phoenix() -> Result<()> {
-    copy_exe_for("phoenix")
-}
-
-fn copy_assets_phoenix() -> Result<()> {
-    copy_assets_for("phoenix")
 }
