@@ -1,32 +1,65 @@
-use std::io::{self, Read, Write};
+use std::{
+    io::{self, Read, Write},
+    marker::PhantomData,
+};
 
 pub const PMESH_MAGIC: u32 = u32::from_le_bytes(*b"PMSH");
 pub const PTEX_MAGIC: u32 = u32::from_le_bytes(*b"PTEX");
 pub const VERSION: u16 = 1;
 
-// ── AssetKind ────────────────────────────────────────────────────────────────
+// ── AssetId ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssetKind {
-    Mesh,
-    Texture,
+/// Phantom marker for mesh assets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Mesh;
+/// Phantom marker for texture assets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Texture;
+/// Phantom marker for shader assets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Shader;
+
+/// FNV-1a 64-bit hash of an asset name, typed by phantom `T`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AssetId<T>(pub u64, PhantomData<fn() -> T>);
+
+impl<T> AssetId<T> {
+    /// Construct from a raw hash value (e.g. read from a binary
+    /// asset file).
+    pub fn from_hash(hash: u64) -> Self {
+        Self(hash, PhantomData)
+    }
 }
 
-impl AssetKind {
-    pub fn to_u16(self) -> u16 {
-        match self {
-            Self::Mesh => 0,
-            Self::Texture => 1,
-        }
-    }
+pub type MeshId = AssetId<Mesh>;
+pub type TextureId = AssetId<Texture>;
+pub type ShaderId = AssetId<Shader>;
 
-    pub fn from_u16(v: u16) -> Option<Self> {
-        match v {
-            0 => Some(Self::Mesh),
-            1 => Some(Self::Texture),
-            _ => None,
-        }
+const FNV_OFFSET: u64 = 14695981039346656037;
+const FNV_PRIME: u64 = 1099511628211;
+
+pub const fn fnv1a(s: &str) -> u64 {
+    let bytes = s.as_bytes();
+    let mut hash = FNV_OFFSET;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        i += 1;
     }
+    hash
+}
+
+pub const fn mesh_id(name: &str) -> MeshId {
+    AssetId(fnv1a(name), PhantomData)
+}
+
+pub const fn texture_id(name: &str) -> TextureId {
+    AssetId(fnv1a(name), PhantomData)
+}
+
+pub const fn shader_id(name: &str) -> ShaderId {
+    AssetId(fnv1a(name), PhantomData)
 }
 
 // ── SectionKind ──────────────────────────────────────────────────────────────
@@ -42,6 +75,7 @@ pub enum SectionKind {
     MeshIndices32,
     MeshTexRef,
     TextureMip,
+    TextureInfo,
 }
 
 impl SectionKind {
@@ -56,6 +90,7 @@ impl SectionKind {
             Self::MeshIndices32 => 6,
             Self::MeshTexRef => 7,
             Self::TextureMip => 100,
+            Self::TextureInfo => 200,
         }
     }
 
@@ -72,6 +107,7 @@ impl SectionKind {
             6 => Some(Self::MeshIndices32),
             7 => Some(Self::MeshTexRef),
             100 => Some(Self::TextureMip),
+            200 => Some(Self::TextureInfo),
             _ => None,
         }
     }
@@ -102,13 +138,46 @@ impl Compression {
     }
 }
 
+// ── TexRole ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TexRole {
+    Albedo,
+    Normal,
+    MetallicRoughness,
+    Emissive,
+    Occlusion,
+}
+
+impl TexRole {
+    pub fn to_u32(self) -> u32 {
+        match self {
+            Self::Albedo => 0,
+            Self::Normal => 1,
+            Self::MetallicRoughness => 2,
+            Self::Emissive => 3,
+            Self::Occlusion => 4,
+        }
+    }
+
+    pub fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            0 => Some(Self::Albedo),
+            1 => Some(Self::Normal),
+            2 => Some(Self::MetallicRoughness),
+            3 => Some(Self::Emissive),
+            4 => Some(Self::Occlusion),
+            _ => None,
+        }
+    }
+}
+
 // ── FileHeader ───────────────────────────────────────────────────────────────
 
-/// Serialized size: 12 bytes.
+/// Serialized size: 10 bytes.
 pub struct FileHeader {
     pub magic: u32,
     pub version: u16,
-    pub asset_kind: AssetKind,
     pub section_count: u32,
 }
 
@@ -116,25 +185,19 @@ impl FileHeader {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
         w.write_all(&self.magic.to_le_bytes())?;
         w.write_all(&self.version.to_le_bytes())?;
-        w.write_all(&self.asset_kind.to_u16().to_le_bytes())?;
         w.write_all(&self.section_count.to_le_bytes())?;
         Ok(())
     }
 
     pub fn read_from(r: &mut impl Read) -> io::Result<Self> {
-        let mut buf = [0u8; 12];
+        let mut buf = [0u8; 10];
         r.read_exact(&mut buf)?;
         let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
-        let kind_raw = u16::from_le_bytes(buf[6..8].try_into().unwrap());
-        let section_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        let asset_kind = AssetKind::from_u16(kind_raw).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "unknown asset_kind")
-        })?;
+        let section_count = u32::from_le_bytes(buf[6..10].try_into().unwrap());
         Ok(Self {
             magic,
             version,
-            asset_kind,
             section_count,
         })
     }
@@ -142,7 +205,8 @@ impl FileHeader {
 
 // ── SectionHeader ────────────────────────────────────────────────────────────
 
-/// Serialized size: 28 bytes (includes 4-byte reserved field).
+/// Serialized size: 24 bytes (no padding or reserved fields).
+#[derive(Clone)]
 pub struct SectionHeader {
     pub kind: SectionKind,
     pub compression: Compression,
@@ -156,7 +220,6 @@ impl SectionHeader {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
         w.write_all(&self.kind.to_u32().to_le_bytes())?;
         w.write_all(&self.compression.to_u32().to_le_bytes())?;
-        w.write_all(&0u32.to_le_bytes())?; // reserved
         w.write_all(&self.byte_offset.to_le_bytes())?;
         w.write_all(&self.byte_len.to_le_bytes())?;
         w.write_all(&self.compressed_byte_len.to_le_bytes())?;
@@ -167,16 +230,15 @@ impl SectionHeader {
     /// Returns `Ok(None)` for unknown `kind`; caller should skip the
     /// section.
     pub fn read_from(r: &mut impl Read) -> io::Result<Option<Self>> {
-        let mut buf = [0u8; 28];
+        let mut buf = [0u8; 24];
         r.read_exact(&mut buf)?;
         let kind_raw = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let comp_raw = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        // buf[8..12] is reserved — ignored
-        let byte_offset = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-        let byte_len = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+        let byte_offset = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let byte_len = u32::from_le_bytes(buf[12..16].try_into().unwrap());
         let compressed_byte_len =
-            u32::from_le_bytes(buf[20..24].try_into().unwrap());
-        let element_count = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+            u32::from_le_bytes(buf[16..20].try_into().unwrap());
+        let element_count = u32::from_le_bytes(buf[20..24].try_into().unwrap());
 
         let Some(kind) = SectionKind::from_u32(kind_raw) else {
             return Ok(None);

@@ -6,5 +6,10 @@ publish = false
 
 [dependencies]
 asset-pipeline = { path = "../asset-pipeline" }
-gltf = "1"
+asset-shared = { path = "../asset-shared" }
+asset-compiler = { path = "../asset-compiler" }
+parengus-tracing = { path = "../parengus-tracing" }
+clap = { version = "4", features = ["derive"] }
+path-slash = "0.2"
+serde = { version = "1", features = ["derive"] }
 toml = "1.0"

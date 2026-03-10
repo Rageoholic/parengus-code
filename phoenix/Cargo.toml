@@ -5,8 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-asset-pipeline = { path = "../asset-pipeline" }
-gltf = "1"
+asset-loader = { path = "../asset-loader" }
+asset-shared = { path = "../asset-shared" }
 bytemuck = { version = "1.25.0", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }
 directories = "6.0.0"
@@ -14,7 +14,7 @@ eyre = "0.6.12"
 rgpu-vk = { version = "0.1.0", path = "../rgpu-vk" }
 tracing = "0.1.44"
 supports-color = "3"
-toml = "1.0"
 tracing-subscriber = "0.3.22"
 vek = { version = "0.17.2", features = ["bytemuck"] }
 winit = "0.30.13"
+parengus-tracing = { path = "../parengus-tracing" }

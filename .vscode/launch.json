@@ -27,6 +27,8 @@
             "request": "launch",
             "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
             "args": [
+                "--tracing-log-level",
+                "error",
                 "--graphics-debug-level",
                 "error"
             ],
@@ -54,72 +56,6 @@
             "preLaunchTask": "build samp-app debug"
         },
         {
-            "name": "(Windows) Launch samp-app (debug) trace no vk debug callback",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
-            "args": [
-                "--tracing-log-level",
-                "trace",
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/samp-app/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build samp-app debug"
-        },
-        {
-            "name": "(Windows) Launch samp-app (debug) trace no rgpu",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
-            "args": [
-                "--tracing-log-level",
-                "trace",
-                "--rgpu-log-level",
-                "off"
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/samp-app/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build samp-app debug"
-        },
-        {
-            "name": "(Windows) Launch samp-app (debug) queue-config: single",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
-            "args": [
-                "--graphics-debug-level",
-                "warn",
-                "--queue-mode",
-                "single"
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/samp-app/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build samp-app debug"
-        },
-        {
-            "name": "(Windows) Launch samp-app (debug) queue-config: unified",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
-            "args": [
-                "--graphics-debug-level",
-                "warn",
-                "--queue-mode",
-                "unified"
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/samp-app/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build samp-app debug"
-        },
-        {
             "name": "(Windows) Launch phoenix",
             "type": "cppvsdbg",
             "request": "launch",
@@ -137,104 +73,6 @@
             "preLaunchTask": "build phoenix debug"
         },
         {
-            "name": "(Windows) Launch phoenix (errors only)",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/phoenix/debug/phoenix.exe",
-            "args": [
-                "--graphics-debug-level",
-                "error"
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/phoenix/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build phoenix debug"
-        },
-        {
-            "name": "(Windows) Launch phoenix trace full",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/phoenix/debug/phoenix.exe",
-            "args": [
-                "--tracing-log-level",
-                "trace",
-                "--graphics-debug-level",
-                "trace"
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/phoenix/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build phoenix debug"
-        },
-        {
-            "name": "(Windows) Launch phoenix trace no vk debug callback",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/phoenix/debug/phoenix.exe",
-            "args": [
-                "--tracing-log-level",
-                "trace",
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/phoenix/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build phoenix debug"
-        },
-        {
-            "name": "(Windows) Launch phoenix trace no rgpu",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/phoenix/debug/phoenix.exe",
-            "args": [
-                "--tracing-log-level",
-                "trace",
-                "--rgpu-log-level",
-                "off"
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/phoenix/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build phoenix debug"
-        },
-        {
-            "name": "(Windows) Launch phoenix queue-config: single",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/phoenix/debug/phoenix.exe",
-            "args": [
-                "--graphics-debug-level",
-                "warn",
-                "--queue-mode",
-                "single"
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/phoenix/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build phoenix debug"
-        },
-        {
-            "name": "(Windows) Launch phoenix queue-config: unified",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/phoenix/debug/phoenix.exe",
-            "args": [
-                "--graphics-debug-level",
-                "warn",
-                "--queue-mode",
-                "unified"
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/phoenix/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build phoenix debug"
-        },
-        {
             "name": "(Windows) Launch samp-app-noext",
             "type": "cppvsdbg",
             "request": "launch",
@@ -244,21 +82,6 @@
                 "warn",
                 "--graphics-debug-level",
                 "warn"
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/samp-app-noext/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build samp-app-noext debug"
-        },
-        {
-            "name": "(Windows) Launch samp-app-noext (errors only)",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/samp-app-noext/debug/samp-app-noext.exe",
-            "args": [
-                "--graphics-debug-level",
-                "error"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceRoot}/out/samp-app-noext/debug/",
