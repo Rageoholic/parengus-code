@@ -31,6 +31,18 @@ type = "mesh"
 source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
 author = "Khronos Group"
 license = "CC-BY 4.0"
+tex_refs = { albedo = "duck-albedo" }
+
+[[asset]]
+name = "duck-albedo"
+file = "tex/DuckCM.png"
+type = "image"
+format = "rgba8"
+color_space = "srgb"
+mips = true
+source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
+author = "Khronos Group"
+license = "CC-BY 4.0"
 
 [[asset]]
 name = "statue-tex"
@@ -39,6 +51,9 @@ source = "https://pixabay.com/photos/statue-sculpture-figure-1275469/"
 author = "Undocumented on Pixabay"
 license = "Pixabay Content License https://pixabay.com/service/terms/"
 type = "image"
+format = "rgba8"
+color_space = "srgb"
+mips = true
 notes = """
 Modified by vulkan-tutorial \
 (https://docs.vulkan.org/tutorial/latest/06_Texture_mapping/00_Images.html) \

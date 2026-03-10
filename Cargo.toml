@@ -1,4 +1,21 @@
 [workspace]
-members = ["asset-pipeline", "phoenix", "rgpu-vk", "samp-app", "samp-app-noext", "xtask"]
-default-members = ["phoenix", "rgpu-vk", "samp-app", "samp-app-noext"]
+members = [
+    "asset-compiler",
+    "asset-loader",
+    "asset-pipeline",
+    "asset-shared",
+    "parengus-tracing",
+    "phoenix",
+    "rgpu-vk",
+    "samp-app",
+    "samp-app-noext",
+    "xtask",
+]
+default-members = [
+    "asset-loader",
+    "phoenix",
+    "rgpu-vk",
+    "samp-app",
+    "samp-app-noext",
+]
 resolver = "3"

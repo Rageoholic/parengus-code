@@ -23,23 +23,12 @@
 			"label": "rust: cargo test debug"
 		},
 		{
-			"type": "shell",
-			"label": "copy executable to game dir (debug)",
-			"command": "cargo xtask copy-exe",
-			"dependsOn": "rust: cargo build debug"
-		},
-		{
 			"type": "cargo",
 			"command": "clippy",
 			"problemMatcher": [
 				"$rustc"
 			],
 			"label": "rust: cargo clippy"
-		},
-		{
-			"type": "shell",
-			"label": "compile shaders (debug)",
-			"command": "cargo xtask compile-shaders"
 		},
 		{
 			"label": "build all debug",
@@ -63,7 +52,7 @@
 		{
 			"label": "build samp-app-noext debug",
 			"type": "shell",
-			"command": "cargo xtask build-noext"
+			"command": "cargo xtask build-samp-app-noext"
 		},
 	]
 }

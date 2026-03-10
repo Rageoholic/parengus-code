@@ -2,17 +2,15 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::{
-    cell::Cell,
-    f32::consts::PI as PI32,
-    fs::{self, File},
-    mem::size_of,
-    sync::Arc,
+    cell::Cell, f32::consts::PI as PI32, fs, mem::size_of, sync::Arc,
     time::Instant,
 };
 
-use asset_pipeline::AssetMap;
+use asset_loader::{AssetMap, Indices, MeshAsset, TexAsset};
+use asset_shared::{mesh_id, shader_id, texture_id};
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
+use parengus_tracing::{TracingLogLevel, init_default};
 use rgpu_vk::{
     ash::vk,
     buffer::{DeviceLocalBuffer, HostVisibleBuffer},
@@ -35,12 +33,6 @@ use rgpu_vk::{
     surface::Surface,
     swapchain::Swapchain,
     sync::{Fence, Semaphore},
-};
-use tracing_subscriber::{
-    Layer,
-    filter::{LevelFilter, Targets},
-    layer::SubscriberExt,
-    util::SubscriberInitExt,
 };
 use vek::{Mat4, Vec2, Vec3};
 use winit::{
@@ -79,74 +71,6 @@ struct Ubo {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct PushConstants {
     model: Mat4<f32>,
-}
-
-// ---------------------------------------------------------------------------
-// glTF loading
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::type_complexity)]
-fn load_duck(
-    gltf_path: &std::path::Path,
-) -> eyre::Result<(Vec<Vertex>, Vec<u16>, u32, u32, Vec<u8>)> {
-    let (doc, buffers, images) = gltf::import(gltf_path)?;
-    let mesh = doc
-        .meshes()
-        .next()
-        .ok_or_else(|| eyre::eyre!("glTF has no meshes"))?;
-    let prim = mesh
-        .primitives()
-        .next()
-        .ok_or_else(|| eyre::eyre!("mesh has no primitives"))?;
-    let reader =
-        prim.reader(|buf| buffers.get(buf.index()).map(|b| b.0.as_slice()));
-
-    let positions: Vec<[f32; 3]> = reader
-        .read_positions()
-        .ok_or_else(|| eyre::eyre!("primitive has no POSITION"))?
-        .collect();
-    let tex_coords: Vec<[f32; 2]> = reader
-        .read_tex_coords(0)
-        .ok_or_else(|| eyre::eyre!("primitive has no TEXCOORD_0"))?
-        .into_f32()
-        .collect();
-
-    let vertices: Vec<Vertex> = positions
-        .into_iter()
-        .zip(tex_coords)
-        .map(|(p, t)| Vertex {
-            position: Vec3::new(p[0], p[1], p[2]),
-            tex_coord: Vec2::new(t[0], t[1]),
-        })
-        .collect();
-
-    let indices: Vec<u16> = reader
-        .read_indices()
-        .ok_or_else(|| eyre::eyre!("primitive has no indices"))?
-        .into_u32()
-        .map(|i| u16::try_from(i).expect("Duck index fits u16"))
-        .collect();
-
-    let img_data = images
-        .into_iter()
-        .next()
-        .ok_or_else(|| eyre::eyre!("glTF has no images"))?;
-
-    // gltf::import decodes the image; normalise to RGBA8.
-    use gltf::image::Format;
-    let pixels = match img_data.format {
-        Format::R8G8B8A8 => img_data.pixels,
-        Format::R8G8B8 => img_data
-            .pixels
-            .chunks_exact(3)
-            .flat_map(|c| [c[0], c[1], c[2], 255])
-            .collect(),
-        fmt => {
-            return Err(eyre::eyre!("unsupported glTF image format: {fmt:?}"));
-        }
-    };
-
-    Ok((vertices, indices, img_data.width, img_data.height, pixels))
 }
 
 // ---------------------------------------------------------------------------
@@ -243,42 +167,6 @@ fn perspective_rh_zo(
     ])
 }
 
-#[rustfmt::skip]
-#[derive(
-    Debug, PartialEq, Eq, PartialOrd, Ord,
-    Clone, Copy, Default, clap::ValueEnum,
-)]
-/// Log verbosity level for tracing output.
-enum TracingLogLevel {
-    /// Disable tracing logs.
-    Off,
-    /// Very detailed execution logs.
-    Trace,
-    /// Informational runtime events.
-    Info,
-    /// Debug-level diagnostics.
-    Debug,
-    /// Warnings and errors only.
-    Warn,
-    #[default]
-    /// Errors only.
-    Error,
-}
-
-impl From<TracingLogLevel> for LevelFilter {
-    fn from(value: TracingLogLevel) -> Self {
-        use tracing_subscriber::filter::LevelFilter;
-        match value {
-            TracingLogLevel::Off => LevelFilter::OFF,
-            TracingLogLevel::Trace => LevelFilter::TRACE,
-            TracingLogLevel::Info => LevelFilter::INFO,
-            TracingLogLevel::Debug => LevelFilter::DEBUG,
-            TracingLogLevel::Warn => LevelFilter::WARN,
-            TracingLogLevel::Error => LevelFilter::ERROR,
-        }
-    }
-}
-
 /// Anti-aliasing mode selected via `--aa`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum AntiAliasing {
@@ -314,9 +202,9 @@ struct CliArgs {
     #[arg(long)]
     graphics_debug_level: Option<CliVulkanLogLevel>,
 
-    /// rgpu_vk tracing verbosity; defaults to --tracing-log-level.
-    #[arg(long)]
-    rgpu_log_level: Option<TracingLogLevel>,
+    /// Extra per-target tracing overrides, repeatable: e.g. --trace-target rgpu_vk=debug
+    #[arg(long = "trace-target")]
+    trace_target: Vec<String>,
 
     /// Use a dedicated transfer queue family (default: true).
     #[arg(long, default_value = "true")]
@@ -382,42 +270,6 @@ impl From<CliVulkanLogLevel> for rgpu_vk::instance::VulkanLogLevel {
     }
 }
 
-/// Build a [`Targets`] filter combining the global tracing level,
-/// an optional `rgpu_vk`-specific override, and an optional
-/// Vulkan debug-utils-specific override.
-///
-/// The default target uses `tracing_level`. When `rgpu_level` differs
-/// from the default, an `"rgpu_vk"` target override is added. When
-/// `gfx_level` maps to a more permissive filter than the effective
-/// `rgpu_vk` level, a `"rgpu_vk::instance::debug_utils"` override is
-/// added so Vulkan callback messages are not suppressed by the broader
-/// `rgpu_vk` filter.
-fn subscriber_filter(
-    tracing_level: TracingLogLevel,
-    rgpu_level: Option<TracingLogLevel>,
-    gfx_level: Option<CliVulkanLogLevel>,
-) -> Targets {
-    let base = LevelFilter::from(tracing_level);
-    let rgpu_filter = rgpu_level.map(LevelFilter::from).unwrap_or(base);
-    let mut targets = Targets::new().with_default(base);
-    if rgpu_filter != base {
-        targets = targets.with_target("rgpu_vk", rgpu_filter);
-    }
-    if let Some(gfx) = gfx_level {
-        let gfx_filter = match gfx {
-            CliVulkanLogLevel::Trace => LevelFilter::TRACE,
-            CliVulkanLogLevel::Info => LevelFilter::INFO,
-            CliVulkanLogLevel::Warn => LevelFilter::WARN,
-            CliVulkanLogLevel::Error => LevelFilter::ERROR,
-        };
-        if gfx_filter > rgpu_filter {
-            targets = targets
-                .with_target("rgpu_vk::instance::debug_utils", gfx_filter);
-        }
-    }
-    targets
-}
-
 fn main() -> eyre::Result<()> {
     let app_dirs = directories::ProjectDirs::from("", "parengus", "samp-app")
         .ok_or_else(|| {
@@ -440,40 +292,58 @@ fn main() -> eyre::Result<()> {
 
     let cli_args = CliArgs::parse();
 
-    let needs_subscriber = cli_args.tracing_log_level != TracingLogLevel::Off
-        || cli_args.graphics_debug_level.is_some()
-        || cli_args
-            .rgpu_log_level
-            .is_some_and(|l| l != TracingLogLevel::Off);
+    let mut targets: std::collections::HashMap<String, TracingLogLevel> =
+        std::collections::HashMap::new();
+    for spec in &cli_args.trace_target {
+        if let Some(eq) = spec.find('=') {
+            let (tgt, lvl) = spec.split_at(eq);
+            let lvl = &lvl[1..];
+            if let Ok(parsed) = lvl.parse::<TracingLogLevel>() {
+                targets.insert(tgt.to_string(), parsed);
+            }
+        }
+    }
 
-    if needs_subscriber {
+    if let Some(gfx) = cli_args.graphics_debug_level {
+        let gfx_lvl = match gfx {
+            CliVulkanLogLevel::Trace => TracingLogLevel::Trace,
+            CliVulkanLogLevel::Info => TracingLogLevel::Info,
+            CliVulkanLogLevel::Warn => TracingLogLevel::Warn,
+            CliVulkanLogLevel::Error => TracingLogLevel::Error,
+        };
+        use tracing_subscriber::filter::LevelFilter as LF;
+        let gfx_filter: LF = LF::from(gfx_lvl);
+        let rgpu_filter = targets.get("rgpu_vk").copied().map(LF::from);
+        let instance_filter = targets
+            .get("rgpu_vk::instance::debug_utils")
+            .copied()
+            .map(LF::from);
+
+        let should_set = if let Some(inst) = instance_filter {
+            gfx_filter > inst
+        } else if let Some(rg) = rgpu_filter {
+            gfx_filter > rg
+        } else {
+            let base: LF = LF::from(cli_args.tracing_log_level);
+            gfx_filter > base
+        };
+        if should_set {
+            targets
+                .insert("rgpu_vk::instance::debug_utils".to_string(), gfx_lvl);
+        }
+    }
+
+    let default_level = cli_args.tracing_log_level;
+    let need_tracing =
+        default_level != TracingLogLevel::Off || !targets.is_empty();
+    if need_tracing {
         fs::create_dir_all(&log_dir)?;
-
         let mut log_file_path = log_dir.clone();
         log_file_path.push("log-file");
         log_file_path.set_extension("txt");
-        let log_file = File::create(&log_file_path)?;
-        let file_log = tracing_subscriber::fmt::layer()
-            .with_writer(log_file)
-            .with_ansi(false);
-
-        let stdout_log = tracing_subscriber::fmt::layer().pretty().with_ansi(
-            !cli_args.no_color
-                && supports_color::on(supports_color::Stream::Stdout).is_some(),
-        );
-
-        let filter = subscriber_filter(
-            cli_args.tracing_log_level,
-            cli_args.rgpu_log_level,
-            cli_args.graphics_debug_level,
-        );
-        tracing_subscriber::registry()
-            .with(stdout_log.with_filter(filter.clone()))
-            .with(file_log.with_filter(filter))
-            .init();
-
-        tracing::debug!("log_file_path: {}", log_file_path.display());
-        tracing::debug!("cli_args: {:#?}", cli_args);
+        let file_path = Some(log_file_path);
+        init_default(targets, default_level, file_path, cli_args.no_color)
+            .map_err(|e| eyre::eyre!("init tracing: {e}"))?;
     }
 
     let event_loop = winit::event_loop::EventLoop::builder().build()?;
@@ -1101,17 +971,10 @@ impl AppRunner {
         let elapsed = state.start_time.elapsed().as_secs_f32();
         let aspect = extent.width as f32 / extent.height as f32;
 
-        // view_proj — uploaded to the per-frame UBO. Baked on the CPU
-        // so the shader only needs one matrix multiply per vertex.
-        // 60° vertical FOV, depth range [1, 1000].
-        // Eye above and behind, aimed at the duck's vertical midpoint
-        // (Y=87), giving a downward angle with the duck centered.
-        // Duck rotates around Y at origin; vertices reach ~200 units
-        // out, so far plane must exceed that.
         let view = look_at_rh(
-            Vec3::new(0.0, 220.0, 300.0),
-            Vec3::new(0.0, 87.0, 0.0),
-            Vec3::unit_y(),
+            Vec3::new(0.0, 300.0, 220.0),
+            Vec3::new(0.0, 0.0, 87.0),
+            Vec3::unit_z(),
         );
         let proj = perspective_rh_zo(PI32 / 3.0, aspect, 1.0, 1000.0);
         let ubo = Ubo {
@@ -1123,9 +986,10 @@ impl AppRunner {
             return DrawFrameOutcome::Fatal(format!("UBO write failed: {e}"));
         }
 
+        const TAU32: f32 = PI32 * 2.0;
         // Model — uploaded as a push constant each frame.
-        // The model rotates around +Y (glTF world up axis).
-        let model = Mat4::<f32>::rotation_y(elapsed * PI32 * 2.0 / 5.0);
+        // Use Z-up right-handed coordinates: rotate around +Z axis.
+        let model = Mat4::<f32>::rotation_z(elapsed / 5.0 * TAU32);
         let push = PushConstants { model };
 
         let pipeline_handle = state.pipeline.raw_pipeline();
@@ -1512,23 +1376,52 @@ impl AppRunner {
 
         let asset_map_path =
             state.self_dir.join("assets").join("asset_map.toml");
-        let asset_map: AssetMap = toml::from_str(
-            &std::fs::read_to_string(&asset_map_path).map_err(|e| {
-                eyre::eyre!("Failed to read {}: {e}", asset_map_path.display(),)
-            })?,
-        )?;
-        tracing::debug!(asset_map = ?asset_map.map, "Loaded asset map");
+        let asset_map =
+            AssetMap::load(&asset_map_path).map_err(|e| eyre::eyre!("{e}"))?;
 
         let assets_dir = state.self_dir.join("assets");
 
         let duck_filename = asset_map
-            .map
-            .get("duck")
+            .get(mesh_id("duck"))
             .ok_or_else(|| eyre::eyre!("asset 'duck' not in map"))?;
-        let duck_path = assets_dir.join(duck_filename);
-        let (scene_vertices, scene_indices, tex_width, tex_height, tex_bytes) =
-            load_duck(&duck_path)?;
+        let duck = MeshAsset::open(&assets_dir.join(duck_filename))
+            .map_err(|e| eyre::eyre!("load duck mesh: {e}"))?;
+        let positions = duck
+            .positions()
+            .map_err(|e| eyre::eyre!("duck positions: {e}"))?;
+        let tex_coords = duck
+            .tex_coords0()
+            .map_err(|e| eyre::eyre!("duck tex_coords0: {e}"))?;
+        let scene_vertices: Vec<Vertex> = positions
+            .into_iter()
+            .zip(tex_coords)
+            .map(|(p, t)| Vertex {
+                position: Vec3::new(p[0], p[1], p[2]),
+                tex_coord: Vec2::new(t[0], t[1]),
+            })
+            .collect();
+        let raw_indices = duck
+            .indices()
+            .map_err(|e| eyre::eyre!("duck indices: {e}"))?;
+        let scene_indices: Vec<u16> = match raw_indices {
+            Indices::U16(v) => v,
+            Indices::U32(v) => v
+                .into_iter()
+                .map(|i| u16::try_from(i).expect("Duck index fits u16"))
+                .collect(),
+        };
         let index_count = scene_indices.len() as u32;
+
+        let albedo_filename = asset_map
+            .get(texture_id("duck-albedo"))
+            .ok_or_else(|| eyre::eyre!("asset 'duck-albedo' not in map"))?;
+        let duck_tex = TexAsset::open(&assets_dir.join(albedo_filename))
+            .map_err(|e| eyre::eyre!("load duck-albedo: {e}"))?;
+        let tex_width = duck_tex.info.width;
+        let tex_height = duck_tex.info.height;
+        let tex_bytes = duck_tex
+            .mip(0)
+            .map_err(|e| eyre::eyre!("duck-albedo mip0: {e}"))?;
 
         let vertex_buffer_size =
             (scene_vertices.len() * size_of::<Vertex>()) as vk::DeviceSize;
@@ -1614,8 +1507,7 @@ impl AppRunner {
             "phoenix-shader"
         };
         let shader_filename = asset_map
-            .map
-            .get(shader_name)
+            .get(shader_id(shader_name))
             .ok_or_else(|| eyre::eyre!("asset '{shader_name}' not in map"))?;
         let shader_path = assets_dir.join(shader_filename);
         let shader_path = if state.shader_debug_info && !shader_path.exists() {
@@ -1625,9 +1517,9 @@ impl AppRunner {
                  found; falling back to non-debug shader"
             );
             let fallback =
-                asset_map.map.get("phoenix-shader").ok_or_else(|| {
-                    eyre::eyre!("asset 'phoenix-shader' not in map")
-                })?;
+                asset_map.get(shader_id("phoenix-shader")).ok_or_else(
+                    || eyre::eyre!("asset 'phoenix-shader' not in map"),
+                )?;
             assets_dir.join(fallback)
         } else {
             shader_path

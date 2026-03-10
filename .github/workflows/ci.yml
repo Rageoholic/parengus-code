@@ -25,22 +25,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [phoenix, rgpu-vk, samp-app, samp-app-noext]
+        package:
+            [ asset-compiler, asset-loader, asset-pipeline,
+              asset-shared, phoenix, rgpu-vk, samp-app,
+              samp-app-noext, xtask ]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev pkg-config
-      - run: cargo clippy -p ${{ matrix.package }} --all-targets -- -D warnings
+      - uses: ./.github/actions/rust-setup
+      - run: >-
+          cargo clippy -p ${{ matrix.package }}
+          --all-targets -- -D warnings
 
   check-workspace:
     name: Workspace build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev pkg-config
+      - uses: ./.github/actions/rust-setup
       - run: cargo build --workspace --all-targets
 
   test:
@@ -48,7 +49,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev pkg-config
+      - uses: ./.github/actions/rust-setup
       - run: cargo test --workspace

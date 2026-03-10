@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, path::PathBuf};
+use std::{collections::HashMap, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,15 @@ pub struct ManifestEntry {
     /// For shader assets: extra arguments passed to `slangc`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compile_args: Vec<String>,
+    /// For mesh assets: texture references — role string → asset name.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tex_refs: HashMap<String, String>,
+    /// For image assets: target compressed format ("bc7", "rgba8", …).
+    pub format: Option<String>,
+    /// For image assets: colour space ("srgb", "linear").
+    pub color_space: Option<String>,
+    /// For image assets: whether to generate a full mip chain.
+    pub mips: Option<bool>,
     pub source: Option<String>,
     pub author: Option<String>,
     pub license: Option<String>,
@@ -65,16 +74,6 @@ pub struct AppAssetRef {
     pub name: String,
     #[serde(rename = "type")]
     pub asset_type: AssetType,
-}
-
-// ---- Generated map (out/.../assets/asset_map.toml) ----------------------
-
-/// Maps logical asset names to filenames in the output assets directory.
-/// Serialized by xtask during the build; deserialized by apps at runtime.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AssetMap {
-    #[serde(with = "path_map_serde")]
-    pub map: BTreeMap<String, PathBuf>,
 }
 
 // ---- Serde helpers: forward-slash paths ---------------------------------
@@ -119,33 +118,5 @@ mod opt_path_serde {
         d: D,
     ) -> Result<Option<PathBuf>, D::Error> {
         Ok(Option::<String>::deserialize(d)?.map(PathBuf::from_slash))
-    }
-}
-
-mod path_map_serde {
-    use std::{collections::BTreeMap, path::PathBuf};
-
-    use path_slash::PathBufExt as _;
-    use serde::{Deserialize, Deserializer, Serializer, ser::SerializeMap};
-
-    pub fn serialize<S: Serializer>(
-        map: &BTreeMap<String, PathBuf>,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
-        let mut ser = s.serialize_map(Some(map.len()))?;
-        for (k, v) in map {
-            ser.serialize_entry(k, &*v.to_slash_lossy())?;
-        }
-        ser.end()
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<BTreeMap<String, PathBuf>, D::Error> {
-        BTreeMap::<String, String>::deserialize(d).map(|m| {
-            m.into_iter()
-                .map(|(k, v)| (k, PathBuf::from_slash(v)))
-                .collect()
-        })
     }
 }

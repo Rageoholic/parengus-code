@@ -9,3 +9,7 @@ type = "shader"
 [[asset]]
 name = "duck"
 type = "mesh"
+
+[[asset]]
+name = "duck-albedo"
+type = "image"

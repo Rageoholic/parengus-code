@@ -20,15 +20,17 @@
 use std::{
     cell::Cell,
     f32::consts::PI as PI32,
-    fs::{self, File},
+    fs::{self},
     mem::size_of,
     sync::Arc,
     time::Instant,
 };
 
-use asset_pipeline::AssetMap;
+use asset_loader::{AssetMap, TexAsset};
+use asset_shared::{shader_id, texture_id};
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
+use parengus_tracing::{TracingLogLevel, init_default};
 use rgpu_vk::{
     ash::vk,
     buffer::{DeviceLocalBuffer, HostVisibleBuffer},
@@ -51,12 +53,6 @@ use rgpu_vk::{
     surface::Surface,
     swapchain::Swapchain,
     sync::{Fence, Semaphore},
-};
-use tracing_subscriber::{
-    Layer,
-    filter::{LevelFilter, Targets},
-    layer::SubscriberExt,
-    util::SubscriberInitExt,
 };
 use vek::{Mat4, Vec2, Vec3};
 use winit::{
@@ -192,33 +188,7 @@ const SCENE_INDICES: [u16; 18] = [
     8, 10, 9, 8, 9, 11, // farthest
 ];
 
-#[rustfmt::skip]
-#[derive(
-    Debug, PartialEq, Eq, PartialOrd, Ord,
-    Clone, Copy, Default, clap::ValueEnum,
-)]
-enum TracingLogLevel {
-    Off,
-    Trace,
-    Info,
-    Debug,
-    Warn,
-    #[default]
-    Error,
-}
-
-impl From<TracingLogLevel> for LevelFilter {
-    fn from(value: TracingLogLevel) -> Self {
-        match value {
-            TracingLogLevel::Off => LevelFilter::OFF,
-            TracingLogLevel::Trace => LevelFilter::TRACE,
-            TracingLogLevel::Info => LevelFilter::INFO,
-            TracingLogLevel::Debug => LevelFilter::DEBUG,
-            TracingLogLevel::Warn => LevelFilter::WARN,
-            TracingLogLevel::Error => LevelFilter::ERROR,
-        }
-    }
-}
+// Use shared `TracingLogLevel` from `parengus-tracing` (imported above).
 
 /// Anti-aliasing mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -252,8 +222,8 @@ struct CliArgs {
     #[arg(long)]
     graphics_debug_level: Option<CliVulkanLogLevel>,
 
-    #[arg(long)]
-    rgpu_log_level: Option<TracingLogLevel>,
+    #[arg(long = "trace-target")]
+    trace_target: Vec<String>,
 
     #[arg(long, default_value = "true")]
     dedicated_transfer: bool,
@@ -309,31 +279,7 @@ impl From<CliVulkanLogLevel> for rgpu_vk::instance::VulkanLogLevel {
     }
 }
 
-fn subscriber_filter(
-    tracing_level: TracingLogLevel,
-    rgpu_level: Option<TracingLogLevel>,
-    gfx_level: Option<CliVulkanLogLevel>,
-) -> Targets {
-    let base = LevelFilter::from(tracing_level);
-    let rgpu_filter = rgpu_level.map(LevelFilter::from).unwrap_or(base);
-    let mut targets = Targets::new().with_default(base);
-    if rgpu_filter != base {
-        targets = targets.with_target("rgpu_vk", rgpu_filter);
-    }
-    if let Some(gfx) = gfx_level {
-        let gfx_filter = match gfx {
-            CliVulkanLogLevel::Trace => LevelFilter::TRACE,
-            CliVulkanLogLevel::Info => LevelFilter::INFO,
-            CliVulkanLogLevel::Warn => LevelFilter::WARN,
-            CliVulkanLogLevel::Error => LevelFilter::ERROR,
-        };
-        if gfx_filter > rgpu_filter {
-            targets = targets
-                .with_target("rgpu_vk::instance::debug_utils", gfx_filter);
-        }
-    }
-    targets
-}
+// subscriber_filter removed — tracing initialization is centralized via `parengus-tracing`.
 
 fn main() -> eyre::Result<()> {
     let app_dirs =
@@ -359,40 +305,58 @@ fn main() -> eyre::Result<()> {
 
     let cli_args = CliArgs::parse();
 
-    let needs_subscriber = cli_args.tracing_log_level != TracingLogLevel::Off
-        || cli_args.graphics_debug_level.is_some()
-        || cli_args
-            .rgpu_log_level
-            .is_some_and(|l| l != TracingLogLevel::Off);
+    let mut targets: std::collections::HashMap<String, TracingLogLevel> =
+        std::collections::HashMap::new();
+    for spec in &cli_args.trace_target {
+        if let Some(eq) = spec.find('=') {
+            let (tgt, lvl) = spec.split_at(eq);
+            let lvl = &lvl[1..];
+            if let Ok(parsed) = lvl.parse::<TracingLogLevel>() {
+                targets.insert(tgt.to_string(), parsed);
+            }
+        }
+    }
 
-    if needs_subscriber {
+    if let Some(gfx) = cli_args.graphics_debug_level {
+        let gfx_lvl = match gfx {
+            CliVulkanLogLevel::Trace => TracingLogLevel::Trace,
+            CliVulkanLogLevel::Info => TracingLogLevel::Info,
+            CliVulkanLogLevel::Warn => TracingLogLevel::Warn,
+            CliVulkanLogLevel::Error => TracingLogLevel::Error,
+        };
+        use tracing_subscriber::filter::LevelFilter as LF;
+        let gfx_filter: LF = LF::from(gfx_lvl);
+        let rgpu_filter = targets.get("rgpu_vk").copied().map(LF::from);
+        let instance_filter = targets
+            .get("rgpu_vk::instance::debug_utils")
+            .copied()
+            .map(LF::from);
+
+        let should_set = if let Some(inst) = instance_filter {
+            gfx_filter > inst
+        } else if let Some(rg) = rgpu_filter {
+            gfx_filter > rg
+        } else {
+            let base: LF = LF::from(cli_args.tracing_log_level);
+            gfx_filter > base
+        };
+        if should_set {
+            targets
+                .insert("rgpu_vk::instance::debug_utils".to_string(), gfx_lvl);
+        }
+    }
+
+    let default_level = cli_args.tracing_log_level;
+    let need_tracing =
+        default_level != TracingLogLevel::Off || !targets.is_empty();
+    if need_tracing {
         fs::create_dir_all(&log_dir)?;
-
         let mut log_file_path = log_dir.clone();
         log_file_path.push("log-file");
         log_file_path.set_extension("txt");
-        let log_file = File::create(&log_file_path)?;
-        let file_log = tracing_subscriber::fmt::layer()
-            .with_writer(log_file)
-            .with_ansi(false);
-
-        let stdout_log = tracing_subscriber::fmt::layer().pretty().with_ansi(
-            !cli_args.no_color
-                && supports_color::on(supports_color::Stream::Stdout).is_some(),
-        );
-
-        let filter = subscriber_filter(
-            cli_args.tracing_log_level,
-            cli_args.rgpu_log_level,
-            cli_args.graphics_debug_level,
-        );
-        tracing_subscriber::registry()
-            .with(stdout_log.with_filter(filter.clone()))
-            .with(file_log.with_filter(filter))
-            .init();
-
-        tracing::debug!("log_file_path: {}", log_file_path.display());
-        tracing::debug!("cli_args: {:#?}", cli_args);
+        let file_path = Some(log_file_path);
+        init_default(targets, default_level, file_path, cli_args.no_color)
+            .map_err(|e| eyre::eyre!("init tracing: {e}"))?;
     }
 
     let event_loop = winit::event_loop::EventLoop::builder().build()?;
@@ -1338,12 +1302,8 @@ impl AppRunner {
 
         let asset_map_path =
             state.self_dir.join("assets").join("asset_map.toml");
-        let asset_map: AssetMap = toml::from_str(
-            &std::fs::read_to_string(&asset_map_path).map_err(|e| {
-                eyre::eyre!("Failed to read {}: {e}", asset_map_path.display())
-            })?,
-        )?;
-        tracing::debug!(asset_map = ?asset_map.map, "Loaded asset map");
+        let asset_map =
+            AssetMap::load(&asset_map_path).map_err(|e| eyre::eyre!("{e}"))?;
 
         let assets_dir = state.self_dir.join("assets");
         let shader_name = if state.shader_debug_info {
@@ -1352,8 +1312,7 @@ impl AppRunner {
             "shader"
         };
         let shader_filename = asset_map
-            .map
-            .get(shader_name)
+            .get(shader_id(shader_name))
             .ok_or_else(|| eyre::eyre!("asset '{shader_name}' not in map"))?;
         let shader_path = assets_dir.join(shader_filename);
         let shader_path = if state.shader_debug_info && !shader_path.exists() {
@@ -1363,8 +1322,7 @@ impl AppRunner {
                  not found; falling back to non-debug shader"
             );
             let fallback = asset_map
-                .map
-                .get("shader")
+                .get(shader_id("shader"))
                 .ok_or_else(|| eyre::eyre!("asset 'shader' not in map"))?;
             assets_dir.join(fallback)
         } else {
@@ -1538,20 +1496,15 @@ impl AppRunner {
         material_descriptor_set.set_name(&device, Some("material set"));
 
         let tex_filename = asset_map
-            .map
-            .get("statue-tex")
+            .get(texture_id("statue-tex"))
             .ok_or_else(|| eyre::eyre!("asset 'statue-tex' not in map"))?;
-        let tex_path = assets_dir.join(tex_filename);
-        let tex_img = image::open(&tex_path)
-            .map_err(|e| {
-                eyre::eyre!(
-                    "Failed to open texture {}: {e}",
-                    tex_path.display()
-                )
-            })?
-            .into_rgba8();
-        let (tex_width, tex_height) = tex_img.dimensions();
-        let tex_bytes = tex_img.into_raw();
+        let statue_tex = TexAsset::open(&assets_dir.join(tex_filename))
+            .map_err(|e| eyre::eyre!("load statue-tex: {e}"))?;
+        let tex_width = statue_tex.info.width;
+        let tex_height = statue_tex.info.height;
+        let tex_bytes = statue_tex
+            .mip(0)
+            .map_err(|e| eyre::eyre!("statue-tex mip0: {e}"))?;
         let tex_staging_size = tex_bytes.len() as vk::DeviceSize;
 
         let mut tex_staging = HostVisibleBuffer::new(
