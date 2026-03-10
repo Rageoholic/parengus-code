@@ -4,6 +4,7 @@ members = [
     "asset-loader",
     "asset-pipeline",
     "asset-shared",
+    "parengus-tracing",
     "phoenix",
     "rgpu-vk",
     "samp-app",

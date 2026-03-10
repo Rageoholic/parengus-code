@@ -4,16 +4,29 @@ use std::{
     path::Path,
 };
 
-use asset_pipeline::{AppAssets, AssetMap, AssetType, Manifest, ManifestEntry};
-use gltf::Gltf;
+use asset_pipeline::{AppAssets, AssetType, Manifest, ManifestEntry};
+use path_slash::PathBufExt as _;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// Serialized to `asset_map.toml` so that `asset-loader::AssetMap`
+/// can load it at runtime.
+#[derive(serde::Serialize)]
+struct AssetMapFile {
+    map: BTreeMap<String, String>,
+}
+
+/// Copy compiled assets from `compiled_cache_dir` to `dst_dir` for
+/// the given app, then write `asset_map.toml`.
+///
+/// Compiled file naming convention:
+/// - Mesh   `{name}.pmesh`
+/// - Image  `{name}.ptex`
+/// - Shader uses `entry.file` (already `.spv`)
 pub(crate) fn copy_assets(
     manifest_path: &Path,
     app_assets_path: &Path,
-    assets_src_dir: &Path,
-    shader_cache_dir: &Path,
+    compiled_cache_dir: &Path,
     dst_dir: &Path,
 ) -> Result<()> {
     let manifest: Manifest =
@@ -35,95 +48,60 @@ pub(crate) fn copy_assets(
 
     for req in &app_assets.asset {
         let entry = index.get(req.name.as_str()).ok_or_else(|| {
-            format!("asset `{}` not found in manifest", req.name)
+            format!("asset '{}' not found in manifest", req.name)
         })?;
 
         if entry.asset_type != req.asset_type {
             return Err(format!(
-                "asset `{}`: manifest type `{}` != app type `{}`",
+                "asset '{}': manifest type '{}' != app type '{}'",
                 req.name, entry.asset_type, req.asset_type,
             )
             .into());
         }
 
-        let src = match entry.asset_type {
-            AssetType::Image => assets_src_dir.join(&entry.file),
-            AssetType::Shader => shader_cache_dir.join(&entry.file),
+        let compiled_name = match entry.asset_type {
             AssetType::Mesh => {
-                let gltf_src = assets_src_dir.join(&entry.file);
-                let src_dir = gltf_src.parent().unwrap_or(assets_src_dir);
-                let doc = Gltf::open(&gltf_src)?;
-
-                for buf in doc.buffers() {
-                    if let gltf::buffer::Source::Uri(uri) = buf.source() {
-                        let s = src_dir.join(uri);
-                        let d = dst_dir.join(uri);
-                        if let Some(p) = d.parent() {
-                            fs::create_dir_all(p)?;
-                        }
-                        if !is_up_to_date(&s, &d) {
-                            fs::copy(&s, &d)?;
-                            println!("Copied {uri}");
-                        }
-                    }
-                }
-
-                for img in doc.images() {
-                    if let gltf::image::Source::Uri { uri, .. } = img.source() {
-                        let s = src_dir.join(uri);
-                        let d = dst_dir.join(uri);
-                        if let Some(p) = d.parent() {
-                            fs::create_dir_all(p)?;
-                        }
-                        if !is_up_to_date(&s, &d) {
-                            fs::copy(&s, &d)?;
-                            println!("Copied {uri}");
-                        }
-                    }
-                }
-
-                gltf_src
+                format!("{}.pmesh", req.name)
             }
+            AssetType::Image => {
+                format!("{}.ptex", req.name)
+            }
+            AssetType::Shader => entry.file.to_string_lossy().into_owned(),
             _ => {
                 return Err(format!(
-                    "asset `{}`: unsupported type `{}`",
-                    req.name, entry.asset_type,
+                    "asset '{}': unsupported type '{}'",
+                    req.name, entry.asset_type
                 )
                 .into());
             }
         };
-        let dst = dst_dir.join(&entry.file);
 
-        if is_up_to_date(&src, &dst) {
+        let src = compiled_cache_dir.join(&compiled_name);
+        let dst = dst_dir.join(&compiled_name);
+
+        if crate::is_up_to_date(&src, &dst) {
             skipped += 1;
         } else {
-            fs::copy(&src, &dst)?;
-            println!("Copied {}", entry.file.display());
+            fs::copy(&src, &dst).map_err(|e| {
+                format!("copy {} → {}: {e}", src.display(), dst.display())
+            })?;
+            println!("Copied {compiled_name}");
             copied += 1;
         }
 
-        map.insert(req.name.clone(), entry.file.clone());
+        map.insert(req.name.clone(), compiled_name);
     }
 
-    let asset_map = AssetMap { map };
+    let asset_map = AssetMapFile {
+        map: map
+            .into_iter()
+            .map(|(k, v)| {
+                (k, std::path::PathBuf::from(v).to_slash_lossy().into_owned())
+            })
+            .collect(),
+    };
     fs::write(dst_dir.join("asset_map.toml"), toml::to_string(&asset_map)?)?;
 
     println!("Assets: {copied} copied, {skipped} up-to-date");
     Ok(())
-}
-
-fn is_up_to_date(src: &Path, dst: &Path) -> bool {
-    let Ok(src_meta) = src.metadata() else {
-        return false;
-    };
-    let Ok(dst_meta) = dst.metadata() else {
-        return false;
-    };
-    let Ok(src_mtime) = src_meta.modified() else {
-        return false;
-    };
-    let Ok(dst_mtime) = dst_meta.modified() else {
-        return false;
-    };
-    src_mtime <= dst_mtime
 }

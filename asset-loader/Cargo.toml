@@ -6,4 +6,6 @@ publish = false
 
 [dependencies]
 asset-shared = { path = "../asset-shared" }
-lz4_flex = "0.12"
+lz4_flex = { version = "0.12", features = ["frame"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
