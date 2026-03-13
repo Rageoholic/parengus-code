@@ -8,7 +8,7 @@ publish = false
 asset-loader = { path = "../asset-loader" }
 asset-shared = { path = "../asset-shared" }
 bytemuck = { version = "1.25.0", features = ["derive"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 directories = "6.0.0"
 eyre = "0.6.12"
 rgpu-vk = { version = "0.1.0", path = "../rgpu-vk" }
