@@ -51,3 +51,18 @@ jobs:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/rust-setup
       - run: cargo test --workspace
+
+  all-checks:
+    name: All checks passed
+    needs: [fmt, check, check-workspace, test]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Fail if any job failed
+        run: |
+          if [[ \
+            "${{ contains(needs.*.result, 'failure') }}" == "true" \
+            || "${{ contains(needs.*.result, 'cancelled') }}" == "true" \
+          ]]; then
+            exit 1
+          fi
