@@ -16,7 +16,9 @@ use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use parengus_tracing::{TracingLogLevel, init_default};
 use rgpu_vk::{
-    ash::vk,
+    ash::vk::{
+        self, CommandBufferSubmitInfo, PipelineStageFlags2, SemaphoreSubmitInfo,
+    },
     buffer::{DeviceLocalBuffer, HostVisibleBuffer},
     command::{ResettableCommandBuffer, ResettableCommandPool},
     descriptor::{
@@ -26,7 +28,7 @@ use rgpu_vk::{
     device::{Device, DeviceConfig, QueueConfig},
     image::{DepthImage, MsaaImage, Texture},
     instance::{Instance, InstanceConfig},
-    memory::image_barrier2,
+    memory::{buffer_barrier2, image_barrier2},
     pipeline::{
         CullModeFlags, DynamicPipeline, DynamicPipelineDesc, FrontFace,
         PipelineLayout, PipelineLayoutDesc, VertexAttributeDesc,
@@ -288,9 +290,9 @@ struct CliArgs {
     #[arg(long, default_value = "true")]
     dedicated_compute: bool,
 
-    /// Allocate all available queues per family (default: true).
-    #[arg(long, default_value = "true")]
-    parallel: bool,
+    /// Use a dedicated present queue family (default: false).
+    #[arg(long, default_value = "false")]
+    dedicated_present: bool,
 
     /// Treat queue config as hard requirements; error if any
     /// requested axis is unsatisfied.
@@ -448,7 +450,7 @@ fn main() -> eyre::Result<()> {
         queue_config: QueueConfig {
             dedicated_transfer: cli_args.dedicated_transfer,
             dedicated_compute: cli_args.dedicated_compute,
-            parallel: cli_args.parallel,
+            dedicated_present: cli_args.dedicated_present,
         },
         queue_config_strict: cli_args.queue_config_strict,
         min_sample_count: cli_args.aa.sample_count(),
@@ -1009,7 +1011,7 @@ impl AppRunner {
             .as_ref()
             .expect("swapchain present: checked above");
         let swapchain_raw = sc.raw_swapchain();
-        let image_available = frame_objs.image_available.raw_semaphore();
+        let image_available = frame_objs.image_available.raw();
 
         // Acquire the next presentable image.
         //
@@ -1039,7 +1041,7 @@ impl AppRunner {
             .render_finished_semaphores
             .as_ref()
             .expect("render_finished_semaphores present with swapchain")[i]
-            .raw_semaphore();
+            .raw();
 
         let elapsed = state.start_time.elapsed().as_secs_f32();
         let aspect = extent.width as f32 / extent.height as f32;
@@ -1097,6 +1099,8 @@ impl AppRunner {
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(image)
+            .src_queue_family_index(state.device.present_queue_family())
+            .dst_queue_family_index(state.device.graphics_queue_family())
             .subresource_range(subresource_range);
         let depth_image = state.depth_images[frame_idx].raw_image();
         let depth_subresource_range = vk::ImageSubresourceRange::default()
@@ -1270,6 +1274,7 @@ impl AppRunner {
         unsafe { frame_cmd.end_rendering() };
 
         // Transition: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
+        // Ownership: Graphics -> Present
         let to_present = image_barrier2()
             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -1278,6 +1283,8 @@ impl AppRunner {
             .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
             .image(image)
+            .src_queue_family_index(state.device.graphics_queue_family())
+            .dst_queue_family_index(state.device.present_queue_family())
             .subresource_range(subresource_range);
         let dep_info_present = vk::DependencyInfo::default()
             .image_memory_barriers(std::slice::from_ref(&to_present));
@@ -1290,7 +1297,7 @@ impl AppRunner {
             ));
         }
 
-        let cmd_handle = frame_cmd.raw_command_buffer();
+        let cmd_handle = frame_cmd.raw();
         // frame_cmd borrow ends here; subsequent accesses are on
         // different fields.
 
@@ -1308,19 +1315,13 @@ impl AppRunner {
             .wait_semaphore_infos(std::slice::from_ref(&wait_info))
             .command_buffer_infos(std::slice::from_ref(&cmd_submit_info))
             .signal_semaphore_infos(std::slice::from_ref(&signal_info));
-        let queue_index = if state.device.queue_config().parallel {
-            frame_idx
-        } else {
-            0
-        };
         // SAFETY: image_available is signaled by acquire; render_finished is
         // unsignaled; fence is unsignaled (just reset above); cmd is in the
-        // executable state. Queue index is known to be in bounds
+        // executable state.
         if let Err(e) = unsafe {
-            state.device.graphics_present_queue_submit2(
+            state.device.graphics_queue_submit2(
                 std::slice::from_ref(&submit),
                 Some(&mut frame_objs.in_flight_fence),
-                queue_index,
             )
         } {
             return DrawFrameOutcome::Fatal(format!(
@@ -1334,9 +1335,9 @@ impl AppRunner {
             .swapchains(std::slice::from_ref(&swapchain_raw))
             .image_indices(std::slice::from_ref(&image_index));
         // SAFETY: render_finished is signaled by submit; image is in
-        // PRESENT_SRC_KHR. queue_index is in bounds
+        // PRESENT_SRC_KHR.
         let present_result =
-            unsafe { state.device.queue_present(&present_info, queue_index) };
+            unsafe { state.device.queue_present(&present_info) };
 
         state.current_frame = (state.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
@@ -1436,6 +1437,11 @@ impl AppRunner {
             state.device_config,
         )?);
 
+        let queue_config = device.queue_config();
+        let dedicated_transfer = queue_config.dedicated_transfer;
+        let transfer_queue_family = device.transfer_queue_family();
+        let graphics_queue_family = device.graphics_queue_family();
+
         let sample_count =
             Self::resolve_sample_count(&device, state.requested_sample_count);
         if sample_count != state.requested_sample_count {
@@ -1453,7 +1459,7 @@ impl AppRunner {
             &device,
             vertex_buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
-            Some("rect staging vertex buffer"),
+            Some("scene staging vertex buffer"),
         )?;
         staging_vertex_buffer.write_pod(&SCENE_VERTICES)?;
 
@@ -1462,7 +1468,7 @@ impl AppRunner {
             vertex_buffer_size,
             vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST,
-            Some("rect vertex buffer"),
+            Some("scene vertex buffer"),
         )?;
 
         let index_buffer_size =
@@ -1471,7 +1477,7 @@ impl AppRunner {
             &device,
             index_buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
-            Some("rect staging index buffer"),
+            Some("scene staging index buffer"),
         )?;
         staging_index_buffer.write_pod(&SCENE_INDICES)?;
 
@@ -1480,12 +1486,12 @@ impl AppRunner {
             index_buffer_size,
             vk::BufferUsageFlags::INDEX_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST,
-            Some("rect index buffer"),
+            Some("scene index buffer"),
         )?;
 
         let upload_command_pool = ResettableCommandPool::new(
             &device,
-            device.graphics_present_queue_family(),
+            device.transfer_queue_family(),
             Some("upload command pool"),
         )?;
         let mut upload_cmd = upload_command_pool.allocate_command_buffer()?;
@@ -1634,7 +1640,7 @@ impl AppRunner {
 
         let command_pool = ResettableCommandPool::new(
             &device,
-            device.graphics_present_queue_family(),
+            device.graphics_queue_family(),
             Some("graphics command pool"),
         )?;
 
@@ -1797,24 +1803,222 @@ impl AppRunner {
             index_buffer
                 .record_copy_from(&mut upload_cmd, &staging_index_buffer)
         }?;
-        // SAFETY: same as buffer copies above; image in recording state.
-        unsafe { texture.record_copy_from2(&mut upload_cmd, &tex_staging) }?;
+
+        // Record synchronization2 image transition once before copies.
+        let to_transfer = texture
+            .whole_image_barrier2()
+            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        // SAFETY: recording state and handles valid.
+        unsafe {
+            upload_cmd.pipeline_barrier2_by_barriers(
+                &[],
+                &[],
+                std::slice::from_ref(&to_transfer),
+            )
+        };
+
+        // Copy
+        // SAFETY: `upload_cmd` is recording; `texture` and `tex_staging`
+        // remain alive until after `device.wait_idle()` therefore the
+        // recorded copy is valid.
+        unsafe { texture.record_copy_from(&mut upload_cmd, &tex_staging) }?;
+
+        // Transition image to shader-readable at the end of the upload
+        // command buffer (single post-copy barrier).
+        let image_to_shader = texture
+            .whole_image_barrier2()
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(if dedicated_transfer {
+                vk::PipelineStageFlags2::BOTTOM_OF_PIPE
+            } else {
+                vk::PipelineStageFlags2::FRAGMENT_SHADER
+            })
+            .dst_access_mask(if dedicated_transfer {
+                vk::AccessFlags2::NONE
+            } else {
+                vk::AccessFlags2::SHADER_READ
+            })
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_queue_family_index(transfer_queue_family)
+            .dst_queue_family_index(graphics_queue_family);
+
+        let mut buffer_barriers = Vec::new();
+        if queue_config.dedicated_transfer {
+            let vertex_buffer_barrier = buffer_barrier2()
+                .buffer(vertex_buffer.raw_buffer())
+                .src_queue_family_index(device.transfer_queue_family())
+                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_queue_family_index(device.graphics_queue_family())
+                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                .size(vk::WHOLE_SIZE);
+
+            let index_buffer_barrier = buffer_barrier2()
+                .buffer(index_buffer.raw_buffer())
+                .src_queue_family_index(transfer_queue_family)
+                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_queue_family_index(graphics_queue_family)
+                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                .size(vk::WHOLE_SIZE);
+
+            buffer_barriers = vec![vertex_buffer_barrier, index_buffer_barrier];
+        }
+        // SAFETY: recording state and handles valid.
+        unsafe {
+            upload_cmd.pipeline_barrier2_by_barriers(
+                &[],
+                &buffer_barriers,
+                std::slice::from_ref(&image_to_shader),
+            )
+        };
 
         upload_cmd.end()?;
-        let cmd_info = vk::CommandBufferSubmitInfo::default()
-            .command_buffer(upload_cmd.raw_command_buffer());
-        let submit_info = vk::SubmitInfo2::default()
-            .command_buffer_infos(std::slice::from_ref(&cmd_info));
-        // SAFETY: command buffer is executable; referenced resources
-        // remain alive until wait_idle below.
-        unsafe {
-            device.graphics_present_queue_submit2(
-                std::slice::from_ref(&submit_info),
-                None,
-                0,
-            )
-        }?;
-        device.wait_idle()?;
+        let opt_graphics_upload = if queue_config.dedicated_transfer {
+            // Create a short command buffer on the graphics queue to acquire
+            // ownership of the uploaded resources and run it after the
+            // transfer semaphore signals.
+            let graphics_upload_pool = ResettableCommandPool::new(
+                &device,
+                device.graphics_queue_family(),
+                Some("graphics upload pool"),
+            )?;
+            let mut graphics_upload_cmd =
+                graphics_upload_pool.allocate_command_buffer()?;
+            graphics_upload_cmd.begin()?;
+
+            let transfer_family = device.transfer_queue_family();
+            let graphics_family = device.graphics_queue_family();
+            let vb_barrier = rgpu_vk::memory::buffer_barrier2()
+                .buffer(vertex_buffer.raw_buffer())
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .src_queue_family_index(transfer_family)
+                .dst_queue_family_index(graphics_family)
+                .size(vk::WHOLE_SIZE);
+            let ib_barrier = rgpu_vk::memory::buffer_barrier2()
+                .buffer(index_buffer.raw_buffer())
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
+                .src_queue_family_index(transfer_family)
+                .dst_queue_family_index(graphics_family)
+                .size(vk::WHOLE_SIZE);
+            let img_barrier = texture
+                .whole_image_barrier2()
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(transfer_family)
+                .dst_queue_family_index(graphics_family);
+
+            let buffer_barriers = [vb_barrier, ib_barrier];
+            // SAFETY: recording state and handles valid.
+            unsafe {
+                graphics_upload_cmd.pipeline_barrier2_by_barriers(
+                    &[],
+                    &buffer_barriers,
+                    std::slice::from_ref(&img_barrier),
+                )
+            };
+
+            graphics_upload_cmd.end()?;
+            Some((graphics_upload_cmd, graphics_upload_pool))
+        } else {
+            None
+        };
+
+        let mut upload_fence =
+            rgpu_vk::sync::Fence::new(&device, false, Some("upload fence"))?;
+        // Not always needed but it's cheap
+        let transfer_semaphore =
+            Semaphore::new(&device, Some("Transfer Semaphore"))?;
+
+        if queue_config.dedicated_transfer {
+            //Double submit path
+
+            let transfer_cb_submit = CommandBufferSubmitInfo::default()
+                .command_buffer(upload_cmd.raw());
+            let transfer_semaphore_submit = SemaphoreSubmitInfo::default()
+                .semaphore(transfer_semaphore.raw())
+                .stage_mask(vk::PipelineStageFlags2::TRANSFER);
+            let transfer_submit = vk::SubmitInfo2::default()
+                .command_buffer_infos(std::slice::from_ref(&transfer_cb_submit))
+                .signal_semaphore_infos(std::slice::from_ref(
+                    &transfer_semaphore_submit,
+                ));
+
+            // SAFETY: transfer_submit is a valid SubmitInfo2. This is because
+            // transfer_cb_submit and transfer_semaphore_submit are valid.
+            // transfer_cb_submit is valid because the command buffer was made
+            // on this device for the transfer queue and is in the recorded
+            // state. transfer_semaphore_submit is valid because it signals
+            // after the last transfer completes and is created on this device
+            unsafe {
+                device.transfer_queue_submit2(
+                    std::slice::from_ref(&transfer_submit),
+                    None,
+                )?
+            }
+            let (graphics_cb, _graphics_pool) = opt_graphics_upload.as_ref().expect(
+                "Somehow used dedicated transfer queue but did not record graphics \
+                 queue half of upload"
+            );
+            let graphics_cb_submit = CommandBufferSubmitInfo::default()
+                .command_buffer(graphics_cb.raw());
+            let graphics_semaphore_submit = SemaphoreSubmitInfo::default()
+                .semaphore(transfer_semaphore.raw())
+                .stage_mask(PipelineStageFlags2::VERTEX_INPUT);
+            let graphics_submit = vk::SubmitInfo2::default()
+                .command_buffer_infos(std::slice::from_ref(&graphics_cb_submit))
+                .wait_semaphore_infos(std::slice::from_ref(
+                    &graphics_semaphore_submit,
+                ));
+
+            // SAFETY: graphics_submit is a valid SubmitInfo2 because
+            // graphics_cb_submit is a valid CommandBufferSubmitInfo and
+            // graphics_semaphore_submit is a valid SemaphoreSubmitInfo.
+            // graphics_cb_submit is a vallid CommandBufferSubmitInfo because
+            // the command buffer was created on this device for this queue
+            // family and is in the recorded state. graphics_semaphore_submit is
+            // valid because it waits at the vertex input stage, the first stage
+            // where we can possibly use the resources it guards
+            unsafe {
+                device.graphics_queue_submit2(
+                    std::slice::from_ref(&graphics_submit),
+                    Some(&mut upload_fence),
+                )?
+            }
+        } else {
+            let transfer_cb_submit = CommandBufferSubmitInfo::default()
+                .command_buffer(upload_cmd.raw());
+
+            let transfer_submit = vk::SubmitInfo2::default()
+                .command_buffer_infos(std::slice::from_ref(
+                    &transfer_cb_submit,
+                ));
+
+            // SAFETY: transfer_submit is a valid SubmitInfo2. This is because
+            // transfer_cb_submit is valid. transfer_cb_submit is valid because
+            // the command buffer was made on this device for the transfer queue
+            unsafe {
+                device.transfer_queue_submit2(
+                    std::slice::from_ref(&transfer_submit),
+                    Some(&mut upload_fence),
+                )?;
+            }
+        }
+        // `wait` is safe and does not require additional invariants beyond
+        // a valid fence; call it directly.
+        upload_fence.wait(u64::MAX)?;
 
         let sampler = rgpu_vk::sampler::Sampler::new(
             &device,

@@ -39,11 +39,11 @@
 //! Higher-level wrappers in sibling modules call these rather than
 //! accessing `ash::Device` directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 
-use ash::vk;
+use ash::vk::{self};
 use gpu_allocator::{
     AllocationError, MemoryLocation,
     vulkan::{
@@ -113,16 +113,18 @@ pub struct Device {
     synchronization2: Option<Synchronization2Loader>,
     physical_device: vk::PhysicalDevice,
     memory_budget: bool,
-    /// Queues for the graphics+present role.
+    /// Queue for the graphics+present role.
     ///
-    /// In `DedicatedParallel`/`Parallel` modes this Vec may hold
-    /// multiple distinct `VkQueue` handles from the same family.
-    /// Roles that share a family share the same `Arc<Mutex<…>>`.
-    graphics_present_queues: Vec<Arc<Mutex<vk::Queue>>>,
-    graphics_present_family: u32,
-    transfer_queues: Vec<Arc<Mutex<vk::Queue>>>,
+    /// We store exactly one `VkQueue` handle per role. Roles that share a
+    /// family share the same `Arc<Mutex<…>>`.
+    graphics_queue: Arc<Mutex<vk::Queue>>,
+    graphics_queue_family: u32,
+    /// Queue for presentation. May be the same family as graphics.
+    present_queue: Arc<Mutex<vk::Queue>>,
+    present_family: u32,
+    transfer_queues: Arc<Mutex<vk::Queue>>,
     transfer_family: u32,
-    compute_queues: Vec<Arc<Mutex<vk::Queue>>>,
+    compute_queues: Arc<Mutex<vk::Queue>>,
     compute_family: u32,
     /// The [`QueueConfig`] that was actually applied (may differ
     /// from the requested config when strict mode is off).
@@ -264,10 +266,9 @@ pub struct QueueConfig {
     /// graphics). When `false`, the graphics/present family is
     /// used for compute.
     pub dedicated_compute: bool,
-    /// Allocate all available queues from each family, enabling
-    /// per-frame-in-flight parallelism. When `false`, exactly one
-    /// queue is allocated per family.
-    pub parallel: bool,
+    /// Use a dedicated present queue family (not shared with graphics).
+    /// When `false`, the graphics family will be used for present.
+    pub dedicated_present: bool,
 }
 
 impl Default for QueueConfig {
@@ -275,7 +276,7 @@ impl Default for QueueConfig {
         Self {
             dedicated_transfer: true,
             dedicated_compute: true,
-            parallel: true,
+            dedicated_present: false,
         }
     }
 }
@@ -284,9 +285,10 @@ impl std::fmt::Display for QueueConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "dedicated_transfer={}, dedicated_compute={}, \
-             parallel={}",
-            self.dedicated_transfer, self.dedicated_compute, self.parallel,
+            "dedicated_transfer={}, dedicated_compute={}, dedicated_present={}",
+            self.dedicated_transfer,
+            self.dedicated_compute,
+            self.dedicated_present,
         )
     }
 }
@@ -364,7 +366,8 @@ impl Device {
             handle: vk::PhysicalDevice,
             props: vk::PhysicalDeviceProperties,
             queue_families: Vec<vk::QueueFamilyProperties>,
-            graphics_present_family: u32,
+            graphics_family: u32,
+            present_family: u32,
             score: (u32, u32, u32),
             /// True when sync2 must use the extension loader.
             use_sync2_ext: bool,
@@ -504,41 +507,63 @@ impl Device {
                 false
             };
 
-            // Find a queue family that supports both graphics and
-            // presentation — hard filter.
-            let Some(graphics_present_family) =
-                queue_families.iter().enumerate().find_map(|(idx, qf)| {
-                    if !qf.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                        return None;
+            // Find at least one graphics-capable family and at least one
+            // present-capable family. We may prefer a unified family later.
+            let mut any_graphics_family: Option<u32> = None;
+            let mut any_present_family: Option<u32> = None;
+            for (idx, qf) in queue_families.iter().enumerate() {
+                if any_graphics_family.is_none()
+                    && qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                {
+                    any_graphics_family = Some(idx as u32);
+                    if let Ok(true) =
+                        // SAFETY: `dev` and `surf` are both derived from the
+                        // same `Instance`, so calling into the instance's
+                        // surface support query is safe here.
+                        unsafe {
+                            surf.supports_queue_family(dev, idx as u32)
+                        }
+                        && (!(config.queue_config.dedicated_present
+                            && config.queue_config_strict)
+                            || any_present_family.is_none())
+                    {
+                        any_present_family = any_graphics_family;
+                        break;
                     }
-                    // SAFETY: dev and surf are both derived from the
-                    // same instance (validated at the top of this fn).
-                    let ok =
-                        unsafe { surf.supports_queue_family(dev, idx as u32) };
-                    match ok {
-                        Ok(true) => Some(idx as u32),
-                        _ => None,
+                }
+                if let Ok(true) =
+                    // SAFETY: `dev` and `surf` are both derived from the
+                    // same `Instance`, so calling into the instance's
+                    // surface support query is safe here.
+                    unsafe {
+                        surf.supports_queue_family(dev, idx as u32)
                     }
-                })
-            else {
+                {
+                    any_present_family = Some(idx as u32);
+                }
+            }
+            if any_graphics_family.is_none() || any_present_family.is_none() {
                 tracing::debug!(
-                    "Skipping {:?}: no graphics+present queue family",
+                    "Skipping {:?}: missing graphics or present family",
                     props.device_name_as_c_str().unwrap_or(c"unknown"),
                 );
                 continue 'dev;
-            };
+            }
 
             let has_dedicated_transfer = queue_families.iter().any(|qf| {
                 qf.queue_flags.contains(vk::QueueFlags::TRANSFER)
                     && !qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
             });
+            let has_dedicated_present =
+                any_graphics_family == any_present_family;
             let has_dedicated_compute = queue_families.iter().any(|qf| {
                 qf.queue_flags.contains(vk::QueueFlags::COMPUTE)
                     && !qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
             });
 
-            let dedicated_count =
-                has_dedicated_transfer as u32 + has_dedicated_compute as u32;
+            let dedicated_score = has_dedicated_transfer as u32
+                + has_dedicated_compute as u32
+                + !has_dedicated_present as u32;
 
             // Sample count support: intersect colour and depth limits.
             let supported_samples =
@@ -558,7 +583,7 @@ impl Device {
             }
 
             let score = (
-                dedicated_count,
+                dedicated_score,
                 device_type_priority(props.device_type),
                 supports_sample_count as u32,
             );
@@ -567,7 +592,8 @@ impl Device {
                 handle: dev,
                 props,
                 queue_families,
-                graphics_present_family,
+                graphics_family: any_graphics_family.unwrap(),
+                present_family: any_present_family.unwrap(),
                 score,
                 use_sync2_ext,
                 use_dr_ext,
@@ -587,7 +613,7 @@ impl Device {
 
         let physical_device = best.handle;
         let queue_families = &best.queue_families;
-        let graphics_present_family = best.graphics_present_family;
+        let graphics_family = best.graphics_family;
         let use_sync2_ext = best.use_sync2_ext;
         let use_dr_ext = best.use_dr_ext;
         let use_maintenance1_ext = best.use_maintenance1_ext;
@@ -604,9 +630,13 @@ impl Device {
         );
 
         // --- Family selection ---
-        // When dedicated_transfer/compute is requested, prefer a
-        // family with the required flag but without GRAPHICS.
-        // Fall back to graphics_present_family if none exists.
+        //
+        // When dedicated_transfer/compute is requested, prefer a family with
+        // the required flag but without GRAPHICS. Fall back to
+        // graphics_present_family if none exists.
+        //
+        // When dedicated_present is not requested, prefer the graphics queue
+        // else use the dedicated_present_queue.
         let dedicated_transfer_family =
             queue_families.iter().enumerate().find_map(|(idx, qf)| {
                 if qf.queue_flags.contains(vk::QueueFlags::TRANSFER)
@@ -628,44 +658,55 @@ impl Device {
                     None
                 }
             });
+        let dedicated_present_family = {
+            queue_families.iter().enumerate().find_map(|(idx, qf)| {
+                if !qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                    // SAFETY: `dev` and `surf` are both derived from the
+                    // same `Instance`, so calling into the instance's
+                    // surface support query is safe here.
+                    && let Ok(true) = unsafe {
+                        surf.supports_queue_family(best.handle, idx as u32)
+                    }
+                {
+                    Some(idx as u32)
+                } else {
+                    None
+                }
+            })
+        };
 
         let transfer_family = if config.queue_config.dedicated_transfer {
-            dedicated_transfer_family.unwrap_or(graphics_present_family)
+            dedicated_transfer_family.unwrap_or(graphics_family)
         } else {
-            graphics_present_family
+            graphics_family
         };
 
         let compute_family = if config.queue_config.dedicated_compute {
-            dedicated_compute_family.unwrap_or(graphics_present_family)
+            dedicated_compute_family.unwrap_or(graphics_family)
         } else {
-            graphics_present_family
+            graphics_family
+        };
+
+        let present_family = if !config.queue_config.dedicated_present {
+            best.present_family
+        } else {
+            dedicated_present_family.unwrap_or(best.present_family)
         };
 
         tracing::info!(
-            "Queue families — graphics+present: {}, \
-             transfer: {}, compute: {}",
-            graphics_present_family,
+            "Queue families — \
+             graphics: {}, present: {}, transfer: {}, compute: {}",
+            graphics_family,
+            graphics_family,
             transfer_family,
             compute_family
         );
 
         // --- Queue count per family ---
-        // Parallel mode allocates all available queues from each
-        // family. Non-parallel mode allocates exactly one.
-        let want_parallel = config.queue_config.parallel;
-
-        // Deduplicate families; count is set once per unique family.
-        let mut family_queue_counts: HashMap<u32, u32> = HashMap::new();
-        for &family in
-            &[graphics_present_family, transfer_family, compute_family]
-        {
-            family_queue_counts.entry(family).or_insert_with(|| {
-                if want_parallel {
-                    queue_families[family as usize].queue_count.max(1)
-                } else {
-                    1
-                }
-            });
+        // Always allocate exactly one queue per family (no parallelism).
+        let mut queue_families: HashSet<u32> = HashSet::new();
+        for &family in &[graphics_family, transfer_family, compute_family] {
+            queue_families.insert(family);
         }
 
         // --- Determine effective config and check strictness ---
@@ -673,11 +714,10 @@ impl Device {
         // dedicated_compute reflect whether each role got its own
         // family; parallel reflects whether more than one queue was
         // allocated from the graphics/present family.
-        let gfx_queue_count = family_queue_counts[&graphics_present_family];
         let effective_config = QueueConfig {
-            dedicated_transfer: transfer_family != graphics_present_family,
-            dedicated_compute: compute_family != graphics_present_family,
-            parallel: gfx_queue_count > 1,
+            dedicated_transfer: transfer_family != graphics_family,
+            dedicated_compute: compute_family != graphics_family,
+            dedicated_present: false,
         };
 
         if config.queue_config_strict {
@@ -685,7 +725,7 @@ impl Device {
             let eff = effective_config;
             if (req.dedicated_transfer && !eff.dedicated_transfer)
                 || (req.dedicated_compute && !eff.dedicated_compute)
-                || (req.parallel && !eff.parallel)
+                || (req.dedicated_present && !eff.dedicated_present)
             {
                 return Err(CreateCompatibleError::QueueConfigUnsatisfied {
                     requested: req,
@@ -694,19 +734,14 @@ impl Device {
             }
         }
 
-        let queue_priorities_storage: Vec<Vec<f32>> = family_queue_counts
-            .iter()
-            .map(|(_, &count)| vec![1.0; count as usize])
-            .collect();
-
+        let priorities = [1.0];
         let queue_create_infos: Vec<vk::DeviceQueueCreateInfo<'_>> =
-            family_queue_counts
+            queue_families
                 .iter()
-                .zip(queue_priorities_storage.iter())
-                .map(|((&family, _), priorities)| {
+                .map(|family| {
                     vk::DeviceQueueCreateInfo::default()
-                        .queue_family_index(family)
-                        .queue_priorities(priorities)
+                        .queue_family_index(*family)
+                        .queue_priorities(&priorities)
                 })
                 .collect();
 
@@ -762,25 +797,43 @@ impl Device {
         }
         .map_err(CreateCompatibleError::DeviceCreationFailed)?;
 
-        // Build per-family Vec<Arc<Mutex<vk::Queue>>>.
-        // Roles that share a family share the same Arc instances, so
+        // Build per-family single `Arc<Mutex<vk::Queue>>` entries.
+        // Roles that share a family share the same Arc instance, so
         // locking any role serialises on the same Mutex.
-        let mut family_queues: HashMap<u32, Vec<Arc<Mutex<vk::Queue>>>> =
+        let mut family_queues: HashMap<u32, Arc<Mutex<vk::Queue>>> =
             HashMap::new();
-        for (&family, &count) in &family_queue_counts {
-            let queues = (0..count)
-                .map(|i| {
-                    // SAFETY: device was just created requesting
-                    // `count` queues from this family.
-                    let q = unsafe { device.get_device_queue(family, i) };
-                    Arc::new(Mutex::new(q))
-                })
-                .collect();
-            family_queues.insert(family, queues);
+        for family in &queue_families {
+            // SAFETY: device was just created requesting at least one
+            // queue from this family; always fetch queue 0.
+            let q = unsafe { device.get_device_queue(*family, 0) };
+            family_queues.insert(*family, Arc::new(Mutex::new(q)));
         }
 
-        let graphics_present_queues =
-            family_queues[&graphics_present_family].clone();
+        let debug_utils_device =
+            instance.create_debug_utils_device_loader(&device);
+
+        // for (family, mut queue) in &mut family_queues {
+        //     debug_utils_device.as_ref().inspect(|dud| {
+        //         let queue = Arc::get_mut(&mut queue)
+        //             .expect("This Arc should not have been cloned yet")
+        //             .get_mut()
+        //             .expect("Poisoned mutex around queue before any usage");
+
+        //         let object_debug_name: String = [if family = graphics_present_family].iter().collect();
+        //         // SAFETY: device was just created. Queue was just created from
+        //         // this device
+        //         unsafe {
+        //             dud.set_debug_utils_object_name(
+        //                 &DebugUtilsObjectNameInfoEXT::default()
+        //                     .object_handle(*queue)
+        //                     .object_name(queue_debug_name),
+        //             )
+        //         };
+        //     });
+        // }
+
+        let graphics_queue = family_queues[&graphics_family].clone();
+        let present_queue = family_queues[&present_family].clone();
         let transfer_queues = family_queues[&transfer_family].clone();
         let compute_queues = family_queues[&compute_family].clone();
 
@@ -804,8 +857,7 @@ impl Device {
             } else {
                 None
             },
-            debug_utils_device: instance
-                .create_debug_utils_device_loader(&device),
+            debug_utils_device,
             dynamic_rendering: if config.dynamic_rendering {
                 if use_dr_ext {
                     Some(DynamicRenderingLoader::Extension(
@@ -831,8 +883,10 @@ impl Device {
             handle: device,
             physical_device,
             memory_budget: best.enable_memory_budget,
-            graphics_present_queues,
-            graphics_present_family,
+            graphics_queue,
+            graphics_queue_family: graphics_family,
+            present_queue,
+            present_family: graphics_family,
             transfer_queues,
             transfer_family,
             compute_queues,
@@ -1035,8 +1089,12 @@ impl Device {
         self.handle.handle()
     }
 
-    pub fn graphics_present_queue_family(&self) -> u32 {
-        self.graphics_present_family
+    pub fn graphics_queue_family(&self) -> u32 {
+        self.graphics_queue_family
+    }
+
+    pub fn present_queue_family(&self) -> u32 {
+        self.present_family
     }
 
     pub fn transfer_queue_family(&self) -> u32 {
@@ -1047,16 +1105,20 @@ impl Device {
         self.compute_family
     }
 
-    pub fn graphics_present_queue_count(&self) -> usize {
-        self.graphics_present_queues.len()
+    pub fn graphics_queue_count(&self) -> usize {
+        1
+    }
+
+    pub fn present_queue_count(&self) -> usize {
+        1
     }
 
     pub fn transfer_queue_count(&self) -> usize {
-        self.transfer_queues.len()
+        1
     }
 
     pub fn compute_queue_count(&self) -> usize {
-        self.compute_queues.len()
+        1
     }
 
     pub fn queue_config(&self) -> QueueConfig {
@@ -1259,18 +1321,15 @@ impl Device {
     pub unsafe fn queue_present(
         &self,
         present_info: &vk::PresentInfoKHR<'_>,
-        queue_index: usize,
     ) -> Result<bool, QueuePresentError> {
         let swapchain_device = self
             .swapchain_device
             .as_ref()
             .expect("swapchain was not enabled in DeviceConfig");
         let queue = self
-            .graphics_present_queues
-            .get(queue_index)
-            .ok_or(QueuePresentError::QueueIndexOutOfBounds(queue_index))?
+            .present_queue
             .lock()
-            .expect("graphics/present queue lock poisoned");
+            .expect("present queue lock poisoned");
         // SAFETY: Caller guarantees all handles and synchronization
         // requirements.
         unsafe { swapchain_device.queue_present(*queue, present_info) }
@@ -1559,18 +1618,15 @@ impl Device {
     /// Command buffers must be in the executable state. Wait semaphores must be
     /// signaled. Signal semaphores must be unsignaled. `fence`, when not null,
     /// must be an unsignaled fence created from this device.
-    pub unsafe fn graphics_present_queue_submit2_raw_fence(
+    pub unsafe fn graphics_queue_submit2_raw_fence(
         &self,
         submits: &[vk::SubmitInfo2<'_>],
         fence: vk::Fence,
-        queue_index: usize,
     ) -> Result<(), QueueSubmitError> {
         let queue = self
-            .graphics_present_queues
-            .get(queue_index)
-            .ok_or(QueueSubmitError::QueueIndexOutOfBounds(queue_index))?
+            .graphics_queue
             .lock()
-            .expect("graphics/present queue lock poisoned");
+            .expect("graphics queue lock poisoned");
         let sync2 = self
             .synchronization2
             .as_ref()
@@ -1597,11 +1653,10 @@ impl Device {
     /// All handles in `submits` must be valid and derived from this device.
     /// Command buffers must be in the executable state. Wait semaphores must be
     /// signaled. Signal semaphores must be unsignaled.
-    pub unsafe fn graphics_present_queue_submit2(
+    pub unsafe fn graphics_queue_submit2(
         &self,
         submits: &[vk::SubmitInfo2<'_>],
         fence: Option<&mut sync::Fence>,
-        queue_index: usize,
     ) -> Result<(), QueueSubmitError> {
         if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
             Err(QueueSubmitError::FenceNotReady)
@@ -1623,17 +1678,98 @@ impl Device {
             // raw_fence is known to have been derived from this device
             // and is in the unsignaled state.
             unsafe {
-                self.graphics_present_queue_submit2_raw_fence(
-                    submits,
-                    raw_fence,
-                    queue_index,
-                )
+                self.graphics_queue_submit2_raw_fence(submits, raw_fence)
             }?;
 
             if let Some(f) = fence {
                 // SAFETY: This fence has just been submitted to the
                 // queue via
                 // Self::graphics_present_queue_submit2_raw_fence.
+                _ = unsafe { f.mark_submitted() }
+            }
+
+            Ok(())
+        }
+    }
+
+    /// Submit work to the transfer queue using the synchronization2 API.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled. `fence`, when not null,
+    /// must be an unsignaled fence created from this device.
+    pub unsafe fn transfer_queue_submit2_raw_fence(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), QueueSubmitError> {
+        let queue = self
+            .transfer_queues
+            .lock()
+            .expect("transfer queue lock poisoned");
+        let sync2 = self
+            .synchronization2
+            .as_ref()
+            .expect("synchronization2 was not enabled in DeviceConfig");
+        match sync2 {
+            Synchronization2Loader::Core => {
+                // SAFETY: `queue` was obtained from this device and remains
+                // valid while this call executes. `submits` and `fence` refer
+                // to resources created for this device; calling the raw
+                // `queue_submit2` function pointer is safe because the
+                // Synchronization2 loader was initialized during device
+                // creation and provides a valid entrypoint.
+                unsafe { self.handle.queue_submit2(*queue, submits, fence) }
+            }
+            Synchronization2Loader::Extension(loader) => {
+                // SAFETY: `loader` contains a valid function pointer for
+                // `queue_submit2` loaded when the device was created. `queue`,
+                // `submits`, and `fence` are valid and derived from this
+                // device, so invoking the extension entrypoint is safe.
+                unsafe { loader.queue_submit2(*queue, submits, fence) }
+            }
+        }
+        .map_err(QueueSubmitError::SubmissionFailed)
+    }
+
+    /// Submit work to the transfer queue using the synchronization2 API.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled.
+    pub unsafe fn transfer_queue_submit2(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| f.parent().raw_device() != self.raw_device())
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            // SAFETY: All handles in submits are valid and derived from
+            // this device by our own safety contract. Command buffers
+            // are in the executable state by our own safety contract.
+            // Wait semaphores are signaled by our own safety contract.
+            // raw_fence is known to have been derived from this device
+            // and is in the unsignaled state.
+            unsafe {
+                self.transfer_queue_submit2_raw_fence(submits, raw_fence)
+            }?;
+
+            if let Some(f) = fence {
+                // SAFETY: This fence has just been submitted to the
+                // queue via Self::transfer_queue_submit2_raw_fence.
                 _ = unsafe { f.mark_submitted() }
             }
 
@@ -1672,6 +1808,9 @@ impl Device {
             },
         }
     }
+
+    // Removed: `cmd_pipeline_barrier2_raw` helper moved to the
+    // `ResettableCommandBuffer` wrapper as requested.
 }
 
 // Recording commands
@@ -1895,11 +2034,10 @@ impl Device {
     /// semaphores must be signaled. Signal semaphores must be
     /// unsignaled. `fence`, when `Some`, must be in the ready state
     /// (unsignaled, not pending).
-    pub unsafe fn graphics_present_queue_submit(
+    pub unsafe fn graphics_queue_submit(
         &self,
         submits: &[vk::SubmitInfo<'_>],
         fence: Option<&mut crate::sync::Fence>,
-        queue_index: usize,
     ) -> Result<(), QueueSubmitError> {
         if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
             Err(QueueSubmitError::FenceNotReady)
@@ -1915,11 +2053,51 @@ impl Device {
                 .map(|f| f.raw_fence())
                 .unwrap_or(vk::Fence::null());
             let queue = self
-                .graphics_present_queues
-                .get(queue_index)
-                .ok_or(QueueSubmitError::QueueIndexOutOfBounds(queue_index))?
+                .graphics_queue
                 .lock()
-                .expect("graphics/present queue lock poisoned");
+                .expect("graphics queue lock poisoned");
+            // SAFETY: Caller guarantees all handle validity and state.
+            unsafe { self.handle.queue_submit(*queue, submits, raw_fence) }
+                .map_err(QueueSubmitError::SubmissionFailed)?;
+            if let Some(f) = fence {
+                // SAFETY: fence was just submitted above.
+                _ = unsafe { f.mark_submitted() };
+            }
+            Ok(())
+        }
+    }
+
+    /// Submit work to the transfer queue using the core Vulkan 1.0
+    /// `vkQueueSubmit` API.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be
+    /// unsignaled. `fence`, when `Some`, must be in the ready state
+    /// (unsignaled, not pending).
+    pub unsafe fn transfer_queue_submit(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| f.parent().raw_device() != self.raw_device())
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            let queue = self
+                .transfer_queues
+                .lock()
+                .expect("transfer queue lock poisoned");
             // SAFETY: Caller guarantees all handle validity and state.
             unsafe { self.handle.queue_submit(*queue, submits, raw_fence) }
                 .map_err(QueueSubmitError::SubmissionFailed)?;
@@ -1940,12 +2118,18 @@ impl Device {
     /// `command_buffer` must be in the recording state. All handles
     /// and image layouts in the barrier arrays must be valid and
     /// consistent with the command buffer's current state.
+    // Allow extra arguments: this signature mirrors the Vulkan
+    // `vkCmdPipelineBarrier` parameter groups and is kept in sync
+    // with the raw API for clarity.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn cmd_pipeline_barrier(
         &self,
         command_buffer: vk::CommandBuffer,
         src_stage_mask: vk::PipelineStageFlags,
         dst_stage_mask: vk::PipelineStageFlags,
         dependency_flags: vk::DependencyFlags,
+        memory_barriers: &[vk::MemoryBarrier<'_>],
+        buffer_memory_barriers: &[vk::BufferMemoryBarrier<'_>],
         image_memory_barriers: &[vk::ImageMemoryBarrier<'_>],
     ) {
         // SAFETY: Caller guarantees command_buffer state and
@@ -1956,8 +2140,8 @@ impl Device {
                 src_stage_mask,
                 dst_stage_mask,
                 dependency_flags,
-                &[],
-                &[],
+                memory_barriers,
+                buffer_memory_barriers,
                 image_memory_barriers,
             )
         }

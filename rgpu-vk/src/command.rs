@@ -433,6 +433,8 @@ impl ResettableCommandBuffer {
         src_stage_mask: vk::PipelineStageFlags,
         dst_stage_mask: vk::PipelineStageFlags,
         dependency_flags: vk::DependencyFlags,
+        memory_barriers: &[vk::MemoryBarrier<'_>],
+        buffer_memory_barriers: &[vk::BufferMemoryBarrier<'_>],
         image_memory_barriers: &[vk::ImageMemoryBarrier<'_>],
     ) {
         debug_assert_eq!(self.state, CommandBufferState::Recording);
@@ -444,8 +446,53 @@ impl ResettableCommandBuffer {
                 src_stage_mask,
                 dst_stage_mask,
                 dependency_flags,
+                memory_barriers,
+                buffer_memory_barriers,
                 image_memory_barriers,
             )
+        }
+    }
+
+    /// Record a synchronization2 pipeline barrier from individual barrier
+    /// slices. This builds a `vk::DependencyInfo` and calls
+    /// `vkCmdPipelineBarrier2`.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state. All provided barrier
+    /// objects must be valid and consistent with the command buffer's
+    /// current state.
+    pub unsafe fn pipeline_barrier2_by_barriers(
+        &mut self,
+        memory_barriers: &[vk::MemoryBarrier2<'_>],
+        buffer_memory_barriers: &[vk::BufferMemoryBarrier2<'_>],
+        image_memory_barriers: &[vk::ImageMemoryBarrier2<'_>],
+    ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
+        let dep_info = vk::DependencyInfo::default()
+            .memory_barriers(memory_barriers)
+            .buffer_memory_barriers(buffer_memory_barriers)
+            .image_memory_barriers(image_memory_barriers);
+        // SAFETY: caller of `pipeline_barrier2_by_barriers` ensures the
+        // buffer is recording and the barrier objects are valid.
+        unsafe { self.pipeline_barrier2(&dep_info) };
+    }
+
+    /// Record a synchronization2 pipeline barrier using a pre-built
+    /// `vk::DependencyInfo`.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state and `dependency_info`
+    /// must be valid for the current command buffer state.
+    pub unsafe fn pipeline_barrier2_by_dep_info(
+        &mut self,
+        dependency_info: &vk::DependencyInfo<'_>,
+    ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
+        // SAFETY: caller ensures the buffer is recording and
+        // dependency_info is valid.
+        unsafe {
+            self.parent
+                .cmd_pipeline_barrier2(self.handle, dependency_info)
         }
     }
 
@@ -778,7 +825,7 @@ impl ResettableCommandBuffer {
         }
     }
 
-    pub fn raw_command_buffer(&self) -> vk::CommandBuffer {
+    pub fn raw(&self) -> vk::CommandBuffer {
         self.handle
     }
 

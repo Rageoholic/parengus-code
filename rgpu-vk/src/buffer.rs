@@ -422,7 +422,7 @@ impl DeviceLocalBuffer {
             });
         }
 
-        let raw_cmd = command_buffer.raw_command_buffer();
+        let raw_cmd = command_buffer.raw();
         let copy_region = vk::BufferCopy::default()
             .src_offset(src_offset)
             .dst_offset(dst_offset)
