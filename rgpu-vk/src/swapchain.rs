@@ -383,8 +383,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         }
 
         let physical_device = parent_device.physical_device();
-        let present_queue_family =
-            parent_device.graphics_present_queue_family();
+        let present_queue_family = parent_device.present_queue_family();
 
         // SAFETY: physical_device belongs to parent_device's instance, and
         // parent_surface is derived from the same instance (validated above).

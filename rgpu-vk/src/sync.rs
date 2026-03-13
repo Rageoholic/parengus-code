@@ -300,7 +300,7 @@ impl Semaphore {
         })
     }
 
-    pub fn raw_semaphore(&self) -> vk::Semaphore {
+    pub fn raw(&self) -> vk::Semaphore {
         self.handle
     }
 

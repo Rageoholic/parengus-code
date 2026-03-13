@@ -85,7 +85,12 @@
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceRoot}/out/samp-app-noext/debug/",
-            "environment": [],
+            "environment": [
+                {
+                    "name": "RUST_BACKTRACE",
+                    "value": "1"
+                }
+            ],
             "console": "integratedTerminal",
             "preLaunchTask": "build samp-app-noext debug"
         },
