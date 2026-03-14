@@ -303,6 +303,12 @@ struct CliArgs {
     #[arg(long)]
     shader_debug_info: bool,
 
+    /// Cap Vulkan instance API version to 1.0 and force extension
+    /// code paths for all device features. Useful for testing
+    /// pre-1.3 / pre-1.1 fallback paths.
+    #[arg(long)]
+    vk_strict_config: bool,
+
     /// Disable ANSI color codes in stdout log output.
     #[arg(long)]
     no_color: bool,
@@ -437,7 +443,11 @@ fn main() -> eyre::Result<()> {
             "samp-app",
             cli_args.graphics_debug_level.map(Into::into),
             Some(&event_loop),
-            InstanceConfig { surface: true },
+            InstanceConfig {
+                surface: true,
+                vk_1_0_strict: cli_args.vk_strict_config,
+                physical_device_features2: true,
+            },
         )
     }?);
 
