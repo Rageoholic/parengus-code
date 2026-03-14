@@ -13,11 +13,17 @@
                 "--tracing-log-level",
                 "warn",
                 "--graphics-debug-level",
-                "warn"
+                "warn",
+                "--vk-strict-config",
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceRoot}/out/samp-app/debug/",
-            "environment": [],
+            "environment": [
+                {
+                    "name": "RUST_BACKTRACE",
+                    "value": "1"
+                }
+            ],
             "console": "integratedTerminal",
             "preLaunchTask": "build samp-app debug"
         },
@@ -30,11 +36,17 @@
                 "--tracing-log-level",
                 "error",
                 "--graphics-debug-level",
-                "error"
+                "error",
+                "--vk-strict-config",
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceRoot}/out/samp-app/debug/",
-            "environment": [],
+            "environment": [
+                {
+                    "name": "RUST_BACKTRACE",
+                    "value": "1"
+                }
+            ],
             "console": "integratedTerminal",
             "preLaunchTask": "build samp-app debug"
         },
@@ -47,11 +59,17 @@
                 "--tracing-log-level",
                 "trace",
                 "--graphics-debug-level",
-                "trace"
+                "trace",
+                "--vk-strict-config",
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceRoot}/out/samp-app/debug/",
-            "environment": [],
+            "environment": [
+                {
+                    "name": "RUST_BACKTRACE",
+                    "value": "1"
+                }
+            ],
             "console": "integratedTerminal",
             "preLaunchTask": "build samp-app debug"
         },
@@ -64,11 +82,17 @@
                 "--tracing-log-level",
                 "warn",
                 "--graphics-debug-level",
-                "warn"
+                "warn",
+                "--vk-strict-config",
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceRoot}/out/phoenix/debug/",
-            "environment": [],
+            "environment": [
+                {
+                    "name": "RUST_BACKTRACE",
+                    "value": "1"
+                }
+            ],
             "console": "integratedTerminal",
             "preLaunchTask": "build phoenix debug"
         },
@@ -81,7 +105,8 @@
                 "--tracing-log-level",
                 "warn",
                 "--graphics-debug-level",
-                "warn"
+                "warn",
+                "--vk-strict-config",
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceRoot}/out/samp-app-noext/debug/",
@@ -103,7 +128,8 @@
                 "--tracing-log-level",
                 "trace",
                 "--graphics-debug-level",
-                "trace"
+                "trace",
+                "--vk-strict-config",
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceRoot}/out/samp-app-noext/debug/",

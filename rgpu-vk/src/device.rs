@@ -200,6 +200,13 @@ pub enum CreateCompatibleError {
     )]
     Maintenance1NotAvailable,
 
+    #[error(
+        "The following DeviceConfig features require \
+         physical_device_features2 on the instance, but it was \
+         not enabled in InstanceConfig: {0}"
+    )]
+    PhysDevFeatures2Required(String),
+
     #[error("Failed to create GPU allocator: {0}")]
     AllocatorCreation(AllocationError),
 
@@ -344,6 +351,20 @@ impl Device {
         if !std::sync::Arc::ptr_eq(surf.parent(), instance) {
             return Err(CreateCompatibleError::MismatchedParams);
         }
+        if !instance.phys_dev_features2_enabled() {
+            let mut needs_features2: Vec<&'static str> = Vec::new();
+            if config.synchronization2 {
+                needs_features2.push("synchronization2");
+            }
+            if config.dynamic_rendering {
+                needs_features2.push("dynamic_rendering");
+            }
+            if !needs_features2.is_empty() {
+                return Err(CreateCompatibleError::PhysDevFeatures2Required(
+                    needs_features2.join(", "),
+                ));
+            }
+        }
 
         // Evaluate every physical device, filtering out those that
         // lack required extensions or a graphics+present queue, then
@@ -401,11 +422,16 @@ impl Device {
             // Use the device's own reported API version so that
             // per-device capability differences are handled correctly
             // rather than relying on the single instance-level version.
+            // When the instance was created with vk_1_0_strict, treat
+            // every device as pre-1.3 and pre-1.1 so that the extension
+            // code paths are always exercised.
             let dev_api =
                 crate::instance::VkVersion::from_raw(props.api_version);
-            let is_pre_1_3 = dev_api.major() < 1
+            let is_pre_1_3 = instance.strict_1_0()
+                || dev_api.major() < 1
                 || (dev_api.major() == 1 && dev_api.minor() < 3);
-            let is_pre_1_1 = dev_api.major() < 1
+            let is_pre_1_1 = instance.strict_1_0()
+                || dev_api.major() < 1
                 || (dev_api.major() == 1 && dev_api.minor() < 1);
 
             // VK_KHR_swapchain is never promoted to core; always check
@@ -745,25 +771,56 @@ impl Device {
                 })
                 .collect();
 
-        // Build extension list from the selected candidate's flags.
-        let mut mandatory_exts: Vec<&CStr> = Vec::with_capacity(4);
+        // Build the device extension list. A HashSet is used so
+        // that dependency extensions can be inserted freely without
+        // worrying about duplicates.
+        //
+        // Extension dependency chains (device extensions only;
+        // instance extensions such as
+        // VK_KHR_get_physical_device_properties2 are omitted
+        // because they cannot appear in ppEnabledExtensionNames):
+        //
+        //   VK_KHR_swapchain
+        //     (no device-ext deps)
+        //   VK_KHR_shader_non_semantic_info
+        //     (no deps)
+        //   VK_EXT_memory_budget
+        //     (no device-ext deps)
+        //   VK_KHR_synchronization2
+        //     (no device-ext deps)
+        //   VK_KHR_dynamic_rendering
+        //     └── VK_KHR_depth_stencil_resolve (1.2 core)
+        //           └── VK_KHR_create_renderpass2 (1.2 core)
+        //                 ├── VK_KHR_multiview (1.1 core)
+        //                 └── VK_KHR_maintenance2 (1.1 core)
+        //   VK_KHR_maintenance1
+        //     (no deps)
+        let mut mandatory_exts: HashSet<&CStr> = HashSet::new();
         if config.swapchain {
-            mandatory_exts.push(ash::khr::swapchain::NAME);
+            mandatory_exts.insert(ash::khr::swapchain::NAME);
         }
         if best.enable_shader_non_semantic {
-            mandatory_exts.push(ash::khr::shader_non_semantic_info::NAME);
+            mandatory_exts.insert(ash::khr::shader_non_semantic_info::NAME);
         }
         if best.enable_memory_budget {
-            mandatory_exts.push(ash::ext::memory_budget::NAME);
+            mandatory_exts.insert(ash::ext::memory_budget::NAME);
         }
         if use_sync2_ext {
-            mandatory_exts.push(ash::khr::synchronization2::NAME);
+            mandatory_exts.insert(ash::khr::synchronization2::NAME);
         }
         if use_dr_ext {
-            mandatory_exts.push(ash::khr::dynamic_rendering::NAME);
+            // Full transitive device-extension dependency chain
+            // for VK_KHR_dynamic_rendering. Validation requires
+            // all deps in ppEnabledExtensionNames even when
+            // promoted to core.
+            mandatory_exts.insert(ash::khr::maintenance2::NAME);
+            mandatory_exts.insert(ash::khr::multiview::NAME);
+            mandatory_exts.insert(ash::khr::create_renderpass2::NAME);
+            mandatory_exts.insert(ash::khr::depth_stencil_resolve::NAME);
+            mandatory_exts.insert(ash::khr::dynamic_rendering::NAME);
         }
         if use_maintenance1_ext {
-            mandatory_exts.push(ash::khr::maintenance1::NAME);
+            mandatory_exts.insert(ash::khr::maintenance1::NAME);
         }
 
         let ext_ptrs: Vec<*const i8> =
@@ -782,12 +839,34 @@ impl Device {
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&ext_ptrs);
+
+        // On Vulkan < 1.1, extension feature structs must be chained
+        // through VkPhysicalDeviceFeatures2 (from
+        // VK_KHR_get_physical_device_properties2) rather than placed
+        // directly in VkDeviceCreateInfo::pNext.
+        // On 1.1+ core, they go directly on DeviceCreateInfo.
+        let mut features2 = vk::PhysicalDeviceFeatures2::default();
+        let mut use_features2 = false;
         if config.synchronization2 {
-            device_create_info =
-                device_create_info.push_next(&mut sync2_features);
+            if use_sync2_ext {
+                features2 = features2.push_next(&mut sync2_features);
+                use_features2 = true;
+            } else {
+                device_create_info =
+                    device_create_info.push_next(&mut sync2_features);
+            }
         }
         if config.dynamic_rendering {
-            device_create_info = device_create_info.push_next(&mut dr_features);
+            if use_dr_ext {
+                features2 = features2.push_next(&mut dr_features);
+                use_features2 = true;
+            } else {
+                device_create_info =
+                    device_create_info.push_next(&mut dr_features);
+            }
+        }
+        if use_features2 {
+            device_create_info = device_create_info.push_next(&mut features2);
         }
 
         // SAFETY: physical_device was derived from instance;

@@ -77,6 +77,26 @@ impl VkVersion {
     }
 }
 
+/// Dispatch target for `vkGetPhysicalDeviceFeatures2`.
+///
+/// Selected at [`Instance`] creation time based on the negotiated
+/// Vulkan version and whether
+/// [`InstanceConfig::physical_device_features2`] was requested:
+///
+/// | Version | Requested | Variant |
+/// |---------|-----------|---------|
+/// | ≥ 1.1   | yes       | `Core`  |
+/// | < 1.1   | yes       | `Ext`   |
+/// | any     | no        | — (`None` stored in `Instance`) |
+enum GetPhysDevFeatures2Loader {
+    /// Dispatch through the core `ash::Instance` entry point
+    /// (Vulkan ≥ 1.1).
+    Core,
+    /// Dispatch through the `VK_KHR_get_physical_device_properties2`
+    /// extension loader (Vulkan < 1.1).
+    Ext(ash::khr::get_physical_device_properties2::Instance),
+}
+
 /// The root Vulkan object.
 ///
 /// Owns the `ash::Entry` loader, the `ash::Instance` handle, an
@@ -92,7 +112,12 @@ pub struct Instance {
     debug_messenger:
         Option<(vk::DebugUtilsMessengerEXT, ash::ext::debug_utils::Instance)>,
     surface_instance: Option<ash::khr::surface::Instance>,
+    /// Dispatch loader for `vkGetPhysicalDeviceFeatures2`.
+    /// `None` when [`InstanceConfig::physical_device_features2`]
+    /// was not requested; calling the method panics in that case.
+    phys_dev_features2: Option<GetPhysDevFeatures2Loader>,
     ver: VkVersion,
+    strict_1_0: bool,
 }
 
 impl Debug for Instance {
@@ -215,6 +240,25 @@ unsafe extern "system" fn vulkan_debug_callback(
 #[derive(Debug, Default)]
 pub struct InstanceConfig {
     pub surface: bool,
+    /// Force Vulkan 1.0 instance API version regardless of what the
+    /// driver reports. Useful for exercising the extension fallback
+    /// paths (e.g. `VK_KHR_synchronization2`,
+    /// `VK_KHR_dynamic_rendering`) that are only taken on pre-1.3
+    /// hardware.
+    ///
+    /// When set, [`Instance::new`] caps the negotiated API version to
+    /// 1.0. [`Device::create_compatible`] honours this flag by
+    /// treating every device as pre-1.3 and pre-1.1 for feature-path
+    /// selection.
+    pub vk_1_0_strict: bool,
+    /// Enable `vkGetPhysicalDeviceFeatures2` support.
+    ///
+    /// On Vulkan ≥ 1.1 the core entry point is used. On Vulkan < 1.1
+    /// this loads `VK_KHR_get_physical_device_properties2` and
+    /// dispatches through its extension entry point. Calling
+    /// [`Instance::get_physical_device_features2`] without this flag
+    /// set will panic.
+    pub physical_device_features2: bool,
 }
 
 impl Instance {
@@ -245,10 +289,29 @@ impl Instance {
         // SAFETY: entry is a live Vulkan entry (loaded on line 202);
         // vkEnumerateInstanceVersion has no preconditions beyond a valid
         // entry point.
-        let api_version = unsafe { entry.try_enumerate_instance_version() }
-            .unwrap_or(Some(vk::API_VERSION_1_0))
-            .unwrap_or(vk::API_VERSION_1_0);
+        let api_version = if enabled_exts.vk_1_0_strict {
+            vk::API_VERSION_1_0
+        } else {
+            // SAFETY: entry is a live Vulkan entry;
+            // vkEnumerateInstanceVersion has no preconditions beyond
+            // a valid entry point.
+            unsafe { entry.try_enumerate_instance_version() }
+                .unwrap_or(Some(vk::API_VERSION_1_0))
+                .unwrap_or(vk::API_VERSION_1_0)
+        };
         let mut mandatory_exts = Vec::with_capacity(256);
+
+        // VK_KHR_get_physical_device_properties2 is needed on
+        // Vulkan < 1.1 when physical_device_features2 is requested.
+        // It was promoted to core in 1.1; on 1.1+ the core entry
+        // point is used directly without loading the extension.
+        let needs_phys_dev_features2_ext = enabled_exts
+            .physical_device_features2
+            && api_version < vk::API_VERSION_1_1;
+        if needs_phys_dev_features2_ext {
+            mandatory_exts
+                .push(ash::khr::get_physical_device_properties2::NAME);
+        }
 
         // Tracks whether surface extensions were actually enabled on
         // the instance. Being requested (`enabled_exts.surface`) is
@@ -431,13 +494,28 @@ impl Instance {
         };
         let surface_instance = surface_ext_loaded
             .then(|| ash::khr::surface::Instance::new(&entry, &instance));
+        let phys_dev_features2 = if enabled_exts.physical_device_features2 {
+            Some(if needs_phys_dev_features2_ext {
+                GetPhysDevFeatures2Loader::Ext(
+                    ash::khr::get_physical_device_properties2::Instance::new(
+                        &entry, &instance,
+                    ),
+                )
+            } else {
+                GetPhysDevFeatures2Loader::Core
+            })
+        } else {
+            None
+        };
 
         Ok(Instance {
             entry,
             handle: instance,
             debug_messenger,
             surface_instance,
+            phys_dev_features2,
             ver: VkVersion::from_raw(api_version),
+            strict_1_0: enabled_exts.vk_1_0_strict,
         })
     }
 
@@ -559,6 +637,19 @@ impl Instance {
     /// not necessarily the version requested by the application.
     pub fn supported_ver(&self) -> VkVersion {
         self.ver
+    }
+
+    /// Returns `true` when [`InstanceConfig::physical_device_features2`]
+    /// was set at instance creation time.
+    pub fn phys_dev_features2_enabled(&self) -> bool {
+        self.phys_dev_features2.is_some()
+    }
+
+    /// Returns `true` when the instance was created with
+    /// [`InstanceConfig::vk_1_0_strict`]. [`Device::create_compatible`]
+    /// uses this to force the extension code paths for all features.
+    pub fn strict_1_0(&self) -> bool {
+        self.strict_1_0
     }
 
     pub fn raw_instance(&self) -> vk::Instance {
@@ -770,6 +861,52 @@ impl Instance {
             Some(ash::ext::debug_utils::Device::new(&self.handle, device))
         } else {
             None
+        }
+    }
+}
+
+// Physical device features2 functionality
+impl Instance {
+    /// Query features of a physical device via
+    /// `vkGetPhysicalDeviceFeatures2`, dispatching through the
+    /// extension loader on Vulkan < 1.1 or the core entry point on
+    /// Vulkan ≥ 1.1.
+    ///
+    /// # Panics
+    /// Panics if [`InstanceConfig::physical_device_features2`] was
+    /// not set when the instance was created.
+    ///
+    /// # Safety
+    /// `physical_device` must be a valid handle derived from this
+    /// instance. All structs in the `features` pNext chain must be
+    /// valid and properly initialized.
+    pub unsafe fn get_physical_device_features2(
+        &self,
+        physical_device: vk::PhysicalDevice,
+        features: &mut vk::PhysicalDeviceFeatures2<'_>,
+    ) {
+        match self.phys_dev_features2.as_ref().expect(
+            "physical_device_features2 was not enabled \
+             in InstanceConfig",
+        ) {
+            GetPhysDevFeatures2Loader::Core => {
+                // SAFETY: passed on from caller.
+                unsafe {
+                    self.handle.get_physical_device_features2(
+                        physical_device,
+                        features,
+                    )
+                }
+            }
+            GetPhysDevFeatures2Loader::Ext(loader) => {
+                // SAFETY: passed on from caller.
+                unsafe {
+                    loader.get_physical_device_features2(
+                        physical_device,
+                        features,
+                    )
+                }
+            }
         }
     }
 }
