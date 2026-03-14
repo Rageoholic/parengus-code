@@ -366,7 +366,7 @@ pub fn main() -> eyre::Result<()> {
             InstanceConfig {
                 surface: true,
                 vk_1_0_strict: cli_args.vk_strict_config,
-                physical_device_features2: false,
+                physical_device_features2: true,
             },
         )
     }?);
