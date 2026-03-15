@@ -401,10 +401,12 @@ impl DeviceLocalImage {
         })
     }
 
+    #[inline]
     pub(crate) fn raw_image(&self) -> vk::Image {
         self.inner.handle
     }
 
+    #[inline]
     fn whole_image_barrier<'a>(&'a self) -> vk::ImageMemoryBarrier<'a> {
         let subresource_range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -417,6 +419,7 @@ impl DeviceLocalImage {
             .subresource_range(subresource_range)
     }
 
+    #[inline]
     fn whole_image_barrier2<'a>(&'a self) -> vk::ImageMemoryBarrier2<'a> {
         let subresource_range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -429,6 +432,7 @@ impl DeviceLocalImage {
             .subresource_range(subresource_range)
     }
 
+    #[inline]
     pub(crate) fn format(&self) -> vk::Format {
         self.inner.format
     }
@@ -571,6 +575,7 @@ impl ImageView {
         })
     }
 
+    #[inline]
     pub(crate) fn raw_image_view(&self) -> vk::ImageView {
         self.handle
     }
@@ -697,27 +702,32 @@ impl Texture {
         unsafe { self.image.record_upload_from(command_buffer, src) }
     }
 
-    /// Helper that returns an `ImageMemoryBarrier` pre-filled with this
-    /// texture's `VkImage` and a subresource range that covers the whole
-    /// image (colour aspect, mip 0, array layer 0, 1 level/layer).
+    /// Helper that returns an `ImageMemoryBarrier` pre-filled with
+    /// this texture's `VkImage` and a subresource range that covers
+    /// the whole image (colour aspect, mip 0, array layer 0, 1
+    /// level/layer).
+    #[inline]
     pub fn whole_image_barrier<'a>(&'a self) -> vk::ImageMemoryBarrier<'a> {
         self.image.whole_image_barrier()
     }
 
-    /// Helper that returns an `ImageMemoryBarrier2` pre-filled with this
-    /// texture's `VkImage` and a subresource range that covers the whole
-    /// image. Use with `vkCmdPipelineBarrier2`.
+    /// Helper that returns an `ImageMemoryBarrier2` pre-filled with
+    /// this texture's `VkImage` and a subresource range that covers
+    /// the whole image. Use with `vkCmdPipelineBarrier2`.
+    #[inline]
     pub fn whole_image_barrier2<'a>(&'a self) -> vk::ImageMemoryBarrier2<'a> {
         self.image.whole_image_barrier2()
     }
 
     /// Returns the extent of the underlying image.
+    #[inline]
     pub fn extent(&self) -> vk::Extent3D {
         self.image.inner.extent
     }
 
     /// Returns the raw `VkImageView` handle for use in descriptor
     /// writes.
+    #[inline]
     pub fn raw_image_view(&self) -> vk::ImageView {
         self.view.raw_image_view()
     }
@@ -775,12 +785,14 @@ impl DepthImage {
     }
 
     /// Returns the raw `VkImage` handle for use in barriers.
+    #[inline]
     pub fn raw_image(&self) -> vk::Image {
         self.image.raw_image()
     }
 
     /// Returns the raw `VkImageView` handle for use as a depth
     /// attachment.
+    #[inline]
     pub fn raw_image_view(&self) -> vk::ImageView {
         self.view.raw_image_view()
     }
@@ -838,12 +850,14 @@ impl MsaaImage {
     }
 
     /// Returns the raw `VkImage` handle.
+    #[inline]
     pub fn raw_image(&self) -> vk::Image {
         self.image.raw_image()
     }
 
     /// Returns the raw `VkImageView` handle for use as a colour
     /// attachment.
+    #[inline]
     pub fn raw_image_view(&self) -> vk::ImageView {
         self.view.raw_image_view()
     }

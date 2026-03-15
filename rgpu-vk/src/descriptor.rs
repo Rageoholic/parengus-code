@@ -32,6 +32,7 @@ pub struct DescriptorBindingDesc {
 }
 
 impl From<DescriptorBindingDesc> for vk::DescriptorSetLayoutBinding<'static> {
+    #[inline]
     fn from(b: DescriptorBindingDesc) -> Self {
         vk::DescriptorSetLayoutBinding::default()
             .binding(b.binding)
@@ -89,6 +90,7 @@ impl DescriptorSetLayout {
         })
     }
 
+    #[inline]
     pub fn raw_descriptor_set_layout(&self) -> vk::DescriptorSetLayout {
         self.handle
     }
@@ -226,6 +228,7 @@ impl std::fmt::Debug for DescriptorSet {
 }
 
 impl DescriptorSet {
+    #[inline]
     pub fn raw_descriptor_set(&self) -> vk::DescriptorSet {
         self.handle
     }

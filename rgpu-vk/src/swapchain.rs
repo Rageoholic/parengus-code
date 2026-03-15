@@ -592,27 +592,33 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         }
     }
 
+    #[inline]
     pub fn format(&self) -> vk::Format {
         self.format
     }
 
+    #[inline]
     pub fn raw_swapchain(&self) -> vk::SwapchainKHR {
         self.handle
     }
 
+    #[inline]
     pub fn extent(&self) -> vk::Extent2D {
         self.extent
     }
 
+    #[inline]
     pub fn images(&self) -> &[vk::Image] {
         &self.images
     }
 
-    /// The image views for this swapchain's images, if they were created.
+    /// The image views for this swapchain's images, if they were
+    /// created.
     ///
     /// Returns `None` when `create_image_views` was `false` at
     /// construction time. Each view corresponds to the image at the
     /// same index in [`images`](Self::images).
+    #[inline]
     pub fn image_views(&self) -> Option<&[vk::ImageView]> {
         self.image_views.as_deref()
     }
@@ -748,9 +754,11 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         Ok(())
     }
 
-    /// The framebuffers created by [`create_framebuffers`](Self::create_framebuffers),
-    /// if any. Each framebuffer corresponds to the swapchain image at
-    /// the same index in [`images`](Self::images).
+    /// The framebuffers created by
+    /// [`create_framebuffers`](Self::create_framebuffers), if any.
+    /// Each framebuffer corresponds to the swapchain image at the same
+    /// index in [`images`](Self::images).
+    #[inline]
     pub fn framebuffers(&self) -> Option<&[vk::Framebuffer]> {
         self.framebuffers.as_deref()
     }

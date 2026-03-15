@@ -974,10 +974,12 @@ impl Device {
         })
     }
 
+    #[inline]
     pub fn parent(&self) -> &Arc<Instance> {
         &self.parent
     }
 
+    #[inline]
     pub fn physical_device(&self) -> vk::PhysicalDevice {
         self.physical_device
     }
@@ -987,18 +989,22 @@ impl Device {
     /// `vk::PhysicalDeviceMemoryBudgetPropertiesEXT` into
     /// `vkGetPhysicalDeviceMemoryProperties2` to obtain accurate
     /// per-heap usage and budget figures.
+    #[inline]
     pub fn has_memory_budget(&self) -> bool {
         self.memory_budget
     }
 
+    #[inline]
     pub fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
         &self.memory_properties
     }
 
+    #[inline]
     pub fn properties(&self) -> &vk::PhysicalDeviceProperties {
         &self.properties
     }
 
+    #[inline]
     pub fn non_coherent_atom_size(&self) -> vk::DeviceSize {
         self.properties.limits.non_coherent_atom_size
     }
@@ -1148,6 +1154,7 @@ impl Device {
         allocator.free(allocation)
     }
 
+    #[inline]
     pub fn ash_device(&self) -> &ash::Device {
         &self.handle
     }
@@ -1164,42 +1171,52 @@ impl Device {
         unsafe { self.handle.device_wait_idle() }
     }
 
+    #[inline]
     pub fn raw_device(&self) -> vk::Device {
         self.handle.handle()
     }
 
+    #[inline]
     pub fn graphics_queue_family(&self) -> u32 {
         self.graphics_queue_family
     }
 
+    #[inline]
     pub fn present_queue_family(&self) -> u32 {
         self.present_family
     }
 
+    #[inline]
     pub fn transfer_queue_family(&self) -> u32 {
         self.transfer_family
     }
 
+    #[inline]
     pub fn compute_queue_family(&self) -> u32 {
         self.compute_family
     }
 
+    #[inline]
     pub fn graphics_queue_count(&self) -> usize {
         1
     }
 
+    #[inline]
     pub fn present_queue_count(&self) -> usize {
         1
     }
 
+    #[inline]
     pub fn transfer_queue_count(&self) -> usize {
         1
     }
 
+    #[inline]
     pub fn compute_queue_count(&self) -> usize {
         1
     }
 
+    #[inline]
     pub fn queue_config(&self) -> QueueConfig {
         self.queue_config
     }
@@ -1214,6 +1231,7 @@ impl Device {
     ///
     /// If `create_info.old_swapchain` is non-null, that handle must be a valid
     /// swapchain created from this device.
+    #[inline]
     pub unsafe fn create_raw_swapchain(
         &self,
         create_info: &vk::SwapchainCreateInfoKHR<'_>,
@@ -1229,6 +1247,7 @@ impl Device {
     /// # Safety
     /// `swapchain` must be a valid swapchain handle created from this device
     /// and not yet destroyed.
+    #[inline]
     pub unsafe fn get_raw_swapchain_images(
         &self,
         swapchain: vk::SwapchainKHR,
@@ -1246,6 +1265,7 @@ impl Device {
     /// child resources derived from it must be destroyed first.
     ///
     /// No in-flight GPU work may still reference the swapchain.
+    #[inline]
     pub unsafe fn destroy_raw_swapchain(&self, swapchain: vk::SwapchainKHR) {
         let swapchain_device = self
             .swapchain_device
@@ -1259,6 +1279,7 @@ impl Device {
     /// `create_info` must reference valid Vulkan objects derived from this
     /// device. Any referenced pointers must remain valid for the duration of
     /// the call.
+    #[inline]
     pub unsafe fn create_raw_image_view(
         &self,
         create_info: &vk::ImageViewCreateInfo<'_>,
@@ -1272,6 +1293,7 @@ impl Device {
     /// objects using it must be destroyed first.
     ///
     /// No in-flight GPU work may still reference the image view.
+    #[inline]
     pub unsafe fn destroy_raw_image_view(&self, image_view: vk::ImageView) {
         // SAFETY: Caller guarantees image_view provenance and drop ordering.
         unsafe { self.handle.destroy_image_view(image_view, None) };
@@ -1282,6 +1304,7 @@ impl Device {
     /// # Safety
     /// `create_info` must be valid and all referenced pointers must remain
     /// valid for the duration of the call.
+    #[inline]
     pub unsafe fn create_raw_image(
         &self,
         create_info: &vk::ImageCreateInfo<'_>,
@@ -1295,6 +1318,7 @@ impl Device {
     /// # Safety
     /// `image` must be a valid handle created from this device and not yet
     /// destroyed. No in-flight GPU work may still reference `image`.
+    #[inline]
     pub unsafe fn destroy_raw_image(&self, image: vk::Image) {
         // SAFETY: Caller guarantees image provenance and drop ordering.
         unsafe { self.handle.destroy_image(image, None) };
@@ -1304,6 +1328,7 @@ impl Device {
     ///
     /// # Safety
     /// `image` must be a valid handle created from this device.
+    #[inline]
     pub unsafe fn get_raw_image_memory_requirements(
         &self,
         image: vk::Image,
@@ -1318,6 +1343,7 @@ impl Device {
     /// `image` and `memory` must both be valid handles created from this
     /// device. `offset` must satisfy alignment/size requirements from
     /// `vkGetImageMemoryRequirements`.
+    #[inline]
     pub unsafe fn bind_raw_image_memory(
         &self,
         image: vk::Image,
@@ -1333,6 +1359,7 @@ impl Device {
     /// # Safety
     /// `create_info` must be valid and all referenced pointers must remain
     /// valid for the duration of the call.
+    #[inline]
     pub unsafe fn create_raw_sampler(
         &self,
         create_info: &vk::SamplerCreateInfo<'_>,
@@ -1346,6 +1373,7 @@ impl Device {
     /// # Safety
     /// `sampler` must be a valid handle created from this device and not yet
     /// destroyed. No in-flight GPU work may still reference `sampler`.
+    #[inline]
     pub unsafe fn destroy_raw_sampler(&self, sampler: vk::Sampler) {
         // SAFETY: Caller guarantees sampler provenance and drop ordering.
         unsafe { self.handle.destroy_sampler(sampler, None) };
@@ -1365,6 +1393,7 @@ impl Device {
     /// `swapchain` must be a valid handle created from this device.
     /// `semaphore` and `fence`, when not null, must be valid unsignaled handles
     /// created from this device.
+    #[inline]
     pub unsafe fn acquire_next_swapchain_image(
         &self,
         swapchain: vk::SwapchainKHR,
@@ -1397,6 +1426,7 @@ impl Device {
     /// device. Wait semaphores must be signaled. The presented image must be in
     /// `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` and not referenced by any pending
     /// GPU work other than this presentation.
+    #[inline]
     pub unsafe fn queue_present(
         &self,
         present_info: &vk::PresentInfoKHR<'_>,
@@ -1415,6 +1445,7 @@ impl Device {
             .map_err(QueuePresentError::Vulkan)
     }
 
+    #[inline]
     pub fn has_swapchain_support(&self) -> bool {
         self.swapchain_device.is_some()
     }
@@ -1517,6 +1548,7 @@ impl Device {
     /// # Safety
     /// `create_info` must contain valid SPIR-V code. All referenced pointers
     /// must remain valid for the duration of the call.
+    #[inline]
     pub unsafe fn create_raw_shader_module(
         &self,
         create_info: &vk::ShaderModuleCreateInfo<'_>,
@@ -1528,6 +1560,7 @@ impl Device {
     /// # Safety
     /// `shader_module` must be a valid handle created from this device and
     /// not yet destroyed. All objects derived from it must be destroyed first.
+    #[inline]
     pub unsafe fn destroy_raw_shader_module(
         &self,
         shader_module: vk::ShaderModule,
@@ -1543,6 +1576,7 @@ impl Device {
     /// `create_info` must be a valid pipeline layout create info. All
     /// referenced descriptor set layouts must be valid handles created from
     /// this device.
+    #[inline]
     pub unsafe fn create_raw_pipeline_layout(
         &self,
         create_info: &vk::PipelineLayoutCreateInfo<'_>,
@@ -1554,6 +1588,7 @@ impl Device {
     /// # Safety
     /// `layout` must be a valid handle created from this device and not yet
     /// destroyed. No pipeline still using this layout may be in use.
+    #[inline]
     pub unsafe fn destroy_raw_pipeline_layout(
         &self,
         layout: vk::PipelineLayout,
@@ -1604,6 +1639,7 @@ impl Device {
     /// # Safety
     /// `pipeline` must be a valid handle created from this device and not yet
     /// destroyed. No in-flight GPU work may still reference the pipeline.
+    #[inline]
     pub unsafe fn destroy_raw_pipeline(&self, pipeline: vk::Pipeline) {
         // SAFETY: Caller guarantees pipeline provenance and drop ordering.
         unsafe { self.handle.destroy_pipeline(pipeline, None) };
@@ -1612,6 +1648,7 @@ impl Device {
 
 // Dynamic rendering functionality
 impl Device {
+    #[inline]
     pub fn has_dynamic_rendering(&self) -> bool {
         self.dynamic_rendering.is_some()
     }
@@ -1630,6 +1667,7 @@ impl Device {
     ///   the render pass.
     /// - All referenced images must be in the layout specified in
     ///   `rendering_info`.
+    #[inline]
     pub unsafe fn cmd_begin_raw_rendering(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -1664,6 +1702,7 @@ impl Device {
     /// - `command_buffer` must be a valid handle in the recording state,
     ///   derived from this device, and currently inside a render pass begun
     ///   with [`cmd_begin_raw_rendering`](Self::cmd_begin_raw_rendering).
+    #[inline]
     pub unsafe fn cmd_end_raw_rendering(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -1697,6 +1736,7 @@ impl Device {
     /// Command buffers must be in the executable state. Wait semaphores must be
     /// signaled. Signal semaphores must be unsignaled. `fence`, when not null,
     /// must be an unsignaled fence created from this device.
+    #[inline]
     pub unsafe fn graphics_queue_submit2_raw_fence(
         &self,
         submits: &[vk::SubmitInfo2<'_>],
@@ -1778,6 +1818,7 @@ impl Device {
     /// Command buffers must be in the executable state. Wait semaphores must be
     /// signaled. Signal semaphores must be unsignaled. `fence`, when not null,
     /// must be an unsignaled fence created from this device.
+    #[inline]
     pub unsafe fn transfer_queue_submit2_raw_fence(
         &self,
         submits: &[vk::SubmitInfo2<'_>],
@@ -1862,6 +1903,7 @@ impl Device {
     /// `command_buffer` must be a valid handle in the recording state, derived
     /// from this device. All handles and image layouts in `dependency_info`
     /// must be valid and consistent with the command buffer's current state.
+    #[inline]
     pub unsafe fn cmd_pipeline_barrier2(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -1899,6 +1941,7 @@ impl Device {
     /// # Safety
     /// `command_buffer` must be in the recording state. `pipeline` must be a
     /// valid graphics pipeline created from this device.
+    #[inline]
     pub unsafe fn cmd_bind_graphics_pipeline(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -1920,6 +1963,7 @@ impl Device {
     /// `command_buffer` must be in the recording state. `buffers` and
     /// `offsets` must have equal length. All buffers must be valid handles
     /// created from this device.
+    #[inline]
     pub unsafe fn cmd_bind_vertex_buffers(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -1945,6 +1989,7 @@ impl Device {
     /// `command_buffer` must be in the recording state. `src_buffer` and
     /// `dst_buffer` must be valid handles created from this device. Regions
     /// must be valid, non-overlapping within each buffer, and within bounds.
+    #[inline]
     pub unsafe fn cmd_copy_buffer(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -1970,6 +2015,7 @@ impl Device {
     /// `command_buffer` must be in the recording state. `src_buffer` must be
     /// a valid `TRANSFER_SRC` buffer. `dst_image` must be a valid image in
     /// `dst_image_layout`. Regions must be valid and within bounds.
+    #[inline]
     pub unsafe fn cmd_copy_buffer_to_image(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -1996,6 +2042,7 @@ impl Device {
     /// # Safety
     /// `command_buffer` must be in the recording state with a pipeline bound
     /// that declares `VK_DYNAMIC_STATE_VIEWPORT`.
+    #[inline]
     pub unsafe fn cmd_set_viewport(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2011,6 +2058,7 @@ impl Device {
     /// # Safety
     /// `command_buffer` must be in the recording state with a pipeline bound
     /// that declares `VK_DYNAMIC_STATE_SCISSOR`.
+    #[inline]
     pub unsafe fn cmd_set_scissor(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2027,6 +2075,7 @@ impl Device {
     /// `command_buffer` must be in the recording state inside an active render
     /// pass, with a compatible graphics pipeline bound and all required dynamic
     /// state set.
+    #[inline]
     pub unsafe fn cmd_draw(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2053,6 +2102,7 @@ impl Device {
     /// `command_buffer` must be in the recording state. `buffer` must be a
     /// valid index buffer created from this device, bound with
     /// `INDEX_BUFFER` usage.
+    #[inline]
     pub unsafe fn cmd_bind_index_buffer(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2078,6 +2128,7 @@ impl Device {
     /// `command_buffer` must be in the recording state inside an active
     /// render pass, with a compatible graphics pipeline bound, all
     /// required dynamic state set, and a valid index buffer bound.
+    #[inline]
     pub unsafe fn cmd_draw_indexed(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2201,6 +2252,7 @@ impl Device {
     // `vkCmdPipelineBarrier` parameter groups and is kept in sync
     // with the raw API for clarity.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     pub unsafe fn cmd_pipeline_barrier(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2235,6 +2287,7 @@ impl Device {
     /// the layouts declared in the render pass attachment
     /// descriptions, or `UNDEFINED` when `initial_layout` is
     /// `UNDEFINED`.
+    #[inline]
     pub unsafe fn cmd_begin_render_pass(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2258,6 +2311,7 @@ impl Device {
     /// `command_buffer` must be in the recording state inside a
     /// render pass begun with
     /// [`cmd_begin_render_pass`](Self::cmd_begin_render_pass).
+    #[inline]
     pub unsafe fn cmd_end_render_pass(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2273,6 +2327,7 @@ impl Device {
     /// `create_info` must be valid and reference only objects derived from
     /// this device. All referenced pointers must remain valid for the
     /// duration of the call.
+    #[inline]
     pub unsafe fn create_raw_buffer(
         &self,
         create_info: &vk::BufferCreateInfo<'_>,
@@ -2284,6 +2339,7 @@ impl Device {
     /// # Safety
     /// `buffer` must be a valid handle created from this device and not yet
     /// destroyed. No in-flight GPU work may still reference `buffer`.
+    #[inline]
     pub unsafe fn destroy_raw_buffer(&self, buffer: vk::Buffer) {
         // SAFETY: Caller guarantees buffer provenance and drop ordering.
         unsafe { self.handle.destroy_buffer(buffer, None) };
@@ -2293,6 +2349,7 @@ impl Device {
     ///
     /// # Safety
     /// `buffer` must be a valid handle created from this device.
+    #[inline]
     pub unsafe fn get_raw_buffer_memory_requirements(
         &self,
         buffer: vk::Buffer,
@@ -2304,6 +2361,7 @@ impl Device {
     /// # Safety
     /// `allocate_info` must be valid and describe a memory type index
     /// supported by this device.
+    #[inline]
     pub unsafe fn allocate_raw_memory(
         &self,
         allocate_info: &vk::MemoryAllocateInfo<'_>,
@@ -2315,6 +2373,7 @@ impl Device {
     /// # Safety
     /// `memory` must be a valid handle created from this device and not yet
     /// freed. No object may still be bound to `memory` at free time.
+    #[inline]
     pub unsafe fn free_raw_memory(&self, memory: vk::DeviceMemory) {
         // SAFETY: Caller guarantees memory provenance and drop ordering.
         unsafe { self.handle.free_memory(memory, None) };
@@ -2324,6 +2383,7 @@ impl Device {
     /// `buffer` and `memory` must both be valid handles created from this
     /// device. `offset` must satisfy alignment/size requirements from
     /// `vkGetBufferMemoryRequirements`.
+    #[inline]
     pub unsafe fn bind_raw_buffer_memory(
         &self,
         buffer: vk::Buffer,
@@ -2338,6 +2398,7 @@ impl Device {
     /// `memory` must be a valid allocation from this device. The mapped range
     /// (`offset`, `size`) must be within the allocation and obey host access
     /// synchronization requirements.
+    #[inline]
     pub unsafe fn map_raw_memory(
         &self,
         memory: vk::DeviceMemory,
@@ -2352,6 +2413,7 @@ impl Device {
     /// # Safety
     /// Every range in `memory_ranges` must reference memory allocations from
     /// this device and satisfy Vulkan flush requirements.
+    #[inline]
     pub unsafe fn flush_raw_mapped_memory_ranges(
         &self,
         memory_ranges: &[vk::MappedMemoryRange<'_>],
@@ -2362,6 +2424,7 @@ impl Device {
 
     /// # Safety
     /// `memory` must currently be mapped on this device.
+    #[inline]
     pub unsafe fn unmap_raw_memory(&self, memory: vk::DeviceMemory) {
         // SAFETY: Caller guarantees memory is currently mapped.
         unsafe { self.handle.unmap_memory(memory) };
@@ -2373,6 +2436,7 @@ impl Device {
     /// # Safety
     /// `create_info` must have a valid `queue_family_index` for this device.
     /// All referenced pointers must remain valid for the duration of the call.
+    #[inline]
     pub unsafe fn create_raw_command_pool(
         &self,
         create_info: &vk::CommandPoolCreateInfo<'_>,
@@ -2386,6 +2450,7 @@ impl Device {
     /// `pool` must be a valid handle created from this device and not yet
     /// destroyed. All command buffers allocated from it must have finished
     /// execution and must not be referenced by any pending GPU work.
+    #[inline]
     pub unsafe fn destroy_raw_command_pool(&self, pool: vk::CommandPool) {
         // SAFETY: Caller guarantees pool provenance and drop ordering.
         unsafe { self.handle.destroy_command_pool(pool, None) };
@@ -2394,6 +2459,7 @@ impl Device {
     /// # Safety
     /// `pool` must be a valid handle created from this device. All command
     /// buffers allocated from it must not be pending execution on the GPU.
+    #[inline]
     pub unsafe fn reset_raw_command_pool(
         &self,
         pool: vk::CommandPool,
@@ -2407,6 +2473,7 @@ impl Device {
     /// # Safety
     /// `allocate_info.command_pool` must be a valid pool created from this
     /// device. `command_buffer_count` must be non-zero.
+    #[inline]
     pub unsafe fn allocate_raw_command_buffers(
         &self,
         allocate_info: &vk::CommandBufferAllocateInfo<'_>,
@@ -2419,6 +2486,7 @@ impl Device {
     /// `command_buffer` must be in the initial or executable state and must
     /// not be pending execution. All pointers in `begin_info` must remain
     /// valid for the duration of the call.
+    #[inline]
     pub unsafe fn begin_raw_command_buffer(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2431,6 +2499,7 @@ impl Device {
 
     /// # Safety
     /// `command_buffer` must be in the recording state.
+    #[inline]
     pub unsafe fn end_raw_command_buffer(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2443,6 +2512,7 @@ impl Device {
     /// `command_buffer` must not be pending execution on the GPU. The pool it
     /// was allocated from must have been created with
     /// `RESET_COMMAND_BUFFER`.
+    #[inline]
     pub unsafe fn reset_raw_command_buffer(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2464,6 +2534,7 @@ impl Device {
     /// - The caller must externally synchronize access to `pool` (e.g. by
     ///   ensuring no other thread is allocating or resetting from it
     ///   concurrently).
+    #[inline]
     pub unsafe fn free_raw_command_buffers(
         &self,
         pool: vk::CommandPool,
@@ -2483,6 +2554,7 @@ impl Device {
     /// # Safety
     /// `create_info` must be a valid fence create info. All referenced pointers
     /// must remain valid for the duration of the call.
+    #[inline]
     pub unsafe fn create_raw_fence(
         &self,
         create_info: &vk::FenceCreateInfo<'_>,
@@ -2494,6 +2566,7 @@ impl Device {
     /// # Safety
     /// `fence` must be a valid handle created from this device and not yet
     /// destroyed. No GPU work may reference this fence at time of destruction.
+    #[inline]
     pub unsafe fn destroy_raw_fence(&self, fence: vk::Fence) {
         // SAFETY: Caller guarantees fence provenance and drop ordering.
         unsafe { self.handle.destroy_fence(fence, None) };
@@ -2501,6 +2574,7 @@ impl Device {
 
     /// # Safety
     /// All handles in `fences` must be valid fences created from this device.
+    #[inline]
     pub unsafe fn wait_for_raw_fences(
         &self,
         fences: &[vk::Fence],
@@ -2514,6 +2588,7 @@ impl Device {
     /// # Safety
     /// All handles in `fences` must be valid fences created from this device
     /// and must not be currently pending on any queue submission.
+    #[inline]
     pub unsafe fn reset_raw_fences(
         &self,
         fences: &[vk::Fence],
@@ -2530,6 +2605,7 @@ impl Device {
     /// # Safety
     /// `fence` must be a valid handle created from this device and not yet
     /// destroyed.
+    #[inline]
     pub unsafe fn get_raw_fence_status(
         &self,
         fence: vk::Fence,
@@ -2541,6 +2617,7 @@ impl Device {
     /// # Safety
     /// `create_info` must be a valid semaphore create info. All referenced
     /// pointers must remain valid for the duration of the call.
+    #[inline]
     pub unsafe fn create_raw_semaphore(
         &self,
         create_info: &vk::SemaphoreCreateInfo<'_>,
@@ -2552,6 +2629,7 @@ impl Device {
     /// # Safety
     /// `semaphore` must be a valid handle created from this device and not yet
     /// destroyed. No GPU work may be waiting on or about to signal it.
+    #[inline]
     pub unsafe fn destroy_raw_semaphore(&self, semaphore: vk::Semaphore) {
         // SAFETY: Caller guarantees semaphore provenance and drop ordering.
         unsafe { self.handle.destroy_semaphore(semaphore, None) };
@@ -2563,6 +2641,7 @@ impl Device {
     /// # Safety
     /// `create_info` must be valid and reference only objects
     /// derived from this device.
+    #[inline]
     pub unsafe fn create_raw_descriptor_set_layout(
         &self,
         create_info: &vk::DescriptorSetLayoutCreateInfo<'_>,
@@ -2575,6 +2654,7 @@ impl Device {
     /// `layout` must be a valid handle created from this device
     /// and not yet destroyed. No descriptor pool that used this
     /// layout may still exist.
+    #[inline]
     pub unsafe fn destroy_raw_descriptor_set_layout(
         &self,
         layout: vk::DescriptorSetLayout,
@@ -2586,6 +2666,7 @@ impl Device {
     /// # Safety
     /// `create_info` must be valid and reference only objects
     /// derived from this device.
+    #[inline]
     pub unsafe fn create_raw_descriptor_pool(
         &self,
         create_info: &vk::DescriptorPoolCreateInfo<'_>,
@@ -2598,6 +2679,7 @@ impl Device {
     /// `pool` must be a valid handle created from this device and
     /// not yet destroyed. All descriptor sets allocated from it
     /// must not be referenced by any pending GPU work.
+    #[inline]
     pub unsafe fn destroy_raw_descriptor_pool(&self, pool: vk::DescriptorPool) {
         // SAFETY: Caller guarantees pool provenance and ordering.
         unsafe { self.handle.destroy_descriptor_pool(pool, None) };
@@ -2607,6 +2689,7 @@ impl Device {
     /// `alloc_info.descriptor_pool` must be a valid pool created
     /// from this device with sufficient capacity. All layouts in
     /// `alloc_info` must be valid handles derived from this device.
+    #[inline]
     pub unsafe fn allocate_raw_descriptor_sets(
         &self,
         alloc_info: &vk::DescriptorSetAllocateInfo<'_>,
@@ -2623,6 +2706,7 @@ impl Device {
     /// references in `descriptor_writes` must remain valid for as
     /// long as the descriptor set is bound in a submitted command
     /// buffer.
+    #[inline]
     pub unsafe fn update_raw_descriptor_sets(
         &self,
         descriptor_writes: &[vk::WriteDescriptorSet<'_>],
@@ -2644,6 +2728,7 @@ impl Device {
     ///   from this device.
     /// - `dynamic_offsets` must match the number of dynamic
     ///   descriptors in the bound sets.
+    #[inline]
     pub unsafe fn cmd_bind_descriptor_sets(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -2675,6 +2760,7 @@ impl Device {
     /// - `stage_flags` and `offset` must match a push constant range
     ///   declared in `layout`.
     /// - `values` length must not exceed the range size.
+    #[inline]
     pub unsafe fn cmd_push_constants(
         &self,
         command_buffer: vk::CommandBuffer,

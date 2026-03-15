@@ -13,6 +13,8 @@
 //! [`BufferHandle`] is a thin trait for passing either type (or raw
 //! `vk::Buffer` references) to command recording helpers.
 
+use std::mem::size_of;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use ash::vk;
@@ -37,6 +39,7 @@ impl<T> BufferHandle for &T
 where
     T: BufferHandle + ?Sized,
 {
+    #[inline]
     fn raw_buffer(&self) -> vk::Buffer {
         (*self).raw_buffer()
     }
@@ -173,14 +176,17 @@ impl AllocatedBuffer {
         })
     }
 
+    #[inline]
     fn raw_buffer(&self) -> vk::Buffer {
         self.handle
     }
 
+    #[inline]
     fn size(&self) -> vk::DeviceSize {
         self.size
     }
 
+    #[inline]
     fn parent(&self) -> &Arc<Device> {
         &self.parent
     }
@@ -210,6 +216,7 @@ impl Drop for AllocatedBuffer {
 #[derive(Debug)]
 pub struct HostVisibleBuffer {
     inner: AllocatedBuffer,
+    ptr: NonNull<u8>,
 }
 
 impl HostVisibleBuffer {
@@ -219,71 +226,103 @@ impl HostVisibleBuffer {
         usage: vk::BufferUsageFlags,
         name: Option<&str>,
     ) -> Result<Self, CreateBufferError> {
+        let inner = AllocatedBuffer::new(
+            device,
+            size,
+            usage,
+            name,
+            MemoryUsage::CpuToGpu,
+        )?;
         Ok(Self {
-            inner: AllocatedBuffer::new(
-                device,
-                size,
-                usage,
-                name,
-                MemoryUsage::CpuToGpu,
-            )?,
+            ptr: inner
+                .allocation
+                .as_ref()
+                .expect("Allocation can only be null during drop")
+                .mapped_ptr()
+                .expect(
+                    "Allocation was created to be mapped and yet it was not",
+                )
+                .cast(),
+            inner,
         })
     }
 
+    #[inline]
     pub fn write_pod<T: Pod>(
         &mut self,
         data: &[T],
     ) -> Result<(), WriteBufferError> {
-        let bytes = bytemuck::cast_slice(data);
-        if bytes.len() as vk::DeviceSize > self.inner.size {
-            return Err(WriteBufferError::DataTooLarge {
-                data_bytes: bytes.len(),
-                buffer_bytes: self.inner.size,
-            });
-        }
+        self.write_pod_iter_exact(data.iter().copied())
+    }
 
+    #[inline]
+    pub fn write_pod_iter_exact<T: Pod, I>(
+        &mut self,
+        iter: I,
+    ) -> Result<(), WriteBufferError>
+    where
+        I: Iterator<Item = T> + ExactSizeIterator,
+    {
+        let size = iter.len() * size_of::<T>();
+        self.check_size_for_write(size)?;
+        self.write_pod_iter(iter)
+    }
+
+    fn write_pod_iter<T: Pod, I>(
+        &mut self,
+        iter: I,
+    ) -> Result<(), WriteBufferError>
+    where
+        I: Iterator<Item = T>,
+    {
         let allocation = self
             .inner
             .allocation
             .as_ref()
             .expect("allocation is only None during drop");
-        let mapped_ptr =
-            allocation.mapped_ptr().ok_or(WriteBufferError::NotMapped)?;
+        let mapped_ptr = self.ptr;
+        let dst = mapped_ptr.as_ptr().cast::<u8>();
+        let cap = self.inner.size() as usize;
+        let mut written: usize = 0;
 
-        // SAFETY: mapped_ptr points to CPU-visible allocation memory and
-        // bytes.len() has been bounds-checked against buffer size above.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                mapped_ptr.as_ptr().cast::<u8>(),
-                bytes.len(),
-            );
+        for item in iter {
+            let bytes = bytemuck::bytes_of(&item);
+            let len = bytes.len();
+            if written + len > cap {
+                return Err(WriteBufferError::DataTooLarge {
+                    data_bytes: written + len,
+                    buffer_bytes: self.inner.size(),
+                });
+            }
+            // SAFETY: dst is valid for writes within allocation size;
+            // bounds checked above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    dst.add(written),
+                    len,
+                );
+            }
+            written += len;
         }
 
-        // HOST_COHERENT memory is always visible to the GPU after the
-        // CPU write; no explicit flush is needed.
+        // Flush non-coherent ranges if needed (same logic as write_u8_iter)
         let is_coherent = allocation
             .memory_properties()
             .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
-        if !is_coherent && !bytes.is_empty() {
+        if !is_coherent && written > 0 {
             let atom = self.inner.parent.non_coherent_atom_size();
-            // Both invariants guaranteed by Device::allocate_memory.
             debug_assert_eq!(allocation.offset() % atom, 0);
             debug_assert_eq!(allocation.size() % atom, 0);
-            // Round written bytes up to the atom boundary. Fits
-            // within allocation.size() since bytes.len() <=
-            // self.inner.size <= allocation.size().
-            let flush_size =
-                (bytes.len() as vk::DeviceSize).div_ceil(atom) * atom;
+            let flush_size = (written as vk::DeviceSize).div_ceil(atom) * atom;
             let flush_range = vk::MappedMemoryRange::default()
-                // SAFETY: allocation was returned by gpu-allocator
-                // for this device and remains live while self is
-                // alive.
+                // SAFETY: Allocation is currently live
                 .memory(unsafe { allocation.memory() })
                 .offset(allocation.offset())
                 .size(flush_size);
-            // SAFETY: flush_range references a valid mapped memory
-            // allocation from this device.
+            // SAFETY: Allocation is currently live. flush range is aligned to
+            // non_coherent_atom_size (guaranteed by the allocator), offset +
+            // size is within the buffer
             unsafe {
                 self.inner.parent.flush_raw_mapped_memory_ranges(
                     std::slice::from_ref(&flush_range),
@@ -295,20 +334,60 @@ impl HostVisibleBuffer {
         Ok(())
     }
 
+    #[inline]
+    pub fn write_u8_iter_exact<I>(
+        &mut self,
+        iter: I,
+    ) -> Result<(), WriteBufferError>
+    where
+        I: Iterator<Item = u8> + ExactSizeIterator,
+    {
+        self.check_size_for_write(iter.len())?;
+        self.write_u8_iter(iter)
+    }
+
+    #[inline]
+    fn write_u8_iter<I>(&mut self, iter: I) -> Result<(), WriteBufferError>
+    where
+        I: Iterator<Item = u8>,
+    {
+        // Delegate to the canonical POD writer with `u8` as the POD type.
+        self.write_pod_iter(iter)
+    }
+
+    #[inline]
     pub fn raw_buffer(&self) -> vk::Buffer {
         self.inner.raw_buffer()
     }
 
+    #[inline]
     pub fn size(&self) -> vk::DeviceSize {
         self.inner.size()
     }
 
+    #[inline]
     pub fn parent(&self) -> &Arc<Device> {
         self.inner.parent()
+    }
+
+    #[inline]
+    fn check_size_for_write(
+        &self,
+        size: usize,
+    ) -> Result<(), WriteBufferError> {
+        if self.size() >= size as u64 {
+            Ok(())
+        } else {
+            Err(WriteBufferError::DataTooLarge {
+                data_bytes: size,
+                buffer_bytes: self.size(),
+            })
+        }
     }
 }
 
 impl BufferHandle for HostVisibleBuffer {
+    #[inline]
     fn raw_buffer(&self) -> vk::Buffer {
         self.inner.raw_buffer()
     }
@@ -342,14 +421,17 @@ impl DeviceLocalBuffer {
         })
     }
 
+    #[inline]
     pub fn raw_buffer(&self) -> vk::Buffer {
         self.inner.raw_buffer()
     }
 
+    #[inline]
     pub fn size(&self) -> vk::DeviceSize {
         self.inner.size()
     }
 
+    #[inline]
     pub fn parent(&self) -> &Arc<Device> {
         self.inner.parent()
     }
@@ -443,6 +525,7 @@ impl DeviceLocalBuffer {
 }
 
 impl BufferHandle for DeviceLocalBuffer {
+    #[inline]
     fn raw_buffer(&self) -> vk::Buffer {
         self.inner.raw_buffer()
     }

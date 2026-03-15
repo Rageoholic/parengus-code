@@ -65,6 +65,7 @@ impl Sampler {
         })
     }
 
+    #[inline]
     pub fn raw_sampler(&self) -> vk::Sampler {
         self.handle
     }

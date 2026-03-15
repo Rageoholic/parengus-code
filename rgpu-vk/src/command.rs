@@ -254,10 +254,12 @@ impl ResettableCommandPool {
         })
     }
 
+    #[inline]
     pub fn raw_command_pool(&self) -> vk::CommandPool {
         self.shared.pool
     }
 
+    #[inline]
     pub fn parent(&self) -> &Arc<Device> {
         &self.shared.parent
     }
@@ -370,6 +372,7 @@ impl ResettableCommandBuffer {
     }
 
     /// Returns the current [`CommandBufferState`] of this buffer.
+    #[inline]
     pub fn state(&self) -> CommandBufferState {
         self.state
     }
@@ -825,10 +828,12 @@ impl ResettableCommandBuffer {
         }
     }
 
+    #[inline]
     pub fn raw(&self) -> vk::CommandBuffer {
         self.handle
     }
 
+    #[inline]
     pub fn parent(&self) -> &Arc<Device> {
         &self.parent
     }

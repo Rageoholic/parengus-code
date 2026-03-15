@@ -13,9 +13,9 @@ use basis_universal::{
     CompressorParams, TranscodeParameters, Transcoder, TranscoderTextureFormat,
 };
 
-// FileHeader: 10 bytes; SectionHeader: 24 bytes
+// FileHeader: 10 bytes; SectionHeader: 20 bytes
 const FILE_HEADER_SIZE: u32 = 10;
-const SECTION_HEADER_SIZE: u32 = 24;
+const SECTION_HEADER_SIZE: u32 = 20;
 
 pub fn compile(
     src: &Path,
@@ -61,46 +61,36 @@ pub fn compile(
 
     let mip_count = mip_images.len() as u32;
 
-    // Encode each mip
-    let mip_data: Vec<(Vec<u8>, Compression)> = mip_images
+    // Encode each mip; second element is uncompressed byte length
+    let mip_data: Vec<(Vec<u8>, u32)> = mip_images
         .iter()
         .map(|img| encode_mip(img, format, color_space))
         .collect::<Result<_, _>>()?;
 
-    // Write TextureInfo body (20 bytes)
-    let mut tex_info_body = Vec::with_capacity(20);
+    // Derive canonical compression from format (same for every mip)
+    let compression = compression_for_format(format);
+
+    // Write TextureInfo body (24 bytes)
+    let mut tex_info_body = Vec::with_capacity(24);
     tex_info_body.extend_from_slice(&format.to_u32().to_le_bytes());
     tex_info_body.extend_from_slice(&color_space.to_u32().to_le_bytes());
     tex_info_body.extend_from_slice(&base_w.to_le_bytes());
     tex_info_body.extend_from_slice(&base_h.to_le_bytes());
     tex_info_body.extend_from_slice(&mip_count.to_le_bytes());
-
-    // section_count = 1 (TextureInfo) + mip_count
-    let section_count = 1 + mip_count;
-    let data_base = FILE_HEADER_SIZE + SECTION_HEADER_SIZE * section_count;
-
-    // Compute byte offsets
-    let mut offsets: Vec<u32> = Vec::new();
-    let mut cursor = data_base;
-    offsets.push(cursor);
-    cursor += tex_info_body.len() as u32;
-    for (data, _) in &mip_data {
-        offsets.push(cursor);
-        cursor += data.len() as u32;
-    }
+    tex_info_body.extend_from_slice(&compression.to_u32().to_le_bytes());
 
     // Open file and delegate to writer-based API
     let file = File::create(dst)
         .map_err(|e| format!("create {}: {e}", dst.display()))?;
     let mut w = BufWriter::new(file);
-    compile_to_writer(&tex_info_body, &mip_data, &mut w, format)
+    compile_to_writer(&tex_info_body, &mip_data, &mut w)
 }
 
 pub fn compile_to_writer<W: std::io::Write>(
     tex_info_body: &[u8],
-    mip_data: &[(Vec<u8>, Compression)],
+    // (on-disk data, uncompressed byte length)
+    mip_data: &[(Vec<u8>, u32)],
     w: &mut W,
-    format: TexFormat,
 ) -> Result<(), String> {
     let mip_count = mip_data.len() as u32;
     let section_count = 1 + mip_count;
@@ -128,7 +118,6 @@ pub fn compile_to_writer<W: std::io::Write>(
     let info_len = tex_info_body.len() as u32;
     SectionHeader {
         kind: SectionKind::TextureInfo,
-        compression: Compression::None,
         byte_offset: offsets[0],
         byte_len: info_len,
         compressed_byte_len: info_len,
@@ -138,17 +127,13 @@ pub fn compile_to_writer<W: std::io::Write>(
     .map_err(|e| format!("write TextureInfo header: {e}"))?;
 
     // TextureMip section headers
-    for (i, (data, compression)) in mip_data.iter().enumerate() {
-        let mip_w = (0u32).saturating_add(0); // placeholder not used here
-        let _ = mip_w;
-        let byte_len = uncompressed_mip_len(1, 1, format); // dummy for element_count
+    for (i, (data, uncompressed_len)) in mip_data.iter().enumerate() {
         SectionHeader {
             kind: SectionKind::TextureMip,
-            compression: *compression,
             byte_offset: offsets[1 + i],
-            byte_len,
+            byte_len: *uncompressed_len,
             compressed_byte_len: data.len() as u32,
-            element_count: byte_len,
+            element_count: *uncompressed_len,
         }
         .write_to(w)
         .map_err(|e| format!("write mip {i} header: {e}"))?;
@@ -166,24 +151,11 @@ pub fn compile_to_writer<W: std::io::Write>(
     Ok(())
 }
 
-fn uncompressed_mip_len(w: u32, h: u32, format: TexFormat) -> u32 {
+#[inline]
+fn compression_for_format(format: TexFormat) -> Compression {
     match format {
-        TexFormat::Rgba8 => w * h * 4,
-        TexFormat::Bc4 => {
-            let bw = w.div_ceil(4);
-            let bh = h.div_ceil(4);
-            bw * bh * 8
-        }
-        TexFormat::Bc5 => {
-            let bw = w.div_ceil(4);
-            let bh = h.div_ceil(4);
-            bw * bh * 16
-        }
-        TexFormat::Bc7 => {
-            let bw = w.div_ceil(4);
-            let bh = h.div_ceil(4);
-            bw * bh * 16
-        }
+        TexFormat::Rgba8 => Compression::Lz4,
+        TexFormat::Bc4 | TexFormat::Bc5 | TexFormat::Bc7 => Compression::None,
     }
 }
 
@@ -191,8 +163,9 @@ fn encode_mip(
     img: &image::RgbaImage,
     format: TexFormat,
     color_space: ColorSpace,
-) -> Result<(Vec<u8>, Compression), String> {
+) -> Result<(Vec<u8>, u32), String> {
     let rgba = img.as_raw();
+    let uncompressed_len = img.width() * img.height() * 4;
 
     match format {
         TexFormat::Rgba8 => {
@@ -200,12 +173,13 @@ fn encode_mip(
             enc.write_all(rgba).map_err(|e| format!("lz4 write: {e}"))?;
             let compressed =
                 enc.finish().map_err(|e| format!("lz4 finish: {e}"))?;
-            Ok((compressed, Compression::Lz4))
+            Ok((compressed, uncompressed_len))
         }
         TexFormat::Bc7 => {
             let blocks =
                 encode_bc7(rgba, img.width(), img.height(), color_space)?;
-            Ok((blocks, Compression::None))
+            let len = blocks.len() as u32;
+            Ok((blocks, len))
         }
         TexFormat::Bc4 | TexFormat::Bc5 => {
             Err(format!("format {format:?} not yet supported"))
