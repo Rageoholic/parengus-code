@@ -78,6 +78,21 @@ Branch naming, issue templates, and PR format are defined in
 [CONTRIBUTING.md](CONTRIBUTING.md). Follow those rules when creating
 branches or opening issues and PRs on behalf of the user.
 
+## Task Graph
+
+This project uses a lightweight hierarchical task graph (PTG) stored
+in `.tasks/`. At the start of any planning or feature-work session:
+
+1. Read [`.tasks/index.md`](.tasks/index.md) for the current task
+   overview and the next available ID.
+2. Read the relevant task file(s) for context and the current plan.
+3. See [`.tasks/CONVENTIONS.md`](.tasks/CONVENTIONS.md) for the full
+   spec: file format, ID scheme, and AI interaction conventions.
+
+When creating a new task, read `index.md` first to get `next_id`,
+then create the task file, update any parent's `children` list, and
+regenerate `index.md`.
+
 ## AI Disclosure
 
 For externally visible project artifacts, explicitly disclose AI assistance.
