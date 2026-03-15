@@ -8,7 +8,7 @@
 - Engine-managed resource layout (no manual binding/set indices in shaders)
 - Automatic push constant packing with uniform buffer spill
 - CPU-side reference executor for correctness verification
-- Source-level debug info via `NonSemantic.Shader.DebugInfo.100` (RenderDoc)
+- Source-level debug info (RenderDoc) — deferred; see Open Questions
 - SPIR-V as the current sole compilation target (via `rspirv`)
 
 ---
@@ -297,10 +297,10 @@ Scalar and component-wise vector/matrix operands unless noted.
 
 ### Composite
 
-- `construct` — build a vector, matrix, or struct from component registers
+- `construct` — build a vector or matrix from component registers
 - `extract` — extract one sub-element by constant index; on a vector: yields a
-  scalar; on a matrix: yields the column vector at that index; on a struct or
-  array: yields the field/element
+  scalar; on a matrix: yields the column vector at that index; on an array:
+  yields the element
 - `shuffle` — reorder / subset vector components by constant index list; maps to
   `OpVectorShuffle`
 - `extract_row` — extract row i from a matrix; yields a vector; more expensive
@@ -359,6 +359,11 @@ and helpers). There is no module-level type block — all uniform resources are
 flat primitive/vector/matrix values; the engine registry maps each
 `uniform(name)` to its type.
 
+Functions are declared with `fn <name>`. Entry points carry a `stage:` field
+(`vertex`, `fragment`; `compute` is future work). Helper functions have no
+`stage:` field and no `resources:` block — they are callable from any entry
+point.
+
 Resource declarations live on **entry points**, not at module level. Helper
 functions receive resources as explicit arguments — they have no implicit access
 to any resource.
@@ -374,7 +379,8 @@ fn vert
   in:  pos: vec3<f32>  input(position)
        uv:  vec2<f32>  input(texcoord0)
   out: clip_pos: vec4<f32>  external_out(position)
-       frag_uv:  vec2<f32>
+       frag_uv:  vec2<f32>  output(frag_uv)
+       prim_id:  u32         output(prim_id)  flat
 body:
   ...
   // resources passed explicitly to helpers
@@ -387,7 +393,8 @@ fn frag
     cam_proj: mat4<f32>  uniform(camera_proj)
     atex:     Texture2D  uniform(albedo_tex)
     asmp:     Sampler    uniform(albedo_smp)
-  in:  frag_uv: vec2<f32>
+  in:  uv:  vec2<f32>  input(frag_uv)
+       pid: u32         input(prim_id)  flat
   out: color: vec4<f32>  external_out(color0)
 body:
   ...
@@ -412,9 +419,14 @@ never write `location(N)`.
 - **Vertex inputs** — `input(name)` annotation; engine maps the name to a vertex
   buffer attribute. The name implies the type — a mismatch is an error. Local
   variable name is independent.
-- **Vertex → fragment interpolants** — compiler assigns when both stages are in
-  the same module; matched by output/input name. Optional `flat` annotation
-  suppresses interpolation (`Flat` decoration in SPIR-V).
+- **Vertex → fragment interpolants** — `output(name)` on vertex `out`,
+  `input(name)` on fragment `in`; compiler matches by name and assigns a shared
+  `Location`. Stage context disambiguates `input`: on a vertex shader it is a
+  vertex attribute; on a fragment shader it is an interpolated varying. Optional
+  `flat` qualifier suppresses interpolation (`Flat` decoration in SPIR-V).
+  Integer and boolean varyings require `flat` — SPIR-V validation rejects
+  interpolated integer/bool interface variables. Unmatched vertex outputs are
+  written but ignored; unmatched fragment inputs are an error.
 - **GPU pipeline inputs** — `external_in(name)` annotation; no location. Emitter
   owns a fixed table mapping each name to the corresponding SPIR-V `BuiltIn`
   decoration.
@@ -484,16 +496,18 @@ Resources declared on entry points are in scope as named values in the entry
 point body. They are passed to helper functions as explicit arguments — helpers
 have no implicit resource access.
 
-All four annotation forms — `uniform(name)`, `input(name)`, `external_in(name)`,
-and `external_out(name)` — follow the same model: a string at authoring time,
-interned to an integer ID in the binary IR. At runtime only IDs appear; no
-strings in the hot path.
+All five annotation forms — `uniform(name)`, `input(name)`, `output(name)`,
+`external_in(name)`, and `external_out(name)` — follow the same model: a string
+at authoring time, interned to an integer ID in the binary IR. At runtime only
+IDs appear; no strings in the hot path.
 
 The engine maintains a registry mapping name → ID for `uniform` and `input`
-names, populated at startup from asset definitions. The emitter maintains a
-fixed table mapping `external_in`/`external_out` name IDs to SPIR-V `BuiltIn`
-decorations. In all cases the mapping from name to implementation is owned by
-the consumer (engine or emitter), not the IR.
+names, populated at startup from asset definitions. The compiler matches
+`output(name)` / `input(name)` pairs across linked entry points and assigns
+shared `Location` indices. The emitter maintains a fixed table mapping
+`external_in`/`external_out` name IDs to SPIR-V `BuiltIn` decorations. In all
+cases the mapping from name to implementation is owned by the consumer (engine,
+compiler, or emitter), not the IR.
 
 ---
 
@@ -561,6 +575,8 @@ diagnosing the emitter or executor itself.
 - Texture queries: `query_size` (dimensions at mip level), `query_levels` (mip
   count)
 - MSAA fetch: `texel_fetch` sample-index argument for multisampled textures
+- Array type syntax (element type, size) and `extract` semantics — listed in
+  Types but not fully specced; defer to implementation
 - Optimizer pass (or delegate to `spirv-opt`) — deferred
 - Binary format section layout and debug metadata — section-based container
   with optional per-function debug sections; section header format and
