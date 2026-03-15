@@ -23,18 +23,19 @@ The magic bytes uniquely identify the asset type; no separate
 All fields are read with explicit `from_le_bytes` — no `Pod` cast,
 no endianness assumption.
 
-### `SectionHeader` (24 bytes)
+### `SectionHeader` (20 bytes)
 
 | Offset | Size | Field | Notes |
 |--------|------|-------|-------|
 | 0 | 4 | `kind` | `u32 LE`; `SectionKind` discriminant |
-| 4 | 4 | `compression` | `u32 LE`; `Compression` discriminant |
-| 8 | 4 | `byte_offset` | `u32 LE`; byte offset of section data in file |
-| 12 | 4 | `byte_len` | `u32 LE`; uncompressed size in bytes |
-| 16 | 4 | `compressed_byte_len` | `u32 LE`; compressed size; equals `byte_len` if `Compression::None` |
-| 20 | 4 | `element_count` | `u32 LE`; number of elements (not bytes); see per-section notes |
+| 4 | 4 | `byte_offset` | `u32 LE`; byte offset of section data in file |
+| 8 | 4 | `byte_len` | `u32 LE`; uncompressed size in bytes |
+| 12 | 4 | `compressed_byte_len` | `u32 LE`; on-disk size; equals `byte_len` when uncompressed |
+| 16 | 4 | `element_count` | `u32 LE`; number of elements (not bytes); see per-section notes |
 
-No padding or reserved fields.
+No padding or reserved fields. Compression is not stored in the
+section header; it is determined by section kind (mesh) or by the
+`TextureInfo` body (texture mips).
 
 ### `Compression` enum
 
@@ -61,6 +62,10 @@ Type aliases: `MeshId`, `TextureId`, `ShaderId`. Const helpers:
 Collision check: xtask hashes all names per type domain at build
 time and errors on any collision within a domain.
 
+No checksums are stored in any asset file format. Integrity
+verification (if needed) is the responsibility of the build pipeline
+or packaging layer above the compiler.
+
 ---
 
 ## `.pmesh` — Compiled Mesh
@@ -70,8 +75,11 @@ time and errors on any collision within a domain.
 
 ### Section Kinds
 
-| `SectionKind` | Value | `element_count` | Element size | `Compression` |
-|---------------|-------|-----------------|--------------|---------------|
+Compression for each mesh section kind is fixed and implicit — it
+is not stored in the section header.
+
+| `SectionKind` | Value | `element_count` | Element size | Compression |
+|---------------|-------|-----------------|--------------|-------------|
 | `MeshPositions`  | 0 | vertex count | 12 B (`[f32; 3]`) | `Lz4` |
 | `MeshNormals`    | 1 | vertex count | 12 B (`[f32; 3]`) | `Lz4` |
 | `MeshTangents`   | 2 | vertex count | 16 B (`[f32; 4]`) | `Lz4` |
@@ -82,8 +90,9 @@ time and errors on any collision within a domain.
 | `MeshTexRef`     | 7 | ref count    | 12 B         | `None` |
 
 `MeshTexCoord1` is omitted if the source mesh has no `TEXCOORD_1`.
-`MeshIndices32` is reserved for future use; current compiler always
-uses `MeshIndices16`.
+`MeshIndices16` is used when all indices fit in a `u16` (max index ≤
+65535); `MeshIndices32` is used otherwise. A file will contain
+exactly one of the two index section kinds.
 
 ### `MeshTexRef` Element Layout (12 bytes each)
 
@@ -97,7 +106,9 @@ asset_id: u64 LE   (FNV-1a 64-bit hash of texture asset name)
 
 Texture references come from the manifest `[asset.tex_refs]` table,
 not from the glTF URI. The compiler validates that each named asset
-exists in the manifest as an image type.
+exists in the manifest as an image type. What happens at runtime when
+a mesh references a texture that cannot be found is engine-defined
+behaviour; the asset format itself imposes no constraint.
 
 ### Coordinate Space
 
@@ -113,17 +124,16 @@ Y-up (glTF) → Z-up transform applied at compile time:
 
 ### Section Kinds
 
-| `SectionKind` | Value | Contents | `element_count` | `Compression` |
-|---------------|-------|----------|-----------------|---------------|
-| `TextureInfo` | 200 | 20-byte metadata | 1 | `None` |
-| `TextureMip`  | 100 | raw mip pixel/block data | byte count of mip | varies |
+| `SectionKind` | Value | Contents | `element_count` |
+|---------------|-------|----------|-----------------|
+| `TextureInfo` | 200 | 24-byte metadata | 1 |
+| `TextureMip`  | 100 | raw mip pixel/block data | byte count of mip |
 
 `TextureInfo` **must** be the first section. `TextureMip` sections
 follow in mip order (mip 0 first). `element_count` for `TextureMip`
-equals the number of bytes of mip data (so `byte_len ==
-element_count`).
+is in bytes (so `byte_len == element_count`).
 
-### `TextureInfo` Body (20 bytes)
+### `TextureInfo` Body (24 bytes)
 
 | Offset | Size | Field | Notes |
 |--------|------|-------|-------|
@@ -132,6 +142,7 @@ element_count`).
 | 8 | 4 | `width` | `u32 LE`; pixels at mip 0 |
 | 12 | 4 | `height` | `u32 LE`; pixels at mip 0 |
 | 16 | 4 | `mip_count` | `u32 LE` |
+| 20 | 4 | `compression` | `u32 LE`; `Compression` discriminant; applies to all `TextureMip` sections |
 
 `TexFormat` values: `Rgba8 = 0`, `Bc4 = 1`, `Bc5 = 2`, `Bc7 = 3`.
 

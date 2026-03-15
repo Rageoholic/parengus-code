@@ -108,10 +108,12 @@ impl<T: HasWindowHandle + HasDisplayHandle> Surface<T> {
         }
     }
 
+    #[inline]
     pub fn parent(&self) -> &Arc<Instance> {
         &self.parent_instance
     }
 
+    #[inline]
     pub fn raw_surface(&self) -> vk::SurfaceKHR {
         self.handle
     }

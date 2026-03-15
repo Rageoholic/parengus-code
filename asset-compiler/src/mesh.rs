@@ -6,20 +6,23 @@ use std::{
 
 use asset_pipeline::{AssetType, Manifest};
 use asset_shared::{
-    Compression, FileHeader, PMESH_MAGIC, SectionHeader, SectionKind, TexRole,
-    VERSION, texture_id,
+    FileHeader, PMESH_MAGIC, SectionHeader, SectionKind, TexRole, VERSION,
+    texture_id,
 };
 
 // ── Vec3 helpers ──────────────────────────────────────────────────────────────
 
+#[inline]
 fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
+#[inline]
 fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
+#[inline]
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
@@ -28,10 +31,12 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+#[inline]
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+#[inline]
 fn normalize(a: [f32; 3]) -> [f32; 3] {
     let l = dot(a, a).sqrt();
     if l < 1e-10 {
@@ -45,6 +50,7 @@ fn normalize(a: [f32; 3]) -> [f32; 3] {
 
 /// glTF is Y-up; the engine is Z-up.
 /// Rotation: +90° about X — (x, y, z) → (x, -z, y)
+#[inline]
 fn yup_to_zup(p: [f32; 3]) -> [f32; 3] {
     [p[0], -p[2], p[1]]
 }
@@ -92,32 +98,39 @@ impl<'a> TangentGen<'a> {
         }
     }
 
+    #[inline]
     fn vi(&self, face: usize, vert: usize) -> usize {
         self.indices[face * 3 + vert] as usize
     }
 }
 
 impl bevy_mikktspace::Geometry for TangentGen<'_> {
+    #[inline]
     fn num_faces(&self) -> usize {
         self.indices.len() / 3
     }
 
+    #[inline]
     fn num_vertices_of_face(&self, _face: usize) -> usize {
         3
     }
 
+    #[inline]
     fn position(&self, face: usize, vert: usize) -> [f32; 3] {
         self.positions[self.vi(face, vert)]
     }
 
+    #[inline]
     fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
         self.normals[self.vi(face, vert)]
     }
 
+    #[inline]
     fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
         self.tex_coords[self.vi(face, vert)]
     }
 
+    #[inline]
     fn set_tangent(
         &mut self,
         tangent_space: Option<bevy_mikktspace::TangentSpace>,
@@ -151,7 +164,6 @@ pub struct Section {
     kind: SectionKind,
     element_count: u32,
     uncompressed_len: u32,
-    compression: Compression,
     data: Vec<u8>,
 }
 
@@ -162,7 +174,6 @@ fn lz4_section(kind: SectionKind, element_count: u32, raw: Vec<u8>) -> Section {
         kind,
         element_count,
         uncompressed_len,
-        compression: Compression::Lz4,
         data,
     }
 }
@@ -177,7 +188,6 @@ fn raw_section(
         kind,
         element_count,
         uncompressed_len,
-        compression: Compression::None,
         data,
     }
 }
@@ -219,9 +229,9 @@ fn role_from_str(s: &str) -> Result<TexRole, String> {
 
 // ── Main compile function ─────────────────────────────────────────────────────
 
-// FileHeader: 10 bytes; SectionHeader: 24 bytes
+// FileHeader: 10 bytes; SectionHeader: 20 bytes
 const FILE_HEADER_SIZE: u32 = 10;
-const SECTION_HEADER_SIZE: u32 = 24;
+const SECTION_HEADER_SIZE: u32 = 20;
 
 pub fn compile(
     src: &Path,
@@ -405,7 +415,6 @@ pub fn compile_to_writer<W: std::io::Write>(
     for (s, &byte_offset) in sections.iter().zip(&offsets) {
         SectionHeader {
             kind: s.kind,
-            compression: s.compression,
             byte_offset,
             byte_len: s.uncompressed_len,
             compressed_byte_len: s.data.len() as u32,
@@ -486,7 +495,6 @@ mod tests {
 
         let sh = SectionHeader {
             kind: SectionKind::MeshTexCoord0,
-            compression: Compression::Lz4,
             byte_offset: 12345,
             byte_len: 54321,
             compressed_byte_len: 22222,
@@ -499,7 +507,6 @@ mod tests {
             SectionHeader::read_from(&mut cur).expect("read section header");
         let got = got_opt.expect("known kind");
         assert_eq!(got.kind, sh.kind);
-        assert_eq!(got.compression, sh.compression);
         assert_eq!(got.byte_offset, sh.byte_offset);
         assert_eq!(got.byte_len, sh.byte_len);
         assert_eq!(got.compressed_byte_len, sh.compressed_byte_len);

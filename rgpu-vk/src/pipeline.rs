@@ -98,6 +98,7 @@ impl PipelineLayout {
         Self::new(device, &PipelineLayoutDesc::default())
     }
 
+    #[inline]
     pub fn raw_pipeline_layout(&self) -> vk::PipelineLayout {
         self.handle
     }
@@ -137,6 +138,7 @@ pub struct VertexBindingDesc {
 }
 
 impl From<VertexBindingDesc> for vk::VertexInputBindingDescription {
+    #[inline]
     fn from(value: VertexBindingDesc) -> Self {
         vk::VertexInputBindingDescription {
             binding: value.binding,
@@ -156,6 +158,7 @@ pub struct VertexAttributeDesc {
 }
 
 impl From<VertexAttributeDesc> for vk::VertexInputAttributeDescription {
+    #[inline]
     fn from(value: VertexAttributeDesc) -> Self {
         vk::VertexInputAttributeDescription {
             location: value.location,
@@ -437,10 +440,12 @@ impl DynamicPipeline {
         })
     }
 
+    #[inline]
     pub fn raw_pipeline(&self) -> vk::Pipeline {
         self.handle
     }
 
+    #[inline]
     pub fn layout(&self) -> &Arc<PipelineLayout> {
         &self.layout
     }
@@ -721,10 +726,12 @@ impl RenderPassPipeline {
         })
     }
 
+    #[inline]
     pub fn raw_pipeline(&self) -> vk::Pipeline {
         self.handle
     }
 
+    #[inline]
     pub fn layout(&self) -> &Arc<PipelineLayout> {
         &self.layout
     }

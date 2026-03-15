@@ -42,36 +42,47 @@ pub enum VulkanLogLevel {
 pub struct VkVersion(u32);
 
 impl VkVersion {
+    #[inline]
     pub fn from_raw(raw: u32) -> Self {
         Self(raw)
     }
 
+    #[inline]
     pub fn new(variant: u32, major: u32, minor: u32, patch: u32) -> Self {
         Self(vk::make_api_version(variant, major, minor, patch))
     }
 
+    #[inline]
     pub fn variant(&self) -> u32 {
         vk::api_version_variant(self.0)
     }
 
+    #[inline]
     pub fn major(&self) -> u32 {
         vk::api_version_major(self.0)
     }
+
+    #[inline]
     pub fn minor(&self) -> u32 {
         vk::api_version_minor(self.0)
     }
+
+    #[inline]
     pub fn patch(&self) -> u32 {
         vk::api_version_patch(self.0)
     }
 
+    #[inline]
     pub fn to_tuple(&self) -> (u32, u32, u32, u32) {
         (self.variant(), self.major(), self.minor(), self.patch())
     }
 
+    #[inline]
     pub fn from_tuple(tuple: (u32, u32, u32, u32)) -> Self {
         Self::new(tuple.0, tuple.1, tuple.2, tuple.3)
     }
 
+    #[inline]
     pub fn to_raw(&self) -> u32 {
         self.0
     }
@@ -635,27 +646,32 @@ impl Instance {
     ///
     /// This is the version reported by `vkEnumerateInstanceVersion`,
     /// not necessarily the version requested by the application.
+    #[inline]
     pub fn supported_ver(&self) -> VkVersion {
         self.ver
     }
 
-    /// Returns `true` when [`InstanceConfig::physical_device_features2`]
-    /// was set at instance creation time.
+    /// Returns `true` when [`InstanceConfig::physical_device_features2`] was
+    /// set at instance creation time.
+    #[inline]
     pub fn phys_dev_features2_enabled(&self) -> bool {
         self.phys_dev_features2.is_some()
     }
 
     /// Returns `true` when the instance was created with
-    /// [`InstanceConfig::vk_1_0_strict`]. [`Device::create_compatible`]
-    /// uses this to force the extension code paths for all features.
+    /// [`InstanceConfig::vk_1_0_strict`]. [`Device::create_compatible`] uses
+    /// this to force the extension code paths for all features.
+    #[inline]
     pub fn strict_1_0(&self) -> bool {
         self.strict_1_0
     }
 
+    #[inline]
     pub fn raw_instance(&self) -> vk::Instance {
         self.handle.handle()
     }
 
+    #[inline]
     pub fn ash_instance(&self) -> &ash::Instance {
         &self.handle
     }
@@ -832,6 +848,7 @@ impl Instance {
 
 // Device extension loader creation functionality
 impl Instance {
+    #[inline]
     pub fn create_swapchain_loader(
         &self,
         device: &ash::Device,
@@ -839,6 +856,7 @@ impl Instance {
         ash::khr::swapchain::Device::new(&self.handle, device)
     }
 
+    #[inline]
     pub fn create_dynamic_rendering_loader(
         &self,
         device: &ash::Device,
@@ -846,6 +864,7 @@ impl Instance {
         ash::khr::dynamic_rendering::Device::new(&self.handle, device)
     }
 
+    #[inline]
     pub fn create_synchronization2_loader(
         &self,
         device: &ash::Device,

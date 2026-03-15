@@ -6,14 +6,15 @@ use std::{
     time::Instant,
 };
 
-use asset_loader::{AssetMap, Indices, MeshAsset, TexAsset};
+use asset_loader::{AssetMap, MeshAsset, TexAsset};
 use asset_shared::{mesh_id, shader_id, texture_id};
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use parengus_tracing::{TracingLogLevel, init_default};
 use rgpu_vk::{
     ash::vk::{
-        self, CommandBufferSubmitInfo, PipelineStageFlags2, SemaphoreSubmitInfo,
+        self, BufferUsageFlags, CommandBufferSubmitInfo, PipelineStageFlags2,
+        SemaphoreSubmitInfo,
     },
     buffer::{DeviceLocalBuffer, HostVisibleBuffer},
     command::{ResettableCommandBuffer, ResettableCommandPool},
@@ -1196,7 +1197,7 @@ impl AppRunner {
             frame_cmd.bind_index_buffer(
                 &state.index_buffer,
                 0,
-                vk::IndexType::UINT16,
+                vk::IndexType::UINT32,
             )
         };
 
@@ -1406,24 +1407,15 @@ impl AppRunner {
         let tex_coords = duck
             .tex_coords0()
             .map_err(|e| eyre::eyre!("duck tex_coords0: {e}"))?;
-        let scene_vertices: Vec<Vertex> = positions
-            .into_iter()
-            .zip(tex_coords)
-            .map(|(p, t)| Vertex {
-                position: Vec3::new(p[0], p[1], p[2]),
-                tex_coord: Vec2::new(t[0], t[1]),
-            })
-            .collect();
-        let raw_indices = duck
+        let scene_indices = duck
             .indices()
             .map_err(|e| eyre::eyre!("duck indices: {e}"))?;
-        let scene_indices: Vec<u16> = match raw_indices {
-            Indices::U16(v) => v,
-            Indices::U32(v) => v
-                .into_iter()
-                .map(|i| u16::try_from(i).expect("Duck index fits u16"))
-                .collect(),
-        };
+        let scene_vertices =
+            positions.zip(tex_coords).map(|(pos, tex_coords)| Vertex {
+                position: pos.into(),
+                tex_coord: tex_coords.into(),
+            });
+
         let index_count = scene_indices.len() as u32;
 
         let albedo_filename = asset_map
@@ -1439,13 +1431,19 @@ impl AppRunner {
 
         let vertex_buffer_size =
             (scene_vertices.len() * size_of::<Vertex>()) as vk::DeviceSize;
+        // Create staging vertex buffer by streaming vertices through
+        // an iterator chain and initializing the buffer from the
+        // produced `u8` iterator. This avoids allocating an intermediate
+        // `Vec<Vertex>`.
+
         let mut staging_vertex_buffer = HostVisibleBuffer::new(
             &device,
             vertex_buffer_size,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            Some("duck staging vertex buffer"),
+            BufferUsageFlags::TRANSFER_SRC,
+            Some("Vertex staging buffer"),
         )?;
-        staging_vertex_buffer.write_pod(&scene_vertices)?;
+
+        staging_vertex_buffer.write_pod_iter_exact(scene_vertices)?;
 
         let mut vertex_buffer = DeviceLocalBuffer::new(
             &device,
@@ -1456,14 +1454,14 @@ impl AppRunner {
         )?;
 
         let index_buffer_size =
-            (scene_indices.len() * size_of::<u16>()) as vk::DeviceSize;
+            (scene_indices.len() * size_of::<u32>()) as vk::DeviceSize;
         let mut staging_index_buffer = HostVisibleBuffer::new(
             &device,
             index_buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             Some("duck staging index buffer"),
         )?;
-        staging_index_buffer.write_pod(&scene_indices)?;
+        staging_index_buffer.write_pod_iter_exact(scene_indices)?;
 
         let mut index_buffer = DeviceLocalBuffer::new(
             &device,

@@ -26,6 +26,7 @@ pub struct AssetId<T>(pub u64, PhantomData<fn() -> T>);
 impl<T> AssetId<T> {
     /// Construct from a raw hash value (e.g. read from a binary
     /// asset file).
+    #[inline]
     pub fn from_hash(hash: u64) -> Self {
         Self(hash, PhantomData)
     }
@@ -50,14 +51,17 @@ pub const fn fnv1a(s: &str) -> u64 {
     hash
 }
 
+#[inline]
 pub const fn mesh_id(name: &str) -> MeshId {
     AssetId(fnv1a(name), PhantomData)
 }
 
+#[inline]
 pub const fn texture_id(name: &str) -> TextureId {
     AssetId(fnv1a(name), PhantomData)
 }
 
+#[inline]
 pub const fn shader_id(name: &str) -> ShaderId {
     AssetId(fnv1a(name), PhantomData)
 }
@@ -79,6 +83,7 @@ pub enum SectionKind {
 }
 
 impl SectionKind {
+    #[inline]
     pub fn to_u32(self) -> u32 {
         match self {
             Self::MeshPositions => 0,
@@ -96,6 +101,7 @@ impl SectionKind {
 
     /// Returns `None` for unknown kinds; callers should skip those
     /// sections rather than fail, to allow forward compatibility.
+    #[inline]
     pub fn from_u32(v: u32) -> Option<Self> {
         match v {
             0 => Some(Self::MeshPositions),
@@ -122,6 +128,7 @@ pub enum Compression {
 }
 
 impl Compression {
+    #[inline]
     pub fn to_u32(self) -> u32 {
         match self {
             Self::None => 0,
@@ -129,6 +136,7 @@ impl Compression {
         }
     }
 
+    #[inline]
     pub fn from_u32(v: u32) -> Option<Self> {
         match v {
             0 => Some(Self::None),
@@ -150,6 +158,7 @@ pub enum TexRole {
 }
 
 impl TexRole {
+    #[inline]
     pub fn to_u32(self) -> u32 {
         match self {
             Self::Albedo => 0,
@@ -160,6 +169,7 @@ impl TexRole {
         }
     }
 
+    #[inline]
     pub fn from_u32(v: u32) -> Option<Self> {
         match v {
             0 => Some(Self::Albedo),
@@ -205,11 +215,10 @@ impl FileHeader {
 
 // ── SectionHeader ────────────────────────────────────────────────────────────
 
-/// Serialized size: 24 bytes (no padding or reserved fields).
+/// Serialized size: 20 bytes (no padding or reserved fields).
 #[derive(Clone)]
 pub struct SectionHeader {
     pub kind: SectionKind,
-    pub compression: Compression,
     pub byte_offset: u32,
     pub byte_len: u32,
     pub compressed_byte_len: u32,
@@ -219,7 +228,6 @@ pub struct SectionHeader {
 impl SectionHeader {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
         w.write_all(&self.kind.to_u32().to_le_bytes())?;
-        w.write_all(&self.compression.to_u32().to_le_bytes())?;
         w.write_all(&self.byte_offset.to_le_bytes())?;
         w.write_all(&self.byte_len.to_le_bytes())?;
         w.write_all(&self.compressed_byte_len.to_le_bytes())?;
@@ -230,25 +238,20 @@ impl SectionHeader {
     /// Returns `Ok(None)` for unknown `kind`; caller should skip the
     /// section.
     pub fn read_from(r: &mut impl Read) -> io::Result<Option<Self>> {
-        let mut buf = [0u8; 24];
+        let mut buf = [0u8; 20];
         r.read_exact(&mut buf)?;
         let kind_raw = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        let comp_raw = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        let byte_offset = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        let byte_len = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        let byte_offset = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let byte_len = u32::from_le_bytes(buf[8..12].try_into().unwrap());
         let compressed_byte_len =
-            u32::from_le_bytes(buf[16..20].try_into().unwrap());
-        let element_count = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+            u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        let element_count = u32::from_le_bytes(buf[16..20].try_into().unwrap());
 
         let Some(kind) = SectionKind::from_u32(kind_raw) else {
             return Ok(None);
         };
-        let compression = Compression::from_u32(comp_raw).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "unknown compression")
-        })?;
         Ok(Some(Self {
             kind,
-            compression,
             byte_offset,
             byte_len,
             compressed_byte_len,
@@ -268,6 +271,7 @@ pub enum TexFormat {
 }
 
 impl TexFormat {
+    #[inline]
     pub fn to_u32(self) -> u32 {
         match self {
             Self::Rgba8 => 0,
@@ -277,6 +281,7 @@ impl TexFormat {
         }
     }
 
+    #[inline]
     pub fn from_u32(v: u32) -> Option<Self> {
         match v {
             0 => Some(Self::Rgba8),
@@ -295,6 +300,7 @@ pub enum ColorSpace {
 }
 
 impl ColorSpace {
+    #[inline]
     pub fn to_u32(self) -> u32 {
         match self {
             Self::Srgb => 0,
@@ -302,6 +308,7 @@ impl ColorSpace {
         }
     }
 
+    #[inline]
     pub fn from_u32(v: u32) -> Option<Self> {
         match v {
             0 => Some(Self::Srgb),

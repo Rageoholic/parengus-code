@@ -232,10 +232,12 @@ impl RenderPass {
             )
     }
 
+    #[inline]
     pub fn raw_render_pass(&self) -> vk::RenderPass {
         self.handle
     }
 
+    #[inline]
     pub fn parent(&self) -> &Arc<Device> {
         &self.parent
     }

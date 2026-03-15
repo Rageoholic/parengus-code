@@ -221,21 +221,26 @@ impl Fence {
         }
     }
 
+    #[inline]
     pub fn raw_fence(&self) -> vk::Fence {
         self.handle
     }
 
+    #[inline]
     pub fn parent(&self) -> &Arc<Device> {
         &self.parent
     }
 
-    /// Is the fence in an unsignaled state where we can submit it to something
-    /// like vkQueueSubmit
+    /// Is the fence in an unsignaled state where we can submit it to
+    /// something like vkQueueSubmit
+    #[inline]
     pub fn is_ready(&self) -> bool {
         self.status == FenceStatus::Ready
     }
 
-    /// Is the fence in a submitted state where we can wait on it and reset it
+    /// Is the fence in a submitted state where we can wait on it and
+    /// reset it
+    #[inline]
     pub fn is_submitted(&self) -> bool {
         self.status == FenceStatus::Submitted
     }
@@ -300,10 +305,12 @@ impl Semaphore {
         })
     }
 
+    #[inline]
     pub fn raw(&self) -> vk::Semaphore {
         self.handle
     }
 
+    #[inline]
     pub fn get_parent(&self) -> &Arc<Device> {
         &self.parent
     }

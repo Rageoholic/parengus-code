@@ -23,6 +23,7 @@ use ash::vk;
 /// transfer."  Fill in the remaining fields (stage/access masks,
 /// layouts, image, subresource range) with the builder methods
 /// before use.
+#[inline]
 pub fn image_barrier<'a>() -> vk::ImageMemoryBarrier<'a> {
     vk::ImageMemoryBarrier::default()
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -39,6 +40,7 @@ pub fn image_barrier<'a>() -> vk::ImageMemoryBarrier<'a> {
 /// transfer."  Fill in the remaining fields (stage/access masks,
 /// layouts, image, subresource range) with the builder methods
 /// before use.
+#[inline]
 pub fn image_barrier2<'a>() -> vk::ImageMemoryBarrier2<'a> {
     vk::ImageMemoryBarrier2::default()
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -54,6 +56,7 @@ pub fn image_barrier2<'a>() -> vk::ImageMemoryBarrier2<'a> {
 /// idiom for "this barrier performs no queue-family ownership
 /// transfer."  Fill in the remaining fields (stage/access masks,
 /// buffer, offset, size) with the builder methods before use.
+#[inline]
 pub fn buffer_barrier<'a>() -> vk::BufferMemoryBarrier<'a> {
     vk::BufferMemoryBarrier::default()
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -69,6 +72,7 @@ pub fn buffer_barrier<'a>() -> vk::BufferMemoryBarrier<'a> {
 /// idiom for "this barrier performs no queue-family ownership
 /// transfer."  Fill in the remaining fields (stage/access masks,
 /// buffer, offset, size) with the builder methods before use.
+#[inline]
 pub fn buffer_barrier2<'a>() -> vk::BufferMemoryBarrier2<'a> {
     vk::BufferMemoryBarrier2::default()
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)

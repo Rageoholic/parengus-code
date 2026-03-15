@@ -48,6 +48,7 @@ pub enum ShaderStage {
 }
 
 impl From<ShaderStage> for vk::ShaderStageFlags {
+    #[inline]
     fn from(stage: ShaderStage) -> Self {
         match stage {
             ShaderStage::Vertex => vk::ShaderStageFlags::VERTEX,
@@ -164,10 +165,12 @@ impl ShaderModule {
         })
     }
 
+    #[inline]
     pub fn raw_shader_module(&self) -> vk::ShaderModule {
         self.handle
     }
 
+    #[inline]
     pub fn get_parent(&self) -> &Arc<Device> {
         &self.parent
     }
@@ -210,6 +213,7 @@ impl<'a> EntryPoint<'a> {
             .name(&self.name)
     }
 
+    #[inline]
     pub fn stage(&self) -> ShaderStage {
         self.stage
     }
