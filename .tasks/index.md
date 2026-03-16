@@ -1,4 +1,4 @@
-next_id: t019
+next_id: t020
 ---
 
 # Task Graph Index
@@ -25,7 +25,7 @@ AI conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 |------|-------------------------------------|---------|---------|----------------|
 | t001 | Parengus Shader IR (PSIR)           | planned | psir    |                |
 | t002 | xtask: smart rebuild-required check | planned | infra   |                |
-| t003 | Implement PBR shading               | blocked | phoenix | blocked by t001|
+| t003 | Implement PBR shading               | blocked | phoenix | blocked by t001, t019|
 | t004 | Implement TUI                       | planned | phoenix |                |
 | t005 | Import renderer task graph          | completed | renderer| import of external graph |
 | t006 | RenderGraph / Executor split        | planned | renderer| rendergraph_executor_split |
@@ -41,3 +41,4 @@ AI conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 | t016 | Material system                     | planned | renderer| material_system |
 | t017 | Deferred decisions (notes)          | planned | renderer| pipeline_compilation_and_caching, transient_resource_memory_aliasing |
 | t018 | Future features (notes)             | planned | renderer| meshlets |
+| t019 | Resource state tracker              | planned | renderer| resource_state_tracker |
