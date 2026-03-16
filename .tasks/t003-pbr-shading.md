@@ -54,11 +54,6 @@ PBR also depends on the resource state tracker (t019): correct
 barrier and ownership-transfer management must be in place before
 draw commands can be reliably recorded.
 
-Dependency direction: the render graph executor depends on PBR,
-not the other way around. PBR must not be listed in any render
-graph task's `blocked_by`; render graph tasks that integrate PBR
-should list t003 in their own `depends_on`.
-
 ## Outcome
 
 (not yet filled — task is idea)
