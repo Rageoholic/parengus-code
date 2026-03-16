@@ -4,7 +4,7 @@ title: "Resource state tracker"
 status: planned
 created: 2026-03-16
 updated: 2026-03-16
-parent: t005
+parent: null
 children: []
 depends_on: []
 blocked_by: []
@@ -53,11 +53,11 @@ the state machine produces barriers for the pre- and post-amble
 of the command buffer. This avoids ad-hoc per-site barrier
 insertion scattered throughout the app.
 
-Dependency direction: the render graph executor (see sibling tasks
-t006–t009) depends on PBR (t003) being available, not the other
-way around. PBR must not depend on any render graph task; any
-render graph task that needs PBR should list t003 in its
-`depends_on`, not vice-versa.
+Dependency direction: the render graph executor (tasks t006–t009)
+depends on PBR (t003) being available, not the other way around.
+PBR must not depend on any render graph task; any render graph task
+that needs PBR should list t003 in its `depends_on`, not
+vice-versa.
 
 Eventually this component will migrate into the render graph
 executor: passes will declare resource usage and the executor will
