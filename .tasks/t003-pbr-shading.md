@@ -3,13 +3,15 @@ id: t003
 title: "Implement PBR shading"
 status: blocked
 created: 2026-03-14
-updated: 2026-03-14
+updated: 2026-03-16
 parent: null
 children: []
 depends_on:
   - t001
+  - t019
 blocked_by:
   - t001
+  - t019
 area: phoenix
 ---
 
@@ -47,6 +49,10 @@ on its own.
 Shader implementation targets PSIR (t001) — Slang is no longer
 in use. The PBR BRDF will be written in PSIR once the IR and
 its SPIR-V backend are functional.
+
+PBR also depends on the resource state tracker (t019): correct
+barrier and ownership-transfer management must be in place before
+draw commands can be reliably recorded.
 
 ## Outcome
 
