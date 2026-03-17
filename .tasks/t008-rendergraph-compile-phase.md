@@ -1,6 +1,6 @@
 ---
 id: t008
-title: "Add compile phase to RenderGraph for pass ordering and resource allocation"
+title: RenderGraph compile phase
 status: planned
 area: renderer
 parent: t005

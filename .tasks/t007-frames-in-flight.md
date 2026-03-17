@@ -1,6 +1,6 @@
 ---
 id: t007
-title: "Add frames-in-flight with per-frame allocators and state"
+title: Frames-in-flight infrastructure
 status: planned
 area: renderer
 parent: t005

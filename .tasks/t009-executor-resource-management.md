@@ -1,6 +1,6 @@
 ---
 id: t009
-title: "Executor owns Vulkan resource, barrier, and semaphore management"
+title: Executor resource management
 status: planned
 area: renderer
 parent: t005

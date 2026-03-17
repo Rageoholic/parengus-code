@@ -1,6 +1,6 @@
 ---
 id: t019
-title: "Track per-resource Vulkan queue-family and image-layout state"
+title: Resource state tracker
 status: planned
 created: 2026-03-16
 updated: 2026-03-16

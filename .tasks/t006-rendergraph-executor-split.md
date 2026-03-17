@@ -1,6 +1,6 @@
 ---
 id: t006
-title: "Split renderer into logical RenderGraph and physical Executor"
+title: RenderGraph / Executor split
 status: planned
 area: renderer
 parent: t005

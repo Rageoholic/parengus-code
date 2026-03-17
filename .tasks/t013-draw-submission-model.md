@@ -1,6 +1,6 @@
 ---
 id: t013
-title: "Hybrid draw: CPU batches by mesh/material, GPU culls and indirect-draws"
+title: Draw submission model
 status: planned
 area: renderer
 parent: t005

@@ -1,6 +1,6 @@
 ---
 id: t015
-title: "Rewrite shader IR bindings to match engine descriptor layout"
+title: Shader binding model
 status: planned
 area: renderer
 parent: t005

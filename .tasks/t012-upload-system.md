@@ -1,6 +1,6 @@
 ---
 id: t012
-title: "Hybrid upload: bulk startup uploads and streaming graph-pass uploads"
+title: Upload system
 status: planned
 area: renderer
 parent: t005

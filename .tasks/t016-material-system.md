@@ -1,6 +1,6 @@
 ---
 id: t016
-title: "SoA material storage with hot fields grouped for cache efficiency"
+title: Material system
 status: planned
 area: renderer
 parent: t005

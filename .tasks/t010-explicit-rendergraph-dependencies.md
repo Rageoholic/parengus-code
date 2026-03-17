@@ -1,6 +1,6 @@
 ---
 id: t010
-title: "Store explicit pass dependencies in RenderGraph"
+title: Explicit rendergraph dependencies
 status: planned
 area: renderer
 parent: t005

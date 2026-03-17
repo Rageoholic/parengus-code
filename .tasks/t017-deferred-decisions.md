@@ -1,6 +1,6 @@
 ---
 id: t017
-title: "Deferred design decisions: pipeline caching and memory aliasing"
+title: Deferred decisions (notes)
 status: planned
 area: renderer
 parent: t005

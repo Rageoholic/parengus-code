@@ -1,6 +1,6 @@
 ---
 id: t011
-title: "Track resources at whole-resource granularity initially"
+title: Resource granularity
 status: planned
 area: renderer
 parent: t005

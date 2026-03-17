@@ -1,6 +1,6 @@
 ---
 id: t018
-title: "Future exploration: meshlets"
+title: Future features (notes)
 status: planned
 area: renderer
 parent: t005

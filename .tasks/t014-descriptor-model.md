@@ -1,6 +1,6 @@
 ---
 id: t014
-title: "Derive global bindless descriptor layout from shader IR"
+title: Descriptor model
 status: planned
 area: renderer
 parent: t005
