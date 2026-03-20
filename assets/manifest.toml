@@ -37,7 +37,7 @@ tex_refs = { albedo = "duck-albedo" }
 name = "duck-albedo"
 file = "tex/DuckCM.png"
 type = "image"
-format = "rgba8"
+format = "bc7"
 color_space = "srgb"
 mips = true
 source = "https://github.com/KhronosGroup/glTF-Sample-Assets"

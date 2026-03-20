@@ -50,6 +50,7 @@ fn fmt_err(s: impl Into<String>) -> LoadError {
 #[derive(Debug)]
 pub struct AssetMap {
     by_hash: HashMap<u64, PathBuf>,
+    by_hash_name: HashMap<u64, String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -62,16 +63,27 @@ impl AssetMap {
         let text = fs::read_to_string(path)?;
         let raw: RawAssetMap = toml::from_str(&text)
             .map_err(|e| fmt_err(format!("parse asset map: {e}")))?;
-        let by_hash = raw
-            .map
-            .into_iter()
-            .map(|(name, p)| (fnv1a(&name), PathBuf::from(p)))
-            .collect();
-        Ok(Self { by_hash })
+        let mut by_hash = HashMap::new();
+        let mut by_hash_name = HashMap::new();
+        for (name, p) in raw.map {
+            let hash = fnv1a(&name);
+            by_hash.insert(hash, PathBuf::from(p));
+            by_hash_name.insert(hash, name);
+        }
+        Ok(Self {
+            by_hash,
+            by_hash_name,
+        })
     }
 
     pub fn get<T>(&self, id: AssetId<T>) -> Option<&Path> {
         self.by_hash.get(&id.0).map(PathBuf::as_path)
+    }
+
+    /// Returns the logical name (as written in `asset_map.toml`) for
+    /// the given asset ID, or `None` if the ID is not in the map.
+    pub fn name_of<T>(&self, id: AssetId<T>) -> Option<&str> {
+        self.by_hash_name.get(&id.0).map(String::as_str)
     }
 }
 
@@ -117,6 +129,9 @@ pub struct MeshAsset {
     sections: Vec<SectionHeader>,
     pub tex_refs: Vec<(TexRole, TextureId)>,
 }
+
+// Read chunk size for SectionElemIter I/O (both paths).
+const SECTION_ITER_CHUNK: usize = 4096;
 
 /// Iterator over fixed-size elements stored in a section. Parameterized
 /// by a const `N` (bytes per element). Produces arrays `[u8; N]` so
@@ -242,38 +257,45 @@ impl<const N: usize> Iterator for SectionElemIter<N> {
         if self.elements_remaining == 0 {
             return None;
         }
-
         self.elements_remaining -= 1;
 
-        if let Some(dec) = &mut self.decoder {
-            while self.decomp_buf.len() - self.decomp_pos < N {
-                let mut tmp = vec![0u8; 4096];
+        // Refill the buffer until at least N bytes are available.
+        while self.decomp_buf.len() - self.decomp_pos < N {
+            // Reclaim memory when the consumed prefix fills the buffer.
+            if self.decomp_pos == self.decomp_buf.len() {
+                self.decomp_buf.clear();
+                self.decomp_pos = 0;
+            }
+            let mut tmp = [0u8; SECTION_ITER_CHUNK];
+            let n = if let Some(dec) = &mut self.decoder {
                 match dec.read(&mut tmp) {
-                    Ok(0) => break,
-                    Ok(n) => self.decomp_buf.extend_from_slice(&tmp[..n]),
+                    Ok(n) => n,
                     Err(_) => return None,
                 }
+            } else {
+                match read_at_partial(&self.file, self.offset, &mut tmp) {
+                    Ok(n) => {
+                        self.offset = self.offset.wrapping_add(n as u64);
+                        n
+                    }
+                    Err(_) => return None,
+                }
+            };
+            if n == 0 {
+                break;
             }
-            let start = self.decomp_pos;
-            let end = start + N;
-            if end > self.decomp_buf.len() {
-                return None;
-            }
-            let slice = &self.decomp_buf[start..end];
-            let mut arr = [0u8; N];
-            arr.copy_from_slice(slice);
-            self.decomp_pos = end;
-            return Some(arr);
+            self.decomp_buf.extend_from_slice(&tmp[..n]);
         }
 
-        // uncompressed: read exactly N bytes
-        let mut buf = vec![0u8; N];
-        if read_exact_at(&self.file, self.offset, &mut buf).is_err() {
+        // Serve N bytes from the buffer.
+        let start = self.decomp_pos;
+        let end = start + N;
+        if end > self.decomp_buf.len() {
             return None;
         }
-        self.offset = self.offset.wrapping_add(N as u64);
         let mut arr = [0u8; N];
-        arr.copy_from_slice(&buf);
+        arr.copy_from_slice(&self.decomp_buf[start..end]);
+        self.decomp_pos = end;
         Some(arr)
     }
 
@@ -370,6 +392,47 @@ fn read_at_partial(
         compile_error!(
             "read_at_partial is only implemented for unix and windows"
         );
+    }
+}
+
+/// Build a `SectionElemIter<N>` for the given section header,
+/// using the asset-level `compression` hint.
+fn make_section_elem_iter<const N: usize>(
+    file: &fs::File,
+    hdr: &SectionHeader,
+    compression: Compression,
+) -> Result<SectionElemIter<N>, LoadError> {
+    let offset = hdr.byte_offset as u64;
+    let file_for_iter = file.try_clone()?;
+
+    // Buffer holds at most an unconsumed tail + one new chunk.
+    let buf_cap = 2 * SECTION_ITER_CHUNK;
+    match compression {
+        Compression::None => Ok(SectionElemIter {
+            file: file_for_iter,
+            elements_remaining: hdr.element_count as usize,
+            offset,
+            decoder: None,
+            decomp_buf: Vec::with_capacity(buf_cap),
+            decomp_pos: 0,
+        }),
+        Compression::Lz4 => {
+            let file_for_reader = file.try_clone()?;
+            let reader = PositionalReader {
+                file: file_for_reader,
+                offset,
+                remaining: hdr.compressed_byte_len as usize,
+            };
+            let dec = lz4_flex::frame::FrameDecoder::new(reader);
+            Ok(SectionElemIter {
+                file: file_for_iter,
+                elements_remaining: hdr.element_count as usize,
+                offset,
+                decoder: Some(dec),
+                decomp_buf: Vec::with_capacity(buf_cap),
+                decomp_pos: 0,
+            })
+        }
     }
 }
 
@@ -484,36 +547,8 @@ impl MeshAsset {
         kind: SectionKind,
     ) -> Result<SectionElemIter<N>, LoadError> {
         let hdr = self.require(kind)?;
-        let offset = hdr.byte_offset as u64;
-        let file_for_iter = self.file.try_clone()?;
-
-        match mesh_section_compression(kind) {
-            Compression::None => Ok(SectionElemIter {
-                file: file_for_iter,
-                elements_remaining: hdr.element_count as usize,
-                offset,
-                decoder: None,
-                decomp_buf: Vec::new(),
-                decomp_pos: 0,
-            }),
-            Compression::Lz4 => {
-                let file_for_reader = self.file.try_clone()?;
-                let reader = PositionalReader {
-                    file: file_for_reader,
-                    offset,
-                    remaining: hdr.compressed_byte_len as usize,
-                };
-                let dec = lz4_flex::frame::FrameDecoder::new(reader);
-                Ok(SectionElemIter {
-                    file: file_for_iter,
-                    elements_remaining: hdr.element_count as usize,
-                    offset,
-                    decoder: Some(dec),
-                    decomp_buf: Vec::new(),
-                    decomp_pos: 0,
-                })
-            }
-        }
+        let compression = mesh_section_compression(kind);
+        make_section_elem_iter(&self.file, hdr, compression)
     }
 
     fn require(&self, kind: SectionKind) -> Result<&SectionHeader, LoadError> {
@@ -752,6 +787,22 @@ impl TexAsset {
         read_section_data(&self.file, hdr, self.info.compression)
     }
 
+    /// Return an iterator over all mip levels. Each item is a
+    /// byte-level `SectionElemIter<1>` for that mip's data.
+    pub fn mips(&self) -> MipIter<'_> {
+        let hdrs = self
+            .sections
+            .iter()
+            .filter(|h| h.kind == SectionKind::TextureMip)
+            .collect();
+        MipIter {
+            file: &self.file,
+            compression: self.info.compression,
+            hdrs,
+            index: 0,
+        }
+    }
+
     /// Clone the underlying file handle for concurrent access.
     pub fn try_clone(&self) -> Result<Self, io::Error> {
         Ok(Self {
@@ -759,5 +810,33 @@ impl TexAsset {
             sections: self.sections.clone(),
             info: self.info,
         })
+    }
+}
+
+// ── MipIter ───────────────────────────────────────────────────────────────────
+
+/// Iterator over all mip levels of a `TexAsset`. Each item yields a
+/// byte iterator (`SectionElemIter<1>`) for that mip's data, using
+/// chunked reads regardless of compression.
+pub struct MipIter<'a> {
+    file: &'a fs::File,
+    compression: Compression,
+    hdrs: Vec<&'a SectionHeader>,
+    index: usize,
+}
+
+impl<'a> Iterator for MipIter<'a> {
+    type Item = Result<SectionElemIter<1>, LoadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let hdr = self.hdrs.get(self.index)?;
+        self.index += 1;
+        Some(make_section_elem_iter(self.file, hdr, self.compression))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = self.hdrs.len() - self.index;
+        (rem, Some(rem))
     }
 }
