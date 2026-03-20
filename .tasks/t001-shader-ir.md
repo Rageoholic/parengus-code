@@ -97,3 +97,10 @@ resolved version from the selected physical device's API version.
 ## Outcome
 
 (not yet filled — task is planned)
+
+## Note (2026-03-20)
+
+Work on PSIR is being deferred for the near term. PBR shading (t003)
+may proceed without waiting for PSIR; this task remains planned but
+is deprioritized. Revisit prioritization when higher-level pipeline
+requirements or staffing change.

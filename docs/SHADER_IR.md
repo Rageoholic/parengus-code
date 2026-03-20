@@ -13,6 +13,10 @@
 
 ---
 
+> Note (2026-03-20): PSIR work is deferred for the near term. The
+> PBR shading task may proceed without PSIR; this document remains
+> the spec for PSIR when work resumes.
+
 ## Crate Structure (planned)
 
 - `psir` — IR data definitions; pure data, no engine or compiler deps

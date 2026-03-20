@@ -7,11 +7,13 @@ updated: 2026-03-16
 parent: null
 children: []
 depends_on:
-  - t001
   - t019
+  - t020
+  - t021
 blocked_by:
-  - t001
   - t019
+  - t020
+  - t021
 area: phoenix
 ---
 
@@ -47,8 +49,9 @@ what the Khronos Duck asset already exercises. IBL can be deferred
 on its own.
 
 Shader implementation targets PSIR (t001) — Slang is no longer
-in use. The PBR BRDF will be written in PSIR once the IR and
-its SPIR-V backend are functional.
+in use. NOTE: PSIR work has been deferred for now; PBR will be
+implemented using the existing shader pipeline or a temporary
+authoring path until PSIR (t001) is completed.
 
 PBR also depends on the resource state tracker (t019): correct
 barrier and ownership-transfer management must be in place before
