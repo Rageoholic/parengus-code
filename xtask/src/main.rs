@@ -533,8 +533,9 @@ fn check_collisions() -> Result<()> {
 fn compile_shaders_for(app_name: &str) -> Result<()> {
     let root = workspace_root();
     let assets_dir = root.join("assets");
-    let cache = compiled_cache();
-    fs::create_dir_all(&cache)?;
+    let out_assets_dir =
+        root.join("out").join(app_name).join("debug").join("assets");
+    fs::create_dir_all(&out_assets_dir)?;
 
     let manifest = manifest()?;
     let app = app_assets(app_name)?;
@@ -560,13 +561,9 @@ fn compile_shaders_for(app_name: &str) -> Result<()> {
         };
 
         let src = assets_dir.join(source_file);
-        let dst = cache.join(&entry.file);
+        let dst = out_assets_dir.join(&entry.file);
 
-        if is_up_to_date(&src, &dst) && !compiler_is_newer_than(&dst) {
-            skipped += 1;
-            continue;
-        }
-
+        // Always recompile shaders to avoid caching issues.
         println!("Compiling shader {} → {}", entry.name, entry.file.display());
         run(Command::new("slangc")
             .arg(&src)
@@ -584,8 +581,9 @@ fn compile_meshes_for(app_name: &str) -> Result<()> {
     let root = workspace_root();
     let assets_dir = root.join("assets");
 
-    let cache = compiled_cache();
-    fs::create_dir_all(&cache)?;
+    let out_assets_dir =
+        root.join("out").join(app_name).join("debug").join("assets");
+    fs::create_dir_all(&out_assets_dir)?;
 
     let manifest = manifest()?;
     let app = app_assets(app_name)?;
@@ -608,13 +606,9 @@ fn compile_meshes_for(app_name: &str) -> Result<()> {
             .ok_or_else(|| format!("mesh '{}' not in manifest", req.name))?;
 
         let src = assets_dir.join(&entry.file);
-        let dst = cache.join(format!("{}.pmesh", req.name));
+        let dst = out_assets_dir.join(format!("{}.pmesh", req.name));
 
-        if is_up_to_date(&src, &dst) && !compiler_is_newer_than(&dst) {
-            skipped += 1;
-            continue;
-        }
-
+        // Always recompile meshes.
         println!("Compiling mesh {} → {}.pmesh", req.name, req.name);
         mesh::compile(&src, &dst, &manifest, req.name.as_str()).map_err(
             |e| {
@@ -633,8 +627,9 @@ fn compile_meshes_for(app_name: &str) -> Result<()> {
 fn compile_images_for(app_name: &str) -> Result<()> {
     let root = workspace_root();
     let assets_dir = root.join("assets");
-    let cache = compiled_cache();
-    fs::create_dir_all(&cache)?;
+    let out_assets_dir =
+        root.join("out").join(app_name).join("debug").join("assets");
+    fs::create_dir_all(&out_assets_dir)?;
 
     let manifest = manifest()?;
     let app = app_assets(app_name)?;
@@ -657,17 +652,13 @@ fn compile_images_for(app_name: &str) -> Result<()> {
             .ok_or_else(|| format!("image '{}' not in manifest", req.name))?;
 
         let src = assets_dir.join(&entry.file);
-        let dst = cache.join(format!("{}.ptex", req.name));
+        let dst = out_assets_dir.join(format!("{}.ptex", req.name));
 
         let format = entry.format.as_deref().unwrap_or("rgba8");
         let color_space = entry.color_space.as_deref().unwrap_or("srgb");
         let mips = entry.mips.unwrap_or(false);
 
-        if is_up_to_date(&src, &dst) {
-            skipped += 1;
-            continue;
-        }
-
+        // Always recompile images.
         println!("Compiling image {} → {}.ptex", req.name, req.name);
         let fmt = match format {
             "bc7" => asset_shared::TexFormat::Bc7,
@@ -738,8 +729,7 @@ fn copy_assets_for(app_name: &str) -> Result<()> {
 }
 
 fn clean_for(app_name: &str) -> Result<()> {
-    // Remove compiled assets for this app from the compiled cache
-    let cache_dir = compiled_cache();
+    // Remove compiled assets for this app from the out assets directory
     // Load the app's asset list to determine compiled filenames
     let app = app_assets(app_name)?;
     let manifest = manifest()?;
@@ -758,7 +748,12 @@ fn clean_for(app_name: &str) -> Result<()> {
             AssetType::Shader => entry.file.to_string_lossy().into_owned(),
             _ => continue,
         };
-        let path = cache_dir.join(&compiled_name);
+        let path = workspace_root()
+            .join("out")
+            .join(app_name)
+            .join("debug")
+            .join("assets")
+            .join(&compiled_name);
         if path.exists() {
             fs::remove_file(&path)?;
             println!("Removed cached {}", compiled_name);
@@ -793,15 +788,6 @@ fn remove_out_for(app_name: &str) -> Result<()> {
 
 fn clean_root() -> Result<()> {
     let root = workspace_root();
-    let cache_dir = compiled_cache();
-
-    if cache_dir.exists() {
-        fs::remove_dir_all(&cache_dir)?;
-        println!("Removed {}", cache_dir.display());
-    } else {
-        println!("No compiled cache to remove");
-    }
-
     let out_dir = root.join("out");
     if out_dir.exists() {
         fs::remove_dir_all(&out_dir)?;

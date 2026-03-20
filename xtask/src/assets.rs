@@ -76,17 +76,19 @@ pub(crate) fn copy_assets(
             }
         };
 
-        let src = compiled_cache_dir.join(&compiled_name);
-        let dst = dst_dir.join(&compiled_name);
-
-        if crate::is_up_to_date(&src, &dst) {
+        // The compiled asset is produced directly into `dst_dir` by the
+        // xtask compile steps. Treat existing files in `dst_dir` as
+        // up-to-date; we no longer copy from a separate compiled cache.
+        let src = dst_dir.join(&compiled_name);
+        if src.exists() {
             skipped += 1;
         } else {
-            fs::copy(&src, &dst).map_err(|e| {
-                format!("copy {} → {}: {e}", src.display(), dst.display())
-            })?;
-            println!("Copied {compiled_name}");
-            copied += 1;
+            return Err(format!(
+                "compiled asset missing: {} (expected in {})",
+                compiled_name,
+                dst_dir.display()
+            )
+            .into());
         }
 
         map.insert(req.name.clone(), compiled_name);
