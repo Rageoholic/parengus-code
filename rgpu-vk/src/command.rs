@@ -658,6 +658,34 @@ impl ResettableCommandBuffer {
         }
     }
 
+    /// Record a buffer-to-image copy.
+    ///
+    /// # Safety
+    /// The buffer must be in the recording state. `src_buffer` and
+    /// `dst_image` must be valid handles created from the same device as
+    /// this command buffer. Regions must be valid and in-bounds; the
+    /// caller must ensure the image is in `dst_image_layout` for the
+    /// duration of the copy.
+    pub unsafe fn copy_buffer_to_image(
+        &mut self,
+        src_buffer: vk::Buffer,
+        dst_image: vk::Image,
+        dst_image_layout: vk::ImageLayout,
+        regions: &[vk::BufferImageCopy],
+    ) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
+        // SAFETY: Caller guarantees recording state and copy validity.
+        unsafe {
+            self.parent.cmd_copy_buffer_to_image(
+                self.handle,
+                src_buffer,
+                dst_image,
+                dst_image_layout,
+                regions,
+            )
+        }
+    }
+
     /// Set the viewport dynamically.
     ///
     /// # Safety

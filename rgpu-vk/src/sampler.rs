@@ -34,6 +34,7 @@ impl Sampler {
         mag_filter: vk::Filter,
         min_filter: vk::Filter,
         address_mode: vk::SamplerAddressMode,
+        mip_levels: u32,
         name: Option<&str>,
     ) -> Result<Self, vk::Result> {
         let create_info = vk::SamplerCreateInfo::default()
@@ -48,7 +49,7 @@ impl Sampler {
             .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
             .mip_lod_bias(0.0)
             .min_lod(0.0)
-            .max_lod(0.0);
+            .max_lod(mip_levels as f32);
 
         // SAFETY: create_info is fully initialised with no borrowed data.
         let handle = unsafe { device.create_raw_sampler(&create_info) }?;

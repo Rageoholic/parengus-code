@@ -42,7 +42,7 @@ use rgpu_vk::{
     device::{Device, DeviceConfig, QueueConfig},
     image::{DepthImage, MsaaImage, Texture},
     instance::{Instance, InstanceConfig},
-    memory::{buffer_barrier, image_barrier},
+    memory::image_barrier,
     pipeline::{
         CullModeFlags, FrontFace, PipelineLayout, PipelineLayoutDesc,
         RenderPassPipeline, RenderPassPipelineDesc, VertexAttributeDesc,
@@ -1560,6 +1560,7 @@ impl AppRunner {
             tex_width,
             tex_height,
             vk::Format::R8G8B8A8_SRGB,
+            1,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
             Some("statue-tex"),
         )?;
@@ -1572,12 +1573,12 @@ impl AppRunner {
         // all buffers remain alive until wait_idle below completes.
         unsafe {
             vertex_buffer
-                .record_copy_from(&mut upload_cmd, &staging_vertex_buffer)
+                .record_upload_from(&mut upload_cmd, &staging_vertex_buffer)
         }?;
         // SAFETY: same as vertex buffer copy above.
         unsafe {
             index_buffer
-                .record_copy_from(&mut upload_cmd, &staging_index_buffer)
+                .record_upload_from(&mut upload_cmd, &staging_index_buffer)
         }?;
 
         // Record a single synchronization2 image transition before any copies.
@@ -1614,17 +1615,15 @@ impl AppRunner {
 
         let mut buffer_barriers = Vec::new();
         if queue_config.dedicated_transfer {
-            let vertex_buffer_barrier = buffer_barrier()
-                .buffer(vertex_buffer.raw_buffer())
+            let vertex_buffer_barrier = vertex_buffer
+                .whole_buffer_barrier()
                 .src_queue_family_index(device.transfer_queue_family())
-                .dst_queue_family_index(device.graphics_queue_family())
-                .size(vk::WHOLE_SIZE);
+                .dst_queue_family_index(device.graphics_queue_family());
 
-            let index_buffer_barrier = buffer_barrier()
-                .buffer(index_buffer.raw_buffer())
+            let index_buffer_barrier = index_buffer
+                .whole_buffer_barrier()
                 .src_queue_family_index(transfer_queue_family)
-                .dst_queue_family_index(graphics_queue_family)
-                .size(vk::WHOLE_SIZE);
+                .dst_queue_family_index(graphics_queue_family);
 
             buffer_barriers = vec![vertex_buffer_barrier, index_buffer_barrier];
         }
@@ -1657,16 +1656,14 @@ impl AppRunner {
 
             let transfer_family = device.transfer_queue_family();
             let graphics_family = device.graphics_queue_family();
-            let vb_barrier = rgpu_vk::memory::buffer_barrier()
-                .buffer(vertex_buffer.raw_buffer())
+            let vb_barrier = vertex_buffer
+                .whole_buffer_barrier()
                 .src_queue_family_index(transfer_family)
-                .dst_queue_family_index(graphics_family)
-                .size(vk::WHOLE_SIZE);
-            let ib_barrier = rgpu_vk::memory::buffer_barrier()
-                .buffer(index_buffer.raw_buffer())
+                .dst_queue_family_index(graphics_family);
+            let ib_barrier = index_buffer
+                .whole_buffer_barrier()
                 .src_queue_family_index(transfer_family)
-                .dst_queue_family_index(graphics_family)
-                .size(vk::WHOLE_SIZE);
+                .dst_queue_family_index(graphics_family);
             let img_barrier = texture
                 .whole_image_barrier()
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -1775,6 +1772,7 @@ impl AppRunner {
             vk::Filter::LINEAR,
             vk::Filter::LINEAR,
             vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            1,
             Some("statue-tex sampler"),
         )?;
 

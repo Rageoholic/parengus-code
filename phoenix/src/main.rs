@@ -7,15 +7,12 @@ use std::{
 };
 
 use asset_loader::{AssetMap, MeshAsset, TexAsset};
-use asset_shared::{mesh_id, shader_id, texture_id};
+use asset_shared::{ColorSpace, TexFormat, TexRole, mesh_id, shader_id};
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use parengus_tracing::{TracingLogLevel, init_default};
 use rgpu_vk::{
-    ash::vk::{
-        self, BufferUsageFlags, CommandBufferSubmitInfo, PipelineStageFlags2,
-        SemaphoreSubmitInfo,
-    },
+    ash::vk::{self},
     buffer::{DeviceLocalBuffer, HostVisibleBuffer},
     command::{ResettableCommandBuffer, ResettableCommandPool},
     descriptor::{
@@ -25,7 +22,7 @@ use rgpu_vk::{
     device::{Device, DeviceConfig, QueueConfig},
     image::{DepthImage, MsaaImage, Texture},
     instance::{Instance, InstanceConfig},
-    memory::{buffer_barrier2, image_barrier2},
+    memory::image_barrier2,
     pipeline::{
         CullModeFlags, DynamicPipeline, DynamicPipelineDesc, FrontFace,
         PipelineLayout, PipelineLayoutDesc, VertexAttributeDesc,
@@ -276,6 +273,21 @@ impl From<CliVulkanLogLevel> for rgpu_vk::instance::VulkanLogLevel {
                 rgpu_vk::instance::VulkanLogLevel::Error
             }
         }
+    }
+}
+
+fn tex_vk_format(fmt: TexFormat, cs: ColorSpace) -> vk::Format {
+    match (fmt, cs) {
+        (TexFormat::Rgba8, ColorSpace::Srgb) => vk::Format::R8G8B8A8_SRGB,
+        (TexFormat::Rgba8, ColorSpace::Linear) => vk::Format::R8G8B8A8_UNORM,
+        (TexFormat::Bc4, ColorSpace::Linear) => vk::Format::BC4_UNORM_BLOCK,
+        (TexFormat::Bc5, ColorSpace::Linear) => vk::Format::BC5_UNORM_BLOCK,
+        (TexFormat::Bc7, ColorSpace::Srgb) => vk::Format::BC7_SRGB_BLOCK,
+        (TexFormat::Bc7, ColorSpace::Linear) => vk::Format::BC7_UNORM_BLOCK,
+        _ => panic!(
+            "unsupported tex format combination: \
+             {fmt:?} + {cs:?}"
+        ),
     }
 }
 
@@ -1418,16 +1430,43 @@ impl AppRunner {
 
         let index_count = scene_indices.len() as u32;
 
+        let albedo_id = duck
+            .tex_refs
+            .iter()
+            .find(|(role, _)| *role == TexRole::Albedo)
+            .map(|(_, id)| *id)
+            .ok_or_else(|| eyre::eyre!("duck has no albedo tex_ref"))?;
+        let albedo_name = asset_map
+            .name_of(albedo_id)
+            .unwrap_or("duck-albedo")
+            .to_owned();
         let albedo_filename = asset_map
-            .get(texture_id("duck-albedo"))
-            .ok_or_else(|| eyre::eyre!("asset 'duck-albedo' not in map"))?;
+            .get(albedo_id)
+            .ok_or_else(|| eyre::eyre!("albedo asset not in map"))?;
         let duck_tex = TexAsset::open(&assets_dir.join(albedo_filename))
-            .map_err(|e| eyre::eyre!("load duck-albedo: {e}"))?;
+            .map_err(|e| eyre::eyre!("load {albedo_name}: {e}"))?;
         let tex_width = duck_tex.info.width;
         let tex_height = duck_tex.info.height;
-        let tex_bytes = duck_tex
-            .mip(0)
-            .map_err(|e| eyre::eyre!("duck-albedo mip0: {e}"))?;
+        let tex_format =
+            tex_vk_format(duck_tex.info.format, duck_tex.info.color_space);
+        let mip_count = duck_tex.info.mip_count as u32;
+
+        // Collect all mip levels into (data, byte_offset) pairs so we
+        // can allocate one contiguous staging buffer.
+        let mut mip_data: Vec<(Vec<u8>, usize)> = Vec::new();
+        let mut running_offset: usize = 0;
+        for mip_result in duck_tex.mips() {
+            let mip_iter = mip_result.map_err(|e| {
+                eyre::eyre!(
+                    "{albedo_name} mip \
+                    iter: {e}"
+                )
+            })?;
+            let data: Vec<u8> = mip_iter.map(|[b]| b).collect();
+            mip_data.push((data, running_offset));
+            running_offset += mip_data.last().unwrap().0.len();
+        }
+        let total_tex_bytes = running_offset;
 
         let vertex_buffer_size =
             (scene_vertices.len() * size_of::<Vertex>()) as vk::DeviceSize;
@@ -1439,7 +1478,7 @@ impl AppRunner {
         let mut staging_vertex_buffer = HostVisibleBuffer::new(
             &device,
             vertex_buffer_size,
-            BufferUsageFlags::TRANSFER_SRC,
+            vk::BufferUsageFlags::TRANSFER_SRC,
             Some("Vertex staging buffer"),
         )?;
 
@@ -1738,23 +1777,25 @@ impl AppRunner {
             .expect("allocated exactly one material set");
         material_descriptor_set.set_name(&device, Some("material set"));
 
-        let tex_staging_size = tex_bytes.len() as vk::DeviceSize;
-
+        let tex_staging_name = format!("{albedo_name} staging");
         let mut tex_staging = HostVisibleBuffer::new(
             &device,
-            tex_staging_size,
+            total_tex_bytes as vk::DeviceSize,
             vk::BufferUsageFlags::TRANSFER_SRC,
-            Some("duck-tex staging"),
+            Some(tex_staging_name.as_str()),
         )?;
-        tex_staging.write_pod(tex_bytes.as_slice())?;
+        for (data, offset) in &mip_data {
+            tex_staging.write_pod_at(data.as_slice(), *offset)?;
+        }
 
         let texture = rgpu_vk::image::Texture::new(
             &device,
             tex_width,
             tex_height,
-            vk::Format::R8G8B8A8_SRGB,
+            tex_format,
+            mip_count,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            Some("duck-tex"),
+            Some(albedo_name.as_str()),
         )?;
 
         // Record all uploads into a single command buffer, then
@@ -1765,12 +1806,12 @@ impl AppRunner {
         // all buffers remain alive until wait_idle below completes.
         unsafe {
             vertex_buffer
-                .record_copy_from(&mut upload_cmd, &staging_vertex_buffer)
+                .record_upload_from(&mut upload_cmd, &staging_vertex_buffer)
         }?;
         // SAFETY: same as vertex buffer copy above.
         unsafe {
             index_buffer
-                .record_copy_from(&mut upload_cmd, &staging_index_buffer)
+                .record_upload_from(&mut upload_cmd, &staging_index_buffer)
         }?;
 
         // Record a single synchronization2 image transition before any copies.
@@ -1791,11 +1832,41 @@ impl AppRunner {
             )
         };
 
-        // Copy
+        let mut image_copy_regions = Vec::with_capacity(mip_data.len());
+
+        // Copy all mip levels.
         // SAFETY: `upload_cmd` is recording; `texture` and `tex_staging`
-        // remain alive until after `device.wait_idle()` therefore the
-        // recorded copy is valid.
-        unsafe { texture.record_copy_from(&mut upload_cmd, &tex_staging) }?;
+        // remain alive until after `device.wait_idle()` therefore
+        // every recorded copy is valid.
+        for (level, (_data, offset)) in mip_data.iter().enumerate() {
+            let level = level as u32;
+            let mip_w = (tex_width >> level).max(1);
+            let mip_h = (tex_height >> level).max(1);
+            let mip_extent = vk::Extent3D {
+                width: mip_w,
+                height: mip_h,
+                depth: 1,
+            };
+
+            let mip_copy = texture.buffer_image_copy_for_mip(
+                *offset as u64,
+                level,
+                mip_extent,
+            );
+
+            image_copy_regions.push(mip_copy);
+        }
+
+        // SAFETY: We know all these copies are to valid mip levels with valid
+        // regions and offsets in the buffer
+        unsafe {
+            upload_cmd.copy_buffer_to_image(
+                tex_staging.raw_buffer(),
+                texture.raw_image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &image_copy_regions,
+            )
+        };
 
         // Transition image to shader-readable at the end of the upload
         // command buffer (single post-copy barrier).
@@ -1814,29 +1885,27 @@ impl AppRunner {
                 vk::AccessFlags2::SHADER_READ
             })
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .src_queue_family_index(transfer_queue_family)
             .dst_queue_family_index(graphics_queue_family);
 
         let mut buffer_barriers = Vec::new();
         if queue_config.dedicated_transfer {
-            let vertex_buffer_barrier = buffer_barrier2()
-                .buffer(vertex_buffer.raw_buffer())
+            let vertex_buffer_barrier = vertex_buffer
+                .whole_buffer_barrier2()
                 .src_queue_family_index(device.transfer_queue_family())
                 .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_queue_family_index(device.graphics_queue_family())
-                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                .size(vk::WHOLE_SIZE);
+                .dst_stage_mask(vk::PipelineStageFlags2::NONE);
 
-            let index_buffer_barrier = buffer_barrier2()
-                .buffer(index_buffer.raw_buffer())
+            let index_buffer_barrier = index_buffer
+                .whole_buffer_barrier2()
                 .src_queue_family_index(transfer_queue_family)
                 .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_queue_family_index(graphics_queue_family)
-                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                .size(vk::WHOLE_SIZE);
+                .dst_stage_mask(vk::PipelineStageFlags2::NONE);
 
             buffer_barriers = vec![vertex_buffer_barrier, index_buffer_barrier];
         }
@@ -1866,20 +1935,18 @@ impl AppRunner {
 
             let transfer_family = device.transfer_queue_family();
             let graphics_family = device.graphics_queue_family();
-            let vb_barrier = rgpu_vk::memory::buffer_barrier2()
-                .buffer(vertex_buffer.raw_buffer())
+            let vb_barrier = vertex_buffer
+                .whole_buffer_barrier2()
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .src_queue_family_index(transfer_family)
-                .dst_queue_family_index(graphics_family)
-                .size(vk::WHOLE_SIZE);
-            let ib_barrier = rgpu_vk::memory::buffer_barrier2()
-                .buffer(index_buffer.raw_buffer())
+                .dst_queue_family_index(graphics_family);
+            let ib_barrier = index_buffer
+                .whole_buffer_barrier2()
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .src_stage_mask(vk::PipelineStageFlags2::NONE)
                 .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
                 .src_queue_family_index(transfer_family)
-                .dst_queue_family_index(graphics_family)
-                .size(vk::WHOLE_SIZE);
+                .dst_queue_family_index(graphics_family);
             let img_barrier = texture
                 .whole_image_barrier2()
                 .src_access_mask(vk::AccessFlags2::NONE)
@@ -1891,12 +1958,13 @@ impl AppRunner {
                 .dst_queue_family_index(graphics_family);
 
             let buffer_barriers = [vb_barrier, ib_barrier];
+            let img_barriers = [img_barrier];
             // SAFETY: recording state and handles valid.
             unsafe {
                 graphics_upload_cmd.pipeline_barrier2_by_barriers(
                     &[],
                     &buffer_barriers,
-                    std::slice::from_ref(&img_barrier),
+                    &img_barriers,
                 )
             };
 
@@ -1915,9 +1983,9 @@ impl AppRunner {
         if queue_config.dedicated_transfer {
             //Double submit path
 
-            let transfer_cb_submit = CommandBufferSubmitInfo::default()
+            let transfer_cb_submit = vk::CommandBufferSubmitInfo::default()
                 .command_buffer(upload_cmd.raw());
-            let transfer_semaphore_submit = SemaphoreSubmitInfo::default()
+            let transfer_semaphore_submit = vk::SemaphoreSubmitInfo::default()
                 .semaphore(transfer_semaphore.raw())
                 .stage_mask(vk::PipelineStageFlags2::TRANSFER);
             let transfer_submit = vk::SubmitInfo2::default()
@@ -1942,11 +2010,11 @@ impl AppRunner {
                 "Somehow used dedicated transfer queue but did not record graphics \
                  queue half of upload"
             );
-            let graphics_cb_submit = CommandBufferSubmitInfo::default()
+            let graphics_cb_submit = vk::CommandBufferSubmitInfo::default()
                 .command_buffer(graphics_cb.raw());
-            let graphics_semaphore_submit = SemaphoreSubmitInfo::default()
+            let graphics_semaphore_submit = vk::SemaphoreSubmitInfo::default()
                 .semaphore(transfer_semaphore.raw())
-                .stage_mask(PipelineStageFlags2::VERTEX_INPUT);
+                .stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT);
             let graphics_submit = vk::SubmitInfo2::default()
                 .command_buffer_infos(std::slice::from_ref(&graphics_cb_submit))
                 .wait_semaphore_infos(std::slice::from_ref(
@@ -1968,7 +2036,7 @@ impl AppRunner {
                 )?
             }
         } else {
-            let transfer_cb_submit = CommandBufferSubmitInfo::default()
+            let transfer_cb_submit = vk::CommandBufferSubmitInfo::default()
                 .command_buffer(upload_cmd.raw());
 
             let transfer_submit = vk::SubmitInfo2::default()
@@ -1995,6 +2063,7 @@ impl AppRunner {
             vk::Filter::LINEAR,
             vk::Filter::LINEAR,
             vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            mip_count,
             Some("duck-tex sampler"),
         )?;
 

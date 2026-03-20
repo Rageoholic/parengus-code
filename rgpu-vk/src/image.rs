@@ -269,6 +269,7 @@ struct AllocatedImage {
     allocation: Option<Allocation>,
     extent: vk::Extent3D,
     format: vk::Format,
+    mip_levels: u32,
 }
 
 impl std::fmt::Debug for AllocatedImage {
@@ -286,6 +287,7 @@ impl AllocatedImage {
         device: &Arc<Device>,
         extent: vk::Extent3D,
         format: vk::Format,
+        mip_levels: u32,
         usage: vk::ImageUsageFlags,
         samples: vk::SampleCountFlags,
         name: Option<&str>,
@@ -294,7 +296,7 @@ impl AllocatedImage {
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(extent)
-            .mip_levels(1)
+            .mip_levels(mip_levels)
             .array_layers(1)
             .samples(samples)
             .tiling(vk::ImageTiling::OPTIMAL)
@@ -346,6 +348,7 @@ impl AllocatedImage {
             allocation: Some(allocation),
             extent,
             format,
+            mip_levels,
         })
     }
 }
@@ -380,11 +383,13 @@ pub(crate) struct DeviceLocalImage {
 
 impl DeviceLocalImage {
     /// Create a 2-D device-local image.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         device: &Arc<Device>,
         width: u32,
         height: u32,
         format: vk::Format,
+        mip_levels: u32,
         usage: vk::ImageUsageFlags,
         samples: vk::SampleCountFlags,
         name: Option<&str>,
@@ -396,7 +401,7 @@ impl DeviceLocalImage {
         };
         Ok(Self {
             inner: AllocatedImage::new(
-                device, extent, format, usage, samples, name,
+                device, extent, format, mip_levels, usage, samples, name,
             )?,
         })
     }
@@ -411,7 +416,7 @@ impl DeviceLocalImage {
         let subresource_range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .base_mip_level(0)
-            .level_count(1)
+            .level_count(self.inner.mip_levels)
             .base_array_layer(0)
             .layer_count(1);
         crate::memory::image_barrier()
@@ -424,12 +429,36 @@ impl DeviceLocalImage {
         let subresource_range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .base_mip_level(0)
-            .level_count(1)
+            .level_count(self.inner.mip_levels)
             .base_array_layer(0)
             .layer_count(1);
         crate::memory::image_barrier2()
             .image(self.inner.handle)
             .subresource_range(subresource_range)
+    }
+
+    /// Build a `vk::BufferImageCopy` for the given mip level and buffer
+    /// offset. This encodes the subresource, offset, and extent used when
+    /// copying from a linear staging buffer into the image.
+    #[inline]
+    fn buffer_image_copy_for_mip(
+        &self,
+        buffer_offset: vk::DeviceSize,
+        mip_level: u32,
+        mip_extent: vk::Extent3D,
+    ) -> vk::BufferImageCopy {
+        let subresource_layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(mip_level)
+            .base_array_layer(0)
+            .layer_count(1);
+        vk::BufferImageCopy::default()
+            .buffer_offset(buffer_offset)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(subresource_layers)
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(mip_extent)
     }
 
     #[inline]
@@ -519,6 +548,61 @@ impl DeviceLocalImage {
 
         Ok(())
     }
+
+    /// Record a buffer-to-image copy for one mip level.
+    ///
+    /// Infallible — no size validation is performed (required because
+    /// `format_texel_size` returns `None` for block-compressed
+    /// formats).
+    ///
+    /// # Safety
+    /// - `command_buffer` must be in the recording state.
+    /// - `src` must be created with `TRANSFER_SRC` usage.
+    /// - The image must be in `TRANSFER_DST_OPTIMAL` layout.
+    /// - `buffer_offset` + the byte size of `mip_extent` at this
+    ///   format must not exceed `src.size()`.
+    /// - The caller must ensure `src` and `self` remain alive until
+    ///   GPU execution of the submitted commands has completed.
+    pub(crate) unsafe fn record_upload_mip_from(
+        &self,
+        command_buffer: &mut ResettableCommandBuffer,
+        src: &HostVisibleBuffer,
+        buffer_offset: vk::DeviceSize,
+        mip_level: u32,
+        mip_extent: vk::Extent3D,
+    ) {
+        debug_assert_eq!(
+            command_buffer.state(),
+            crate::command::CommandBufferState::Recording
+        );
+        let raw_cmd = command_buffer.raw();
+        let device = &self.inner.parent;
+        let image = self.inner.handle;
+
+        let subresource_layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(mip_level)
+            .base_array_layer(0)
+            .layer_count(1);
+        let copy_region = vk::BufferImageCopy::default()
+            .buffer_offset(buffer_offset)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(subresource_layers)
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(mip_extent);
+        // SAFETY: caller guarantees recording state; src buffer and
+        // image are valid and in the correct layouts.
+        unsafe {
+            device.cmd_copy_buffer_to_image(
+                raw_cmd,
+                src.raw_buffer(),
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&copy_region),
+            )
+        };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -544,12 +628,13 @@ impl ImageView {
     pub(crate) fn new(
         device: &Arc<Device>,
         image: &DeviceLocalImage,
+        mip_levels: u32,
         name: Option<&str>,
     ) -> Result<Self, CreateImageViewError> {
         let subresource_range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .base_mip_level(0)
-            .level_count(1)
+            .level_count(mip_levels)
             .base_array_layer(0)
             .layer_count(1);
         let create_info = vk::ImageViewCreateInfo::default()
@@ -656,6 +741,7 @@ impl Texture {
         width: u32,
         height: u32,
         format: vk::Format,
+        mip_levels: u32,
         usage: vk::ImageUsageFlags,
         name: Option<&str>,
     ) -> Result<Self, CreateTextureError> {
@@ -664,11 +750,12 @@ impl Texture {
             width,
             height,
             format,
+            mip_levels,
             usage,
             vk::SampleCountFlags::TYPE_1,
             name,
         )?;
-        let view = ImageView::new(device, &image, name)?;
+        let view = ImageView::new(device, &image, mip_levels, name)?;
         Ok(Self { view, image })
     }
 
@@ -702,6 +789,52 @@ impl Texture {
         unsafe { self.image.record_upload_from(command_buffer, src) }
     }
 
+    /// Record a buffer-to-image copy for a single mip level.
+    ///
+    /// Infallible — no size validation. See
+    /// [`DeviceLocalImage::record_upload_mip_from`] for full safety
+    /// requirements.
+    ///
+    /// # Safety
+    /// Same as [`record_copy_from`](Self::record_copy_from), except
+    /// `buffer_offset`, `mip_level`, and `mip_extent` select which
+    /// mip and which region of the staging buffer to use.
+    pub unsafe fn record_copy_mip_from(
+        &self,
+        command_buffer: &mut ResettableCommandBuffer,
+        src: &HostVisibleBuffer,
+        buffer_offset: vk::DeviceSize,
+        mip_level: u32,
+        mip_extent: vk::Extent3D,
+    ) {
+        // SAFETY: caller upholds the same preconditions.
+        unsafe {
+            self.image.record_upload_mip_from(
+                command_buffer,
+                src,
+                buffer_offset,
+                mip_level,
+                mip_extent,
+            )
+        }
+    }
+
+    /// Build a `vk::BufferImageCopy` describing the copy region for the
+    /// given mip level. Useful when accumulating regions to pass to a
+    /// single `vkCmdCopyBufferToImage` call.
+    pub fn buffer_image_copy_for_mip(
+        &self,
+        buffer_offset: vk::DeviceSize,
+        mip_level: u32,
+        mip_extent: vk::Extent3D,
+    ) -> vk::BufferImageCopy {
+        self.image.buffer_image_copy_for_mip(
+            buffer_offset,
+            mip_level,
+            mip_extent,
+        )
+    }
+
     /// Helper that returns an `ImageMemoryBarrier` pre-filled with
     /// this texture's `VkImage` and a subresource range that covers
     /// the whole image (colour aspect, mip 0, array layer 0, 1
@@ -730,6 +863,10 @@ impl Texture {
     #[inline]
     pub fn raw_image_view(&self) -> vk::ImageView {
         self.view.raw_image_view()
+    }
+
+    pub fn raw_image(&self) -> vk::Image {
+        self.image.raw_image()
     }
 }
 
@@ -776,6 +913,7 @@ impl DepthImage {
             width,
             height,
             format,
+            1,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             samples,
             name,
@@ -840,12 +978,13 @@ impl MsaaImage {
             width,
             height,
             format,
+            1,
             vk::ImageUsageFlags::COLOR_ATTACHMENT
                 | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
             samples,
             name,
         )?;
-        let view = ImageView::new(device, &image, name)?;
+        let view = ImageView::new(device, &image, 1, name)?;
         Ok(Self { view, image })
     }
 

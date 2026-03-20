@@ -190,6 +190,20 @@ impl AllocatedBuffer {
     fn parent(&self) -> &Arc<Device> {
         &self.parent
     }
+
+    #[inline]
+    fn whole_buffer_barrier(&self) -> vk::BufferMemoryBarrier<'_> {
+        crate::memory::buffer_barrier()
+            .buffer(self.handle)
+            .size(vk::WHOLE_SIZE)
+    }
+
+    #[inline]
+    fn whole_buffer_barrier2(&self) -> vk::BufferMemoryBarrier2<'_> {
+        crate::memory::buffer_barrier2()
+            .buffer(self.handle)
+            .size(vk::WHOLE_SIZE)
+    }
 }
 
 impl Drop for AllocatedBuffer {
@@ -252,7 +266,21 @@ impl HostVisibleBuffer {
         &mut self,
         data: &[T],
     ) -> Result<(), WriteBufferError> {
-        self.write_pod_iter_exact(data.iter().copied())
+        self.write_pod_at(data, 0)
+    }
+
+    /// Write `data` into the buffer starting at `byte_offset`.
+    ///
+    /// Returns [`WriteBufferError::DataTooLarge`] if
+    /// `byte_offset + data.len() * size_of::<T>()` exceeds the buffer
+    /// size.
+    #[inline]
+    pub fn write_pod_at<T: Pod>(
+        &mut self,
+        data: &[T],
+        byte_offset: usize,
+    ) -> Result<(), WriteBufferError> {
+        self.write_pod_iter_exact_at(data.iter().copied(), byte_offset)
     }
 
     #[inline]
@@ -263,14 +291,38 @@ impl HostVisibleBuffer {
     where
         I: Iterator<Item = T> + ExactSizeIterator,
     {
-        let size = iter.len() * size_of::<T>();
-        self.check_size_for_write(size)?;
-        self.write_pod_iter(iter)
+        self.write_pod_iter_exact_at(iter, 0)
     }
 
-    fn write_pod_iter<T: Pod, I>(
+    /// Write items from `iter` into the buffer starting at
+    /// `byte_offset`.
+    ///
+    /// Returns [`WriteBufferError::DataTooLarge`] if
+    /// `byte_offset + iter.len() * size_of::<T>()` exceeds the buffer
+    /// size.
+    #[inline]
+    pub fn write_pod_iter_exact_at<T: Pod, I>(
         &mut self,
         iter: I,
+        byte_offset: usize,
+    ) -> Result<(), WriteBufferError>
+    where
+        I: Iterator<Item = T> + ExactSizeIterator,
+    {
+        let end = byte_offset.saturating_add(iter.len() * size_of::<T>());
+        if end as u64 > self.size() {
+            return Err(WriteBufferError::DataTooLarge {
+                data_bytes: end,
+                buffer_bytes: self.size(),
+            });
+        }
+        self.write_pod_iter_at(iter, byte_offset)
+    }
+
+    fn write_pod_iter_at<T: Pod, I>(
+        &mut self,
+        iter: I,
+        byte_offset: usize,
     ) -> Result<(), WriteBufferError>
     where
         I: Iterator<Item = T>,
@@ -288,9 +340,9 @@ impl HostVisibleBuffer {
         for item in iter {
             let bytes = bytemuck::bytes_of(&item);
             let len = bytes.len();
-            if written + len > cap {
+            if byte_offset + written + len > cap {
                 return Err(WriteBufferError::DataTooLarge {
-                    data_bytes: written + len,
+                    data_bytes: byte_offset + written + len,
                     buffer_bytes: self.inner.size(),
                 });
             }
@@ -299,14 +351,15 @@ impl HostVisibleBuffer {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
-                    dst.add(written),
+                    dst.add(byte_offset + written),
                     len,
                 );
             }
             written += len;
         }
 
-        // Flush non-coherent ranges if needed (same logic as write_u8_iter)
+        // Flush non-coherent memory from the start of the dirty range
+        // (aligned down) to the end (aligned up).
         let is_coherent = allocation
             .memory_properties()
             .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
@@ -314,15 +367,21 @@ impl HostVisibleBuffer {
             let atom = self.inner.parent.non_coherent_atom_size();
             debug_assert_eq!(allocation.offset() % atom, 0);
             debug_assert_eq!(allocation.size() % atom, 0);
-            let flush_size = (written as vk::DeviceSize).div_ceil(atom) * atom;
+            // Round the dirty start down and dirty end up to atom
+            // boundaries. allocation.offset() is atom-aligned so
+            // flush_offset is too.
+            let dirty_start = (byte_offset as vk::DeviceSize / atom) * atom;
+            let dirty_end = ((byte_offset + written) as vk::DeviceSize)
+                .div_ceil(atom)
+                * atom;
             let flush_range = vk::MappedMemoryRange::default()
-                // SAFETY: Allocation is currently live
+                // SAFETY: Allocation is currently live.
                 .memory(unsafe { allocation.memory() })
-                .offset(allocation.offset())
-                .size(flush_size);
-            // SAFETY: Allocation is currently live. flush range is aligned to
-            // non_coherent_atom_size (guaranteed by the allocator), offset +
-            // size is within the buffer
+                .offset(allocation.offset() + dirty_start)
+                .size(dirty_end - dirty_start);
+            // SAFETY: Allocation is currently live. flush range is
+            // aligned to non_coherent_atom_size (guaranteed above),
+            // and offset + size is within the buffer.
             unsafe {
                 self.inner.parent.flush_raw_mapped_memory_ranges(
                     std::slice::from_ref(&flush_range),
@@ -342,17 +401,7 @@ impl HostVisibleBuffer {
     where
         I: Iterator<Item = u8> + ExactSizeIterator,
     {
-        self.check_size_for_write(iter.len())?;
-        self.write_u8_iter(iter)
-    }
-
-    #[inline]
-    fn write_u8_iter<I>(&mut self, iter: I) -> Result<(), WriteBufferError>
-    where
-        I: Iterator<Item = u8>,
-    {
-        // Delegate to the canonical POD writer with `u8` as the POD type.
-        self.write_pod_iter(iter)
+        self.write_pod_iter_exact_at(iter, 0)
     }
 
     #[inline]
@@ -371,18 +420,13 @@ impl HostVisibleBuffer {
     }
 
     #[inline]
-    fn check_size_for_write(
-        &self,
-        size: usize,
-    ) -> Result<(), WriteBufferError> {
-        if self.size() >= size as u64 {
-            Ok(())
-        } else {
-            Err(WriteBufferError::DataTooLarge {
-                data_bytes: size,
-                buffer_bytes: self.size(),
-            })
-        }
+    pub fn whole_buffer_barrier(&self) -> vk::BufferMemoryBarrier<'_> {
+        self.inner.whole_buffer_barrier()
+    }
+
+    #[inline]
+    pub fn whole_buffer_barrier2(&self) -> vk::BufferMemoryBarrier2<'_> {
+        self.inner.whole_buffer_barrier2()
     }
 }
 
@@ -436,6 +480,16 @@ impl DeviceLocalBuffer {
         self.inner.parent()
     }
 
+    #[inline]
+    pub fn whole_buffer_barrier(&self) -> vk::BufferMemoryBarrier<'_> {
+        self.inner.whole_buffer_barrier()
+    }
+
+    #[inline]
+    pub fn whole_buffer_barrier2(&self) -> vk::BufferMemoryBarrier2<'_> {
+        self.inner.whole_buffer_barrier2()
+    }
+
     /// Record an upload of the entire source buffer into this device-local
     /// buffer. Returns [`UploadBufferError::SourceTooLarge`] if `src` is larger
     /// than `self`.
@@ -449,7 +503,7 @@ impl DeviceLocalBuffer {
     ///   execution of the recorded copy has completed.
     /// - `src` must be created with `TRANSFER_SRC` usage and `self` with
     ///   `TRANSFER_DST` usage.
-    pub unsafe fn record_copy_from(
+    pub unsafe fn record_upload_from(
         &mut self,
         command_buffer: &mut ResettableCommandBuffer,
         src: &HostVisibleBuffer,
