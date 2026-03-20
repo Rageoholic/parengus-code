@@ -16,8 +16,8 @@ struct AssetMapFile {
     map: BTreeMap<String, String>,
 }
 
-/// Copy compiled assets from `compiled_cache_dir` to `dst_dir` for
-/// the given app, then write `asset_map.toml`.
+/// Verify compiled assets exist in `dst_dir` for the given app,
+/// then write `asset_map.toml`.
 ///
 /// Compiled file naming convention:
 /// - Mesh   `{name}.pmesh`
@@ -26,7 +26,6 @@ struct AssetMapFile {
 pub(crate) fn copy_assets(
     manifest_path: &Path,
     app_assets_path: &Path,
-    compiled_cache_dir: &Path,
     dst_dir: &Path,
 ) -> Result<()> {
     let manifest: Manifest =
@@ -43,7 +42,6 @@ pub(crate) fn copy_assets(
     fs::create_dir_all(dst_dir)?;
 
     let mut map = BTreeMap::new();
-    let mut copied = 0u32;
     let mut skipped = 0u32;
 
     for req in &app_assets.asset {
@@ -78,7 +76,7 @@ pub(crate) fn copy_assets(
 
         // The compiled asset is produced directly into `dst_dir` by the
         // xtask compile steps. Treat existing files in `dst_dir` as
-        // up-to-date; we no longer copy from a separate compiled cache.
+        // present; we no longer copy from a separate compiled cache.
         let src = dst_dir.join(&compiled_name);
         if src.exists() {
             skipped += 1;
@@ -104,6 +102,6 @@ pub(crate) fn copy_assets(
     };
     fs::write(dst_dir.join("asset_map.toml"), toml::to_string(&asset_map)?)?;
 
-    println!("Assets: {copied} copied, {skipped} up-to-date");
+    println!("Assets present: {skipped}");
     Ok(())
 }

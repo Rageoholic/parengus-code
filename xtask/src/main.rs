@@ -365,94 +365,6 @@ pub(crate) fn is_up_to_date(src: &Path, dst: &Path) -> bool {
     st <= dt
 }
 
-/// Returns true if the built `asset-compiler` binary is newer than `dst`.
-fn compiler_is_newer_than(dst: &Path) -> bool {
-    // If any source file in the `asset-compiler` crate (Cargo.toml or
-    // files under `src/`) is newer than `dst`, consider the compiler
-    // newer so we force a rebuild of the compiled asset.
-    let crate_dir = workspace_root().join("asset-compiler");
-
-    fn latest_mod_in_dir(path: &Path) -> Option<std::time::SystemTime> {
-        let mut latest: Option<std::time::SystemTime> = None;
-        let mut stack = vec![path.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                let p = entry.path();
-                // Ignore binary entrypoints; changes to `main.rs` shouldn't
-                // force asset recompilation since the library code matters.
-                if let Some("main.rs") = p.file_name().and_then(|s| s.to_str())
-                {
-                    continue;
-                }
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_dir() {
-                        if let Some(name) =
-                            p.file_name().and_then(|s| s.to_str())
-                        {
-                            // Skip target, VCS, and crate binary dirs (src/bin)
-                            if name == "target" || name == ".git" {
-                                continue;
-                            }
-
-                            if let Some("src") = p
-                                .parent()
-                                .and_then(|pp| pp.file_name())
-                                .and_then(|s| s.to_str())
-                                && name == "bin"
-                            {
-                                continue;
-                            }
-                        }
-                        stack.push(p);
-                        continue;
-                    }
-                    if let Ok(m) = meta.modified() {
-                        latest = match latest {
-                            Some(t) if t > m => Some(t),
-                            _ => Some(m),
-                        };
-                    }
-                }
-            }
-        }
-        latest
-    }
-
-    let crate_latest = {
-        // Consider Cargo.toml and src/
-        let mut cand: Option<std::time::SystemTime> = None;
-        let cargo_toml = crate_dir.join("Cargo.toml");
-        if let Ok(meta) = std::fs::metadata(&cargo_toml)
-            && let Ok(m) = meta.modified()
-        {
-            cand = Some(m);
-        }
-        let src_dir = crate_dir.join("src");
-        if let Some(m) = latest_mod_in_dir(&src_dir) {
-            cand = match cand {
-                Some(t) if t > m => Some(t),
-                _ => Some(m),
-            };
-        }
-        cand
-    };
-
-    let Ok(dst_meta) = dst.metadata() else {
-        return false;
-    };
-    let Ok(dst_m) = dst_meta.modified() else {
-        return false;
-    };
-    if let Some(crate_m) = crate_latest {
-        return crate_m > dst_m;
-    }
-    false
-}
-
 fn run(cmd: &mut Command) -> Result<()> {
     let status = cmd.status()?;
     if !status.success() {
@@ -484,10 +396,6 @@ fn app_assets(app_name: &str) -> Result<AppAssets> {
     let root = workspace_root();
     let text = fs::read_to_string(root.join(app_name).join("assets.toml"))?;
     Ok(toml::from_str(&text)?)
-}
-
-fn compiled_cache() -> PathBuf {
-    workspace_root().join("cache").join("compiled")
 }
 
 fn cargo() -> String {
@@ -547,7 +455,6 @@ fn compile_shaders_for(app_name: &str) -> Result<()> {
         .collect();
 
     let mut compiled = 0u32;
-    let mut skipped = 0u32;
 
     for req in &app.asset {
         if req.asset_type != AssetType::Shader {
@@ -573,7 +480,7 @@ fn compile_shaders_for(app_name: &str) -> Result<()> {
         compiled += 1;
     }
 
-    println!("{app_name} shaders: {compiled} compiled, {skipped} up-to-date");
+    println!("{app_name} shaders: {compiled} compiled");
     Ok(())
 }
 
@@ -595,7 +502,6 @@ fn compile_meshes_for(app_name: &str) -> Result<()> {
         .collect();
 
     let mut compiled = 0u32;
-    let mut skipped = 0u32;
 
     for req in &app.asset {
         if req.asset_type != AssetType::Mesh {
@@ -620,7 +526,7 @@ fn compile_meshes_for(app_name: &str) -> Result<()> {
         compiled += 1;
     }
 
-    println!("{app_name} meshes: {compiled} compiled, {skipped} up-to-date");
+    println!("{app_name} meshes: {compiled} compiled");
     Ok(())
 }
 
@@ -641,7 +547,6 @@ fn compile_images_for(app_name: &str) -> Result<()> {
         .collect();
 
     let mut compiled = 0u32;
-    let mut skipped = 0u32;
 
     for req in &app.asset {
         if req.asset_type != AssetType::Image {
@@ -680,7 +585,7 @@ fn compile_images_for(app_name: &str) -> Result<()> {
         compiled += 1;
     }
 
-    println!("{app_name} images: {compiled} compiled, {skipped} up-to-date");
+    println!("{app_name} images: {compiled} compiled");
     Ok(())
 }
 
@@ -723,7 +628,6 @@ fn copy_assets_for(app_name: &str) -> Result<()> {
     assets::copy_assets(
         &root.join("assets").join("manifest.toml"),
         &root.join(app_name).join("assets.toml"),
-        &compiled_cache(),
         &root.join("out").join(app_name).join("debug").join("assets"),
     )
 }
