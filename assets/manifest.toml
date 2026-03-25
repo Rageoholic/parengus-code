@@ -45,6 +45,70 @@ author = "Khronos Group"
 license = "CC-BY 4.0"
 
 [[asset]]
+name = "damaged-helmet"
+file = "DamagedHelmet.gltf"
+type = "mesh"
+source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
+author = "Khronos Group"
+license = "CC-BY 4.0"
+tex_refs = { albedo = "dh-albedo", ao = "dh-ao", normal = "dh-normal" }
+
+[[asset]]
+name = "dh-albedo"
+file = "tex/Default_albedo.jpg"
+type = "image"
+format = "bc7"
+color_space = "srgb"
+mips = true
+source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
+author = "Khronos Group"
+license = "CC-BY 4.0"
+
+[[asset]]
+name = "dh-ao"
+file = "tex/Default_AO.jpg"
+type = "image"
+format = "bc7"
+color_space = "linear"
+mips = true
+source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
+author = "Khronos Group"
+license = "CC-BY 4.0"
+
+[[asset]]
+name = "dh-normal"
+file = "tex/Default_normal.jpg"
+type = "image"
+format = "bc7"
+color_space = "linear"
+mips = true
+source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
+author = "Khronos Group"
+license = "CC-BY 4.0"
+
+[[asset]]
+name = "dh-emissive"
+file = "tex/Default_emissive.jpg"
+type = "image"
+format = "bc7"
+color_space = "srgb"
+mips = true
+source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
+author = "Khronos Group"
+license = "CC-BY 4.0"
+
+[[asset]]
+name = "dh-metal-rough"
+file = "tex/Default_metalRoughness.jpg"
+type = "image"
+format = "bc7"
+color_space = "linear"
+mips = true
+source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
+author = "Khronos Group"
+license = "CC-BY 4.0"
+
+[[asset]]
 name = "statue-tex"
 file = "statue-tex.png"
 source = "https://pixabay.com/photos/statue-sculpture-figure-1275469/"

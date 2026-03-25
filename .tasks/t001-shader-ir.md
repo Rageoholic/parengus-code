@@ -104,3 +104,10 @@ Work on PSIR is being deferred for the near term. PBR shading (t003)
 may proceed without waiting for PSIR; this task remains planned but
 is deprioritized. Revisit prioritization when higher-level pipeline
 requirements or staffing change.
+
+## Note (2026-03-24)
+
+Rendering focus has shifted to a LearnOpenGL-style Blinn-Phong
+baseline (t022). PBR shading (t003) is now a follow-up milestone.
+PSIR remains planned and can be revisited when the shader pipeline
+needs outgrow the interim path.
