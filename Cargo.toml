@@ -7,15 +7,7 @@ members = [
     "parengus-tracing",
     "phoenix",
     "rgpu-vk",
-    "samp-app",
-    "samp-app-noext",
     "xtask",
 ]
-default-members = [
-    "asset-loader",
-    "phoenix",
-    "rgpu-vk",
-    "samp-app",
-    "samp-app-noext",
-]
+default-members = ["asset-loader", "phoenix", "rgpu-vk"]
 resolver = "3"

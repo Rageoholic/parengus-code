@@ -3,14 +3,7 @@
 Rust workspace for Vulkan experiments.
 
 - `rgpu-vk`: Vulkan wrapper library (uses `ash`)
-- `samp-app`: sample app using `winit`, Vulkan 1.3 features
-- `samp-app-noext`: same app, Vulkan 1.0 core APIs only
-
-`samp-app` and `samp-app-noext` render the same scene and are
-intentional parallel implementations. They exist to contrast modern
-Vulkan APIs (dynamic rendering, synchronization2) against the
-classic render-pass / VK 1.0 submit path. **Do not factor shared
-code between them** — the duplication is the point.
+- `phoenix`: sample app using `winit` and the demo scene
 
 ## rgpu-vk overview
 
@@ -75,10 +68,11 @@ From repository root:
 cargo xtask build
 ```
 
-This builds the sample app, compiles shaders, and copies the
+
+This builds the demo app, compiles shaders, and copies the
 executable and debug info to the `out/` directory.
 
-Then run the binary from `out/samp-app/debug/`.
+Then run the binary from `out/phoenix/debug/`.
 
 If you have local VS Code tasks configured, you can also run the
 equivalent editor task flow. (`.vscode` is gitignored in this repo.)
@@ -90,14 +84,14 @@ equivalent editor task flow. (`.vscode` is gitignored in this repo.)
 - `shader.spv` (default)
 - `shader.debug.spv` (compiled with debug info)
 
-Outputs are written to `out/samp-app/debug/shaders`.
+Outputs are written to `out/phoenix/debug/shaders`.
 
 ## RenderDoc / shader debug info
 
 To load debug-info shaders at runtime, pass `--shader-debug-info`:
 
 ```sh
-./out/samp-app/debug/samp-app --shader-debug-info
+./out/phoenix/debug/phoenix --shader-debug-info
 ```
 
 If `shader.debug.spv` is missing, the app falls back to `shader.spv`.
@@ -109,10 +103,8 @@ per package.
 
 ```sh
 cargo check -p rgpu-vk
-cargo check -p samp-app
 cargo test --workspace
 cargo clippy -p rgpu-vk --all-targets -- -D warnings
-cargo clippy -p samp-app --all-targets -- -D warnings
 ```
 
 ## AI attribution

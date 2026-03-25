@@ -5,72 +5,6 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "(Windows) Launch samp-app",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
-            "args": [
-                "--tracing-log-level",
-                "warn",
-                "--graphics-debug-level",
-                "warn",
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/samp-app/debug/",
-            "environment": [
-                {
-                    "name": "RUST_BACKTRACE",
-                    "value": "1"
-                }
-            ],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build samp-app debug"
-        },
-        {
-            "name": "(Windows) Launch samp-app (errors only)",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
-            "args": [
-                "--tracing-log-level",
-                "error",
-                "--graphics-debug-level",
-                "error",
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/samp-app/debug/",
-            "environment": [
-                {
-                    "name": "RUST_BACKTRACE",
-                    "value": "1"
-                }
-            ],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build samp-app debug"
-        },
-        {
-            "name": "(Windows) Launch samp-app (debug) trace full",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/samp-app/debug/samp-app.exe",
-            "args": [
-                "--tracing-log-level",
-                "trace",
-                "--graphics-debug-level",
-                "trace",
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/samp-app/debug/",
-            "environment": [
-                {
-                    "name": "RUST_BACKTRACE",
-                    "value": "1"
-                }
-            ],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build samp-app debug"
-        },
-        {
             "name": "(Windows) Launch phoenix",
             "type": "cppvsdbg",
             "request": "launch",
@@ -79,7 +13,7 @@
                 "--tracing-log-level",
                 "warn",
                 "--graphics-debug-level",
-                "warn",
+                "warn"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceRoot}/out/phoenix/debug/",
@@ -91,45 +25,6 @@
             ],
             "console": "integratedTerminal",
             "preLaunchTask": "build phoenix debug"
-        },
-        {
-            "name": "(Windows) Launch samp-app-noext",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/samp-app-noext/debug/samp-app-noext.exe",
-            "args": [
-                "--tracing-log-level",
-                "warn",
-                "--graphics-debug-level",
-                "warn",
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/samp-app-noext/debug/",
-            "environment": [
-                {
-                    "name": "RUST_BACKTRACE",
-                    "value": "1"
-                }
-            ],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build samp-app-noext debug"
-        },
-        {
-            "name": "(Windows) Launch samp-app-noext trace full",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/out/samp-app-noext/debug/samp-app-noext.exe",
-            "args": [
-                "--tracing-log-level",
-                "trace",
-                "--graphics-debug-level",
-                "trace",
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceRoot}/out/samp-app-noext/debug/",
-            "environment": [],
-            "console": "integratedTerminal",
-            "preLaunchTask": "build samp-app-noext debug"
         }
     ]
 }

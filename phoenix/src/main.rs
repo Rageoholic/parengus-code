@@ -294,10 +294,10 @@ fn tex_vk_format(fmt: TexFormat, cs: ColorSpace) -> vk::Format {
 }
 
 pub fn main() -> eyre::Result<()> {
-    let app_dirs = directories::ProjectDirs::from("", "parengus", "samp-app")
+    let app_dirs = directories::ProjectDirs::from("", "parengus", "phoenix")
         .ok_or_else(|| {
-        eyre::eyre!("Failed to determine application directories")
-    })?;
+            eyre::eyre!("Failed to determine application directories")
+        })?;
 
     let self_dir = std::env::current_exe()?
         .parent()
@@ -378,7 +378,7 @@ pub fn main() -> eyre::Result<()> {
     // object does.
     let instance = Arc::new(unsafe {
         rgpu_vk::instance::Instance::new(
-            "samp-app",
+            "phoenix",
             cli_args.graphics_debug_level.map(Into::into),
             Some(&event_loop),
             InstanceConfig {
@@ -394,6 +394,7 @@ pub fn main() -> eyre::Result<()> {
         dynamic_rendering: true,
         synchronization2: true,
         maintenance1: false,
+        descriptor_indexing: true,
         shader_non_semantic_info: true,
         queue_config: QueueConfig {
             dedicated_transfer: cli_args.dedicated_transfer,
@@ -1887,7 +1888,11 @@ impl AppRunner {
                 vk::AccessFlags2::SHADER_READ
             })
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(if transfer_queue_family == graphics_queue_family {
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            } else {
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL
+            })
             .src_queue_family_index(transfer_queue_family)
             .dst_queue_family_index(graphics_queue_family);
 

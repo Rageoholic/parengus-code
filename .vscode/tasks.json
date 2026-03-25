@@ -40,19 +40,9 @@
 			}
 		},
 		{
-			"label": "build samp-app debug",
-			"type": "shell",
-			"command": "cargo xtask build-samp-app"
-		},
-		{
 			"label": "build phoenix debug",
 			"type": "shell",
 			"command": "cargo xtask build-phoenix"
-		},
-		{
-			"label": "build samp-app-noext debug",
-			"type": "shell",
-			"command": "cargo xtask build-samp-app-noext"
-		},
+		}
 	]
 }

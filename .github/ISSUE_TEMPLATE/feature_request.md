@@ -23,7 +23,7 @@ labels: enhancement
 ## Scope
 
 - [ ] `rgpu` (Vulkan wrapper library)
-- [ ] `samp-app` (sample application)
+- [ ] `phoenix` (sample application)
 - [ ] Other (CI, docs, tooling)
 
 ---

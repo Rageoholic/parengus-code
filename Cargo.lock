@@ -2181,44 +2181,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "samp-app"
-version = "0.1.0"
-dependencies = [
- "asset-loader",
- "asset-shared",
- "bytemuck",
- "clap",
- "directories",
- "eyre",
- "parengus-tracing",
- "rgpu-vk",
- "supports-color",
- "tracing",
- "tracing-subscriber",
- "vek",
- "winit",
-]
-
-[[package]]
-name = "samp-app-noext"
-version = "0.1.0"
-dependencies = [
- "asset-loader",
- "asset-shared",
- "bytemuck",
- "clap",
- "directories",
- "eyre",
- "parengus-tracing",
- "rgpu-vk",
- "supports-color",
- "tracing",
- "tracing-subscriber",
- "vek",
- "winit",
-]
-
-[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

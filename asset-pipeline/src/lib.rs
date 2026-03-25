@@ -62,7 +62,7 @@ pub struct ManifestEntry {
     pub notes: Option<String>,
 }
 
-// ---- App asset list (samp-app/src/assets.toml) --------------------------
+// ---- App asset list (phoenix/src/assets.toml) --------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppAssets {

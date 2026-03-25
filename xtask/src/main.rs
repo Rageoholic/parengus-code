@@ -104,13 +104,7 @@ struct App {
     name: &'static str,
 }
 
-const APPS: &[App] = &[
-    App { name: "samp-app" },
-    App {
-        name: "samp-app-noext",
-    },
-    App { name: "phoenix" },
-];
+const APPS: &[App] = &[App { name: "phoenix" }];
 
 // ----------------------------------------------------------------
 // Task graph

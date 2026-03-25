@@ -92,7 +92,7 @@ resolved version from the selected physical device's API version.
 | `Highest` | Prefer higher SPIR-V | Enables bump exts if avail |
 | `AtLeast(V)` | Reject devices below V | Enables exts to reach V |
 
-`samp-app-noext` uses `None` (strict VK 1.0, no extras).
+The no-extension variant uses `None` (strict VK 1.0, no extras).
 
 ## Outcome
 

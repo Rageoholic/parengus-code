@@ -306,6 +306,7 @@ pub struct DeviceConfig {
     pub dynamic_rendering: bool,
     pub synchronization2: bool,
     pub maintenance1: bool,
+    pub descriptor_indexing: bool,
     /// When `true`, enable `VK_KHR_shader_non_semantic_info` on
     /// pre-1.3 devices that support it (core in 1.3, no-op on 1.3+).
     /// Required when loading SPIR-V compiled with non-semantic debug

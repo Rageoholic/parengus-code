@@ -64,7 +64,7 @@ Include:
    from the caller's perspective
 3. **Alternatives considered** — other approaches and why you prefer this
    one
-4. **Scope** — does it affect `rgpu`, `samp-app`, or both?
+4. **Scope** — does it affect `rgpu`, `phoenix`, or both?
 
 ### General rules
 - Search for duplicates before opening a new issue
@@ -105,7 +105,6 @@ sections:
 - [ ] `cargo test` passes
 - [ ] Lines ≤ 80 columns
 - [ ] No new `unsafe` without a safety comment
-- [ ] If the change touches `samp-app` or `samp-app-noext`, consider
-      whether the sibling app needs the same fix (they share structure
-      and bugs tend to appear in both)
+- [ ] If the change touches `phoenix`, consider whether other demo apps or
+   shared crates need the same fix.
 - [ ] AI assistance disclosed if applicable
