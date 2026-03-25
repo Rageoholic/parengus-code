@@ -230,6 +230,8 @@ struct CliArgs {
     /// Cap Vulkan instance API version to 1.0 and force extension
     /// code paths for all device features. Useful for testing
     /// pre-1.3 / pre-1.1 fallback paths.
+    ///
+    /// **Currently broken.**
     #[arg(long)]
     vk_strict_config: bool,
 
