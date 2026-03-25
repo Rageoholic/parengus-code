@@ -37,4 +37,5 @@ manual binding annotations.
 ## Outcome
 
 When complete, the engine can use Slang-produced metadata for shader
-resource layout so PBR and other features can proceed without PSIR.
+resource layout so Blinn-Phong (t022), later PBR (t003), and other
+features can proceed without PSIR.

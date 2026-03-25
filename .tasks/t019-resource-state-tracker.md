@@ -17,9 +17,9 @@ The renderer needs to track the Vulkan state of every image and
 buffer — owning queue family and image layout — to insert correct
 barriers and queue-family ownership transfers at submit boundaries.
 
-PBR shading (t003) depends on this tracker: a correct shading
-pipeline requires reliable resource state management before
-recording draw commands.
+Near-term shading work (t022 Blinn-Phong baseline) and follow-up
+PBR work (t003) both depend on reliable resource state management
+before recording draw commands.
 
 ## Goal
 

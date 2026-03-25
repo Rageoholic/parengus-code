@@ -1,19 +1,14 @@
 ---
 id: t003
 title: "Implement PBR shading"
-status: blocked
+status: planned
 created: 2026-03-14
-updated: 2026-03-16
+updated: 2026-03-24
 parent: null
 children: []
 depends_on:
-  - t019
-  - t020
-  - t021
-blocked_by:
-  - t019
-  - t020
-  - t021
+  - t022
+blocked_by: []
 area: phoenix
 ---
 
@@ -23,10 +18,16 @@ Phoenix currently renders geometry with a placeholder material
 model. PBR (Physically Based Rendering) is the target shading
 model per the GDD (`private/docs/PHOENIX_GDD.md`).
 
+As of 2026-03-24, this work is explicitly deferred while a
+LearnOpenGL-style Blinn-Phong baseline is implemented first (t022).
+
 ## Goal
 
 Phoenix renders objects using a PBR material model (metallic-
 roughness workflow) with at minimum direct lighting support.
+
+This remains a follow-up milestone after the Blinn-Phong renderer
+baseline is complete.
 
 ## Plan
 
@@ -48,6 +49,9 @@ what the Khronos Duck asset already exercises. IBL can be deferred
 — direct lighting with a correct BRDF is a meaningful milestone
 on its own.
 
+Priority update: Blinn-Phong baseline task t022 now comes first for
+near-term engine progress; this task stays planned for later.
+
 Shader implementation targets PSIR (t001) — Slang is no longer
 in use. NOTE: PSIR work has been deferred for now; PBR will be
 implemented using the existing shader pipeline or a temporary
@@ -59,4 +63,4 @@ draw commands can be reliably recorded.
 
 ## Outcome
 
-(not yet filled — task is idea)
+(not yet filled — task is planned)
