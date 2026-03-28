@@ -10,13 +10,14 @@ struct CameraUbo
 [[vk::binding(0, 0)]]
 ConstantBuffer<CameraUbo> camera;
 
-// Set 1 — material: texture sampler, bound once at load time.
+// Set 1 — material: bindless texture array, bound once at load time.
 [[vk::binding(0, 1)]]
-Sampler2D tex;
+Sampler2D textures[16];
 
 struct PushConstants
 {
     VekMat4 model;
+    uint tex_idx;
 };
 
 [[vk::push_constant]]
@@ -54,5 +55,5 @@ VertexOutput vert_main(VertexInput input)
 [shader("fragment")]
 float4 frag_main(VertexOutput in_vert) : SV_Target
 {
-    return tex.Sample(in_vert.tex_coord);
+    return textures[push.tex_idx].Sample(in_vert.tex_coord);
 }

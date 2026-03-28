@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, path::PathBuf};
+use std::{fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,8 +48,7 @@ pub struct ManifestEntry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compile_args: Vec<String>,
     /// For mesh assets: texture references — role string → asset name.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub tex_refs: HashMap<String, String>,
+
     /// For image assets: target compressed format ("bc7", "rgba8", …).
     pub format: Option<String>,
     /// For image assets: colour space ("srgb", "linear").

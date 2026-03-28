@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::File,
     io::{BufWriter, Write as _},
     path::Path,
@@ -9,6 +10,7 @@ use asset_shared::{
     FileHeader, PMESH_MAGIC, SectionHeader, SectionKind, TexRole, VERSION,
     texture_id,
 };
+use path_slash::PathExt as _;
 
 // ── Vec3 helpers ──────────────────────────────────────────────────────────────
 
@@ -240,126 +242,392 @@ pub fn compile(
     asset_name: &str,
 ) -> Result<(), String> {
     // Look up this asset in the manifest
-    let entry = manifest
+    let _entry = manifest
         .asset
         .iter()
         .find(|a| a.name == asset_name)
         .ok_or_else(|| format!("asset '{asset_name}' not found in manifest"))?;
-
-    // 1-2. Import glTF, pick first mesh/primitive
+    // 1-2. Import glTF and prepare to traverse scene nodes for all
+    // meshes/primitives. We'll concatenate vertex/index data from
+    // all primitives and emit per-submesh metadata sections.
     let (doc, buffers, _images) =
         gltf::import(src).map_err(|e| format!("{e}"))?;
-    let prim = doc
-        .meshes()
-        .next()
-        .ok_or("glTF has no meshes")?
-        .primitives()
-        .next()
-        .ok_or("mesh has no primitives")?;
-    let reader = prim.reader(|buf| Some(&buffers[buf.index()]));
 
-    // 3. Positions — Y-up → Z-up
-    let positions: Vec<[f32; 3]> = reader
-        .read_positions()
-        .ok_or("primitive has no POSITION")?
-        .map(yup_to_zup)
+    // Accumulators for concatenating vertex/index data
+    let mut positions_all: Vec<[f32; 3]> = Vec::new();
+    let mut normals_all: Vec<[f32; 3]> = Vec::new();
+    let mut tangents_all: Vec<[f32; 4]> = Vec::new();
+    let mut tex0_all: Vec<[f32; 2]> = Vec::new();
+    let mut tex1_all: Vec<[f32; 2]> = Vec::new();
+    let mut indices_all: Vec<u32> = Vec::new();
+
+    // Sub-mesh table entries: (translation[3], rotation[4], scale[3],
+    // index_base u32, index_count u32)
+    let mut submeshes_raw: Vec<u8> = Vec::new();
+    // Per-submesh albedo TextureId (u64 little-endian), parallel to
+    // submeshes_raw.
+    let mut sub_albedos_raw: Vec<u8> = Vec::new();
+
+    // Material data array: 14 f32 = 56 bytes per material entry
+    let mut material_data_raw: Vec<u8> = Vec::new();
+
+    // Reverse map: image URI (forward-slash, relative to assets/) → asset name
+    // Built from manifest image entries for URI → asset_name lookup.
+    let img_uri_to_asset: HashMap<String, String> = manifest
+        .asset
+        .iter()
+        .filter(|e| e.asset_type == AssetType::Image)
+        .map(|e| (e.file.to_slash_lossy().into_owned(), e.name.clone()))
         .collect();
 
-    // 4. Normals (optional) — generate if absent
-    let maybe_normals: Option<Vec<[f32; 3]>> =
-        reader.read_normals().map(|it| it.map(yup_to_zup).collect());
+    // Global derived tex_refs (role -> asset name) collected across
+    // all materials in the glTF. We dedupe by role: first occurrence wins.
+    let mut derived_texrefs: HashMap<String, String> = HashMap::new();
 
-    // 5. Tangents (optional) — generate if absent
-    let maybe_tangents: Option<Vec<[f32; 4]>> =
-        reader.read_tangents().map(|it| {
-            it.map(|t| {
-                let xyz = yup_to_zup([t[0], t[1], t[2]]);
-                [xyz[0], xyz[1], xyz[2], t[3]]
-            })
-            .collect()
-        });
+    // Helper: write f32 slice into raw vec
+    let push_f32 = |raw: &mut Vec<u8>, v: &[f32]| {
+        for f in v {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+    };
 
-    // 6. TEXCOORD_0
-    let tex_coords: Vec<[f32; 2]> = reader
-        .read_tex_coords(0)
-        .ok_or("primitive has no TEXCOORD_0")?
-        .into_f32()
-        .collect();
+    // Column-major 4×4 multiply: r[col][row] = Σ_k a[k][row] * b[col][k]
+    fn mat_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+        let mut r = [[0.0f32; 4]; 4];
+        for col in 0..4 {
+            for row in 0..4 {
+                let mut s = 0.0f32;
+                for k in 0..4 {
+                    s += a[k][row] * b[col][k];
+                }
+                r[col][row] = s;
+            }
+        }
+        r
+    }
 
-    // 7. TEXCOORD_1 (optional)
-    let tex_coords1: Option<Vec<[f32; 2]>> =
-        reader.read_tex_coords(1).map(|it| it.into_f32().collect());
+    // Length of the 3-component vector in column `col` of a 4×4
+    // column-major matrix.
+    fn col_length(col: &[f32; 4]) -> f32 {
+        (col[0] * col[0] + col[1] * col[1] + col[2] * col[2]).sqrt()
+    }
 
-    // 8. Indices → u32 internally; choose u16/u32 for output
-    let indices: Vec<u32> = reader
-        .read_indices()
-        .ok_or("primitive has no indices")?
-        .into_u32()
-        .collect();
+    // Convert a column-major 3×3 rotation matrix (r[col][row]) to
+    // a quaternion [x, y, z, w] using Shepperd's method.
+    fn rot_mat_to_quat(r: [[f32; 3]; 3]) -> [f32; 4] {
+        let (r00, r10, r20) = (r[0][0], r[0][1], r[0][2]);
+        let (r01, r11, r21) = (r[1][0], r[1][1], r[1][2]);
+        let (r02, r12, r22) = (r[2][0], r[2][1], r[2][2]);
+        let trace = r00 + r11 + r22;
+        let (x, y, z, w);
+        if trace > 0.0 {
+            let s = 0.5 / (trace + 1.0).sqrt();
+            w = 0.25 / s;
+            x = (r21 - r12) * s;
+            y = (r02 - r20) * s;
+            z = (r10 - r01) * s;
+        } else if r00 > r11 && r00 > r22 {
+            let s = 2.0 * (1.0 + r00 - r11 - r22).sqrt();
+            w = (r21 - r12) / s;
+            x = 0.25 * s;
+            y = (r01 + r10) / s;
+            z = (r02 + r20) / s;
+        } else if r11 > r22 {
+            let s = 2.0 * (1.0 + r11 - r00 - r22).sqrt();
+            w = (r02 - r20) / s;
+            x = (r01 + r10) / s;
+            y = 0.25 * s;
+            z = (r12 + r21) / s;
+        } else {
+            let s = 2.0 * (1.0 + r22 - r00 - r11).sqrt();
+            w = (r10 - r01) / s;
+            x = (r02 + r20) / s;
+            y = (r12 + r21) / s;
+            z = 0.25 * s;
+        }
+        [x, y, z, w]
+    }
 
-    // Generate normals / tangents if absent
-    let normals =
-        maybe_normals.unwrap_or_else(|| gen_normals(&positions, &indices));
-    let tangents = maybe_tangents.unwrap_or_else(|| {
-        gen_tangents(&positions, &normals, &tex_coords, &indices)
-    });
+    // Traverse nodes depth-first, composing world matrices and
+    // extracting primitives.
+    let scene = doc.scenes().next().ok_or("glTF has no scenes")?;
+
+    // Stack: (node, world_matrix)
+    let mut stack: Vec<(gltf::Node, [[f32; 4]; 4])> = Vec::new();
+    for root in scene.nodes() {
+        // root.transform().matrix() is available
+        let m = root.transform().matrix();
+        stack.push((root, m));
+    }
+
+    while let Some((node, world_m)) = stack.pop() {
+        // push children with composed matrix
+        for child in node.children() {
+            let cm = child.transform().matrix();
+            let composed = mat_mul(world_m, cm);
+            stack.push((child, composed));
+        }
+
+        if let Some(mesh) = node.mesh() {
+            for prim in mesh.primitives() {
+                let reader = prim.reader(|buf| Some(&buffers[buf.index()]));
+
+                // Positions — Y-up → Z-up (do not bake node transform)
+                let prim_positions: Vec<[f32; 3]> = reader
+                    .read_positions()
+                    .ok_or("primitive has no POSITION")?
+                    .map(yup_to_zup)
+                    .collect();
+
+                // Normals (optional) — generate if absent
+                let maybe_normals: Option<Vec<[f32; 3]>> = reader
+                    .read_normals()
+                    .map(|it| it.map(yup_to_zup).collect());
+
+                // Tangents (optional) — generate if absent
+                let maybe_tangents: Option<Vec<[f32; 4]>> =
+                    reader.read_tangents().map(|it| {
+                        it.map(|t| {
+                            let xyz = yup_to_zup([t[0], t[1], t[2]]);
+                            [xyz[0], xyz[1], xyz[2], t[3]]
+                        })
+                        .collect()
+                    });
+
+                // TEXCOORD_0
+                let prim_tex0: Vec<[f32; 2]> = reader
+                    .read_tex_coords(0)
+                    .ok_or("primitive has no TEXCOORD_0")?
+                    .into_f32()
+                    .collect();
+
+                // TEXCOORD_1 (optional)
+                let prim_tex1: Option<Vec<[f32; 2]>> =
+                    reader.read_tex_coords(1).map(|it| it.into_f32().collect());
+
+                // Indices → u32 internally
+                let prim_indices: Vec<u32> = reader
+                    .read_indices()
+                    .ok_or("primitive has no indices")?
+                    .into_u32()
+                    .collect();
+
+                // Generate missing normals/tangents per-primitive
+                let prim_normals = maybe_normals.unwrap_or_else(|| {
+                    gen_normals(&prim_positions, &prim_indices)
+                });
+                let prim_tangents = maybe_tangents.unwrap_or_else(|| {
+                    gen_tangents(
+                        &prim_positions,
+                        &prim_normals,
+                        &prim_tex0,
+                        &prim_indices,
+                    )
+                });
+
+                // Record base offsets
+                let vertex_base = positions_all.len() as u32;
+                let index_base = indices_all.len() as u32;
+
+                // Append vertex attributes
+                positions_all.extend_from_slice(&prim_positions);
+                normals_all.extend_from_slice(&prim_normals);
+                tangents_all.extend_from_slice(&prim_tangents);
+                tex0_all.extend_from_slice(&prim_tex0);
+                if let Some(t1) = prim_tex1 {
+                    tex1_all.extend_from_slice(&t1);
+                }
+
+                // Append indices with offset
+                indices_all
+                    .extend(prim_indices.iter().map(|&i| i + vertex_base));
+
+                // Extract translation from column 3 (column-major).
+                let translation_yup =
+                    [world_m[3][0], world_m[3][1], world_m[3][2]];
+                let translation = yup_to_zup(translation_yup);
+
+                // Scale = length of each upper-3×3 column in Y-up
+                // space. Under Rx(+90°), scale_x stays with col0,
+                // scale_y (Z-up Y) comes from col2, scale_z (Z-up Z)
+                // comes from col1.
+                let sx = col_length(&world_m[0]);
+                let sy = col_length(&world_m[2]);
+                let sz = col_length(&world_m[1]);
+
+                // Build the Z-up column vectors (without scale) and
+                // convert to a rotation quaternion.
+                let safe_div = |v: f32, s: f32| {
+                    if s > 1e-10 { v / s } else { 0.0f32 }
+                };
+                let c0 =
+                    yup_to_zup([world_m[0][0], world_m[0][1], world_m[0][2]]);
+                let c1 = yup_to_zup([
+                    -world_m[2][0],
+                    -world_m[2][1],
+                    -world_m[2][2],
+                ]);
+                let c2 =
+                    yup_to_zup([world_m[1][0], world_m[1][1], world_m[1][2]]);
+                let r3 = [
+                    [
+                        safe_div(c0[0], sx),
+                        safe_div(c0[1], sx),
+                        safe_div(c0[2], sx),
+                    ],
+                    [
+                        safe_div(c1[0], sy),
+                        safe_div(c1[1], sy),
+                        safe_div(c1[2], sy),
+                    ],
+                    [
+                        safe_div(c2[0], sz),
+                        safe_div(c2[1], sz),
+                        safe_div(c2[2], sz),
+                    ],
+                ];
+                let rotation = rot_mat_to_quat(r3);
+                let scale = [sx, sy, sz];
+
+                push_f32(&mut submeshes_raw, &translation);
+                push_f32(&mut submeshes_raw, &rotation);
+                push_f32(&mut submeshes_raw, &scale);
+                submeshes_raw.extend_from_slice(&index_base.to_le_bytes());
+                let idx_count = (indices_all.len() as u32) - index_base;
+                submeshes_raw.extend_from_slice(&idx_count.to_le_bytes());
+
+                // Material constants (14 f32s)
+                let mut mat_consts = [0.0f32; 14];
+                let material = prim.material();
+                let pbr = material.pbr_metallic_roughness();
+                let base = pbr.base_color_factor();
+                mat_consts[0] = base[0];
+                mat_consts[1] = base[1];
+                mat_consts[2] = base[2];
+                mat_consts[3] = base[3];
+                let em = material.emissive_factor();
+                mat_consts[4] = em[0];
+                mat_consts[5] = em[1];
+                mat_consts[6] = em[2];
+                mat_consts[8] = pbr.metallic_factor();
+                mat_consts[9] = pbr.roughness_factor();
+                push_f32(&mut material_data_raw, &mat_consts);
+
+                // Derive tex_refs by matching glTF image URIs to manifest.
+                let uri_of = |tex: gltf::Texture| -> Option<String> {
+                    match tex.source().source() {
+                        gltf::image::Source::Uri { uri, .. } => {
+                            Some(uri.to_string())
+                        }
+                        gltf::image::Source::View { .. } => None,
+                    }
+                };
+                let slots: &[(&str, Option<String>)] = &[
+                    (
+                        "albedo",
+                        pbr.base_color_texture()
+                            .and_then(|t| uri_of(t.texture())),
+                    ),
+                    (
+                        "normal",
+                        material
+                            .normal_texture()
+                            .and_then(|t| uri_of(t.texture())),
+                    ),
+                    (
+                        "metallic-roughness",
+                        pbr.metallic_roughness_texture()
+                            .and_then(|t| uri_of(t.texture())),
+                    ),
+                    (
+                        "emissive",
+                        material
+                            .emissive_texture()
+                            .and_then(|t| uri_of(t.texture())),
+                    ),
+                    (
+                        "occlusion",
+                        material
+                            .occlusion_texture()
+                            .and_then(|t| uri_of(t.texture())),
+                    ),
+                ];
+                for (role, uri_opt) in slots {
+                    let Some(uri) = uri_opt else { continue };
+                    let Some(name) = img_uri_to_asset.get(uri.as_str()) else {
+                        continue;
+                    };
+                    derived_texrefs
+                        .entry(role.to_string())
+                        .or_insert_with(|| name.clone());
+                }
+
+                // Per-submesh albedo: look up the albedo URI and hash
+                // it to a TextureId, or emit 0 if no albedo is present.
+                let albedo_id: u64 = pbr
+                    .base_color_texture()
+                    .and_then(|t| uri_of(t.texture()))
+                    .and_then(|uri| img_uri_to_asset.get(&uri))
+                    .map(|name| texture_id(name).0)
+                    .unwrap_or(0);
+                sub_albedos_raw.extend_from_slice(&albedo_id.to_le_bytes());
+            }
+        }
+    }
 
     // ── Build sections ────────────────────────────────────────────────────────
 
-    let n_verts = positions.len() as u32;
-    let n_idx = indices.len() as u32;
+    let n_verts = positions_all.len() as u32;
+    let n_idx = indices_all.len() as u32;
 
     let mut sections: Vec<Section> = vec![
         lz4_section(
             SectionKind::MeshPositions,
             n_verts,
-            encode_f32s(&positions),
+            encode_f32s(&positions_all),
         ),
-        lz4_section(SectionKind::MeshNormals, n_verts, encode_f32s(&normals)),
-        lz4_section(SectionKind::MeshTangents, n_verts, encode_f32s(&tangents)),
+        lz4_section(
+            SectionKind::MeshNormals,
+            n_verts,
+            encode_f32s(&normals_all),
+        ),
+        lz4_section(
+            SectionKind::MeshTangents,
+            n_verts,
+            encode_f32s(&tangents_all),
+        ),
         lz4_section(
             SectionKind::MeshTexCoord0,
             n_verts,
-            encode_f32s(&tex_coords),
+            encode_f32s(&tex0_all),
         ),
     ];
 
-    if let Some(ref tc1) = tex_coords1 {
+    if !tex1_all.is_empty() {
         sections.push(lz4_section(
             SectionKind::MeshTexCoord1,
             n_verts,
-            encode_f32s(tc1),
+            encode_f32s(&tex1_all),
         ));
     }
 
     // Index section — u16 if all indices fit, else u32
-    let max_idx = indices.iter().copied().max().unwrap_or(0);
+    let max_idx = indices_all.iter().copied().max().unwrap_or(0);
     if max_idx <= u16::MAX as u32 {
-        let raw: Vec<u8> = indices
+        let raw: Vec<u8> = indices_all
             .iter()
             .flat_map(|&i| (i as u16).to_le_bytes())
             .collect();
         sections.push(lz4_section(SectionKind::MeshIndices16, n_idx, raw));
     } else {
         let raw: Vec<u8> =
-            indices.iter().flat_map(|&i| i.to_le_bytes()).collect();
+            indices_all.iter().flat_map(|&i| i.to_le_bytes()).collect();
         sections.push(lz4_section(SectionKind::MeshIndices32, n_idx, raw));
     }
-
-    // TexRef section — (role: u32 LE, asset_id: u64 LE) per entry
-    if !entry.tex_refs.is_empty() {
-        let mut data = Vec::with_capacity(entry.tex_refs.len() * 12);
-        for (role_str, tex_name) in &entry.tex_refs {
-            // Validate the named asset exists as an image
-            let valid = manifest.asset.iter().any(|a| {
-                a.name == *tex_name && a.asset_type == AssetType::Image
-            });
-            if !valid {
-                return Err(format!(
-                    "tex_ref '{tex_name}': not found in manifest \
-                     or not an image"
-                ));
-            }
+    // TexRef section — emit derived global texture refs (deduped)
+    if !derived_texrefs.is_empty() {
+        let mut data = Vec::with_capacity(derived_texrefs.len() * 12);
+        for (role_str, tex_name) in &derived_texrefs {
             let role = role_from_str(role_str)?;
             let id = texture_id(tex_name).0;
             data.extend_from_slice(&role.to_u32().to_le_bytes());
@@ -367,8 +635,31 @@ pub fn compile(
         }
         sections.push(raw_section(
             SectionKind::MeshTexRef,
-            entry.tex_refs.len() as u32,
+            derived_texrefs.len() as u32,
             data,
+        ));
+    }
+
+    // Emit SubMeshTable and MeshMaterialData sections if present
+    if !submeshes_raw.is_empty() {
+        sections.push(raw_section(
+            SectionKind::MeshSubMeshTable,
+            (submeshes_raw.len() / (3 * 4 + 4 * 4 + 3 * 4 + 4 + 4)) as u32,
+            submeshes_raw,
+        ));
+    }
+    if !sub_albedos_raw.is_empty() {
+        sections.push(raw_section(
+            SectionKind::MeshSubMeshAlbedo,
+            (sub_albedos_raw.len() / 8) as u32,
+            sub_albedos_raw,
+        ));
+    }
+    if !material_data_raw.is_empty() {
+        sections.push(raw_section(
+            SectionKind::MeshMaterialData,
+            (material_data_raw.len() / 56) as u32,
+            material_data_raw,
         ));
     }
 

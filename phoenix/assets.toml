@@ -13,3 +13,91 @@ type = "mesh"
 [[asset]]
 name = "duck-albedo"
 type = "image"
+
+[[asset]]
+name = "damaged-helmet"
+type = "mesh"
+
+[[asset]]
+name = "dh-albedo"
+type = "image"
+
+[[asset]]
+name = "dh-ao"
+type = "image"
+
+[[asset]]
+name = "dh-normal"
+type = "image"
+
+[[asset]]
+name = "dh-emissive"
+type = "image"
+
+[[asset]]
+name = "dh-metal-rough"
+type = "image"
+
+[[asset]]
+name = "flight-helmet"
+type = "mesh"
+
+[[asset]]
+name = "fh-rubber-normal"
+type = "image"
+
+[[asset]]
+name = "fh-rubber-orm"
+type = "image"
+
+[[asset]]
+name = "fh-rubber-albedo"
+type = "image"
+
+[[asset]]
+name = "fh-glass-normal"
+type = "image"
+
+[[asset]]
+name = "fh-glass-orm"
+type = "image"
+
+[[asset]]
+name = "fh-glass-albedo"
+type = "image"
+
+[[asset]]
+name = "fh-metal-normal"
+type = "image"
+
+[[asset]]
+name = "fh-metal-orm"
+type = "image"
+
+[[asset]]
+name = "fh-metal-albedo"
+type = "image"
+
+[[asset]]
+name = "fh-leather-normal"
+type = "image"
+
+[[asset]]
+name = "fh-leather-orm"
+type = "image"
+
+[[asset]]
+name = "fh-leather-albedo"
+type = "image"
+
+[[asset]]
+name = "fh-lenses-normal"
+type = "image"
+
+[[asset]]
+name = "fh-lenses-orm"
+type = "image"
+
+[[asset]]
+name = "fh-lenses-albedo"
+type = "image"

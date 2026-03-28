@@ -13,3 +13,5 @@ clap = { version = "4", features = ["derive"] }
 path-slash = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "1.0"
+rayon = "1.9"
+num_cpus = "1.17"

@@ -31,7 +31,7 @@ type = "mesh"
 source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
 author = "Khronos Group"
 license = "CC-BY 4.0"
-tex_refs = { albedo = "duck-albedo" }
+
 
 [[asset]]
 name = "duck-albedo"
@@ -51,7 +51,7 @@ type = "mesh"
 source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
 author = "Khronos Group"
 license = "CC-BY 4.0"
-tex_refs = { albedo = "dh-albedo", ao = "dh-ao", normal = "dh-normal" }
+
 
 [[asset]]
 name = "dh-albedo"
@@ -79,7 +79,7 @@ license = "CC-BY 4.0"
 name = "dh-normal"
 file = "tex/Default_normal.jpg"
 type = "image"
-format = "bc7"
+format = "bc5"
 color_space = "linear"
 mips = true
 source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
@@ -107,6 +107,134 @@ mips = true
 source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
 author = "Khronos Group"
 license = "CC-BY 4.0"
+
+[[asset]]
+name = "flight-helmet"
+file = "FlightHelmet.gltf"
+type = "mesh"
+source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
+author = "Khronos Group"
+license = "CC-BY 4.0"
+
+[[asset]]
+name = "fh-rubber-normal"
+file = "tex/fh-rubber-normal.png"
+type = "image"
+format = "bc5"
+color_space = "linear"
+mips = true
+
+[[asset]]
+name = "fh-rubber-orm"
+file = "tex/fh-rubber-orm.png"
+type = "image"
+format = "bc7"
+color_space = "linear"
+mips = true
+
+[[asset]]
+name = "fh-rubber-albedo"
+file = "tex/fh-rubber-albedo.png"
+type = "image"
+format = "bc7"
+color_space = "srgb"
+mips = true
+
+[[asset]]
+name = "fh-glass-normal"
+file = "tex/fh-glass-normal.png"
+type = "image"
+format = "bc5"
+color_space = "linear"
+mips = true
+
+[[asset]]
+name = "fh-glass-orm"
+file = "tex/fh-glass-orm.png"
+type = "image"
+format = "bc7"
+color_space = "linear"
+mips = true
+
+[[asset]]
+name = "fh-glass-albedo"
+file = "tex/fh-glass-albedo.png"
+type = "image"
+format = "bc7"
+color_space = "srgb"
+mips = true
+
+[[asset]]
+name = "fh-metal-normal"
+file = "tex/fh-metal-normal.png"
+type = "image"
+format = "bc5"
+color_space = "linear"
+mips = true
+
+[[asset]]
+name = "fh-metal-orm"
+file = "tex/fh-metal-orm.png"
+type = "image"
+format = "bc7"
+color_space = "linear"
+mips = true
+
+[[asset]]
+name = "fh-metal-albedo"
+file = "tex/fh-metal-albedo.png"
+type = "image"
+format = "bc7"
+color_space = "srgb"
+mips = true
+
+[[asset]]
+name = "fh-leather-normal"
+file = "tex/fh-leather-normal.png"
+type = "image"
+format = "bc5"
+color_space = "linear"
+mips = true
+
+[[asset]]
+name = "fh-leather-orm"
+file = "tex/fh-leather-orm.png"
+type = "image"
+format = "bc7"
+color_space = "linear"
+mips = true
+
+[[asset]]
+name = "fh-leather-albedo"
+file = "tex/fh-leather-albedo.png"
+type = "image"
+format = "bc7"
+color_space = "srgb"
+mips = true
+
+[[asset]]
+name = "fh-lenses-normal"
+file = "tex/fh-lenses-normal.png"
+type = "image"
+format = "bc5"
+color_space = "linear"
+mips = true
+
+[[asset]]
+name = "fh-lenses-orm"
+file = "tex/fh-lenses-orm.png"
+type = "image"
+format = "bc7"
+color_space = "linear"
+mips = true
+
+[[asset]]
+name = "fh-lenses-albedo"
+file = "tex/fh-lenses-albedo.png"
+type = "image"
+format = "bc7"
+color_space = "srgb"
+mips = true
 
 [[asset]]
 name = "statue-tex"

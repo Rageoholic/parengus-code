@@ -7,6 +7,8 @@ use std::{
 use asset_pipeline::{AppAssets, AssetType, Manifest, ManifestEntry};
 use path_slash::PathBufExt as _;
 
+use crate::cache;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Serialized to `asset_map.toml` so that `asset-loader::AssetMap`
@@ -16,13 +18,13 @@ struct AssetMapFile {
     map: BTreeMap<String, String>,
 }
 
-/// Verify compiled assets exist in `dst_dir` for the given app,
-/// then write `asset_map.toml`.
+/// Copy compiled assets from the shared cache into `dst_dir` for the
+/// given app, then write `asset_map.toml`.
 ///
-/// Compiled file naming convention:
+/// Compiled file naming convention (in cache and in dst_dir):
 /// - Mesh   `{name}.pmesh`
 /// - Image  `{name}.ptex`
-/// - Shader uses `entry.file` (already `.spv`)
+/// - Shader uses `entry.file` extension (e.g. `.spv`)
 pub(crate) fn copy_assets(
     manifest_path: &Path,
     app_assets_path: &Path,
@@ -42,7 +44,6 @@ pub(crate) fn copy_assets(
     fs::create_dir_all(dst_dir)?;
 
     let mut map = BTreeMap::new();
-    let mut skipped = 0u32;
 
     for req in &app_assets.asset {
         let entry = index.get(req.name.as_str()).ok_or_else(|| {
@@ -57,14 +58,17 @@ pub(crate) fn copy_assets(
             .into());
         }
 
-        let compiled_name = match entry.asset_type {
-            AssetType::Mesh => {
-                format!("{}.pmesh", req.name)
+        let (compiled_name, cache_ext) = match entry.asset_type {
+            AssetType::Mesh => (format!("{}.pmesh", req.name), "pmesh"),
+            AssetType::Image => (format!("{}.ptex", req.name), "ptex"),
+            AssetType::Shader => {
+                let ext = entry
+                    .file
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("spv");
+                (entry.file.to_string_lossy().into_owned(), ext)
             }
-            AssetType::Image => {
-                format!("{}.ptex", req.name)
-            }
-            AssetType::Shader => entry.file.to_string_lossy().into_owned(),
             _ => {
                 return Err(format!(
                     "asset '{}': unsupported type '{}'",
@@ -74,20 +78,11 @@ pub(crate) fn copy_assets(
             }
         };
 
-        // The compiled asset is produced directly into `dst_dir` by the
-        // xtask compile steps. Treat existing files in `dst_dir` as
-        // present; we no longer copy from a separate compiled cache.
-        let src = dst_dir.join(&compiled_name);
-        if src.exists() {
-            skipped += 1;
-        } else {
-            return Err(format!(
-                "compiled asset missing: {} (expected in {})",
-                compiled_name,
-                dst_dir.display()
-            )
-            .into());
-        }
+        let src = cache::artifact_path(&req.name, cache_ext);
+        let dst = dst_dir.join(&compiled_name);
+        fs::copy(&src, &dst).map_err(|e| {
+            format!("failed to copy '{}' from cache: {e}", req.name)
+        })?;
 
         map.insert(req.name.clone(), compiled_name);
     }
@@ -102,6 +97,6 @@ pub(crate) fn copy_assets(
     };
     fs::write(dst_dir.join("asset_map.toml"), toml::to_string(&asset_map)?)?;
 
-    println!("Assets present: {skipped}");
+    println!("Assets copied: {}", app_assets.asset.len());
     Ok(())
 }

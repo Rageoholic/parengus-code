@@ -2,12 +2,12 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::{
-    cell::Cell, f32::consts::PI as PI32, fs, mem::size_of, sync::Arc,
-    time::Instant,
+    cell::Cell, collections::HashMap, f32::consts::PI as PI32, fs,
+    mem::size_of, sync::Arc, time::Instant,
 };
 
 use asset_loader::{AssetMap, MeshAsset, TexAsset};
-use asset_shared::{ColorSpace, TexFormat, TexRole, mesh_id, shader_id};
+use asset_shared::{ColorSpace, TexFormat, TextureId, mesh_id, shader_id};
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use parengus_tracing::{TracingLogLevel, init_default};
@@ -62,15 +62,33 @@ struct Ubo {
     view_proj: Mat4<f32>,
 }
 
-/// Push-constant block — model matrix.
+/// Push-constant block — model matrix + texture slot index.
 ///
-/// The model matrix changes per draw (the model rotates every frame)
-/// so it is supplied as a push constant: baked directly into the
-/// command buffer with no descriptor set update needed.
+/// Updated per submesh draw. model (64 B) + tex_idx (4 B) = 68 B
+/// total; visible to both vertex and fragment stages.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct PushConstants {
     model: Mat4<f32>,
+    tex_idx: u32,
+}
+
+/// Per-submesh draw record built at load time from SubMeshInfo.
+#[derive(Debug)]
+struct SubmeshDraw {
+    first_index: u32,
+    index_count: u32,
+    /// Vertex base offset into the combined vertex buffer for this
+    /// mesh (passed as the `vertex_offset` parameter of
+    /// `vkCmdDrawIndexed`).
+    vertex_offset: i32,
+    /// Slot into the bindless texture array (widened to u32 at push
+    /// time).
+    tex_idx: u16,
+    /// Index into MODEL_SCALES / MODEL_OFFSETS.
+    model_idx: usize,
+    /// Pre-baked TRS from the glTF node, in Z-up space.
+    sub_trs: Mat4<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,51 +138,59 @@ fn look_at_rh(
     )
 }
 
-/// Build a right-handed perspective projection matrix for Vulkan's
-/// clip space (depth range [0, 1], Y axis pointing **down**).
+/// Build a right-handed infinite reversed-Z perspective projection
+/// matrix for Vulkan's clip space (depth range [0, 1], Y-down).
 ///
 /// - `fov_y`: vertical field of view in radians.
 /// - `aspect`: viewport width divided by height.
-/// - `near` / `far`: distances to the near and far clip planes
-///   (both positive, measured along the view direction).
+/// - `near`: distance to the near plane (positive).
 ///
-/// The camera is assumed to look down **−Z** in view space (see
-/// [`look_at_rh`]).
+/// Reversed-Z maps near → 1 and far → 0 (the far plane is at ∞).
+/// Pair with `GREATER_OR_EQUAL` depth compare and a 0.0 depth clear.
+/// This gives full float precision near the camera where it matters.
 ///
-/// Negates Y (col 1 = [0, −f, 0, 0]) to account for Vulkan's Y-down
-/// NDC convention, so world-space Y-up maps to screen top and CCW
-/// world-space winding stays CCW in framebuffer coordinates.
-fn perspective_rh_zo(
+/// Derivation: z_ndc = (A·z_view + B) / (−z_view). Boundary
+/// conditions near=1, far=0 as far→∞ yield A=0, B=near, so
+/// z_clip = near, w_clip = −z_view, z_ndc = near/−z_view.
+///
+/// Negates Y (col 1 = [0, −f, 0, 0]) for Vulkan's Y-down NDC.
+fn perspective_rh_zo_infinite_rev(
     fov_y: f32,
     aspect: f32,
     near: f32,
-    far: f32,
 ) -> Mat4<f32> {
-    // Focal length: distance from the image plane at which the
-    // vertical half-FOV spans exactly 1 unit.
     let f = 1.0 / (fov_y * 0.5).tan();
-
-    // Depth remapping coefficients for the [0, 1] range:
-    //   At z_view = -near → z_ndc = 0
-    //   At z_view = -far  → z_ndc = 1
-    // Derived from z_ndc = (A·z_view + B) / (-z_view) with the
-    // above boundary conditions:
-    //   A = far / (near - far)
-    //   B = far·near / (near - far)
-    let a = far / (near - far);
-    let b = far * near / (near - far);
-
-    // Column-major layout (vek convention, 16-scalar Mat4::new):
-    //   col 0 = [ f/aspect,  0,   0,  0 ]
-    //   col 1 = [ 0,       -f,   0,  0 ]
-    //   col 2 = [ 0,         0,   a, -1 ]  ← w_clip = -z_view
-    //   col 3 = [ 0,         0,   b,  0 ]
+    // col 0 = [ f/aspect,  0,    0,  0 ]
+    // col 1 = [ 0,        -f,    0,  0 ]  ← Y-down
+    // col 2 = [ 0,         0,    0, -1 ]  ← A=0; w_clip = -z_view
+    // col 3 = [ 0,         0, near,  0 ]  ← B=near
     Mat4::from_col_arrays([
         [f / aspect, 0.0, 0.0, 0.0],
         [0.0, -f, 0.0, 0.0],
-        [0.0, 0.0, a, -1.0],
-        [0.0, 0.0, b, 0.0],
+        [0.0, 0.0, 0.0, -1.0],
+        [0.0, 0.0, near, 0.0],
     ])
+}
+
+/// Build a TRS matrix from SubMeshInfo fields (Z-up, column-major).
+/// `r` = [x, y, z, w] quaternion (vek convention).
+#[rustfmt::skip]
+fn trs_to_mat4(t: [f32; 3], r: [f32; 4], s: [f32; 3]) -> Mat4<f32> {
+    let (x, y, z, w) = (r[0], r[1], r[2], r[3]);
+    let rot = Mat4::from_col_arrays([
+        [1.-2.*(y*y+z*z),    2.*(x*y+z*w),    2.*(x*z-y*w), 0.],
+        [   2.*(x*y-z*w), 1.-2.*(x*x+z*z),    2.*(y*z+x*w), 0.],
+        [   2.*(x*z+y*w),    2.*(y*z-x*w), 1.-2.*(x*x+y*y), 0.],
+        [             0.,              0.,               0.,  1.],
+    ]);
+    let scale = Mat4::from_col_arrays([
+        [s[0],  0.,   0.,  0.],
+        [  0., s[1],  0.,  0.],
+        [  0.,   0., s[2], 0.],
+        [  0.,   0.,   0., 1.],
+    ]);
+    let trans:Mat4<f32> = Mat4::translation_3d(Vec3::new(t[0], t[1], t[2]));
+    trans * rot * scale
 }
 
 /// Anti-aliasing mode selected via `--aa`.
@@ -429,6 +455,16 @@ enum App {
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+const MAX_BINDLESS_TEXTURES: usize = 16;
+/// World-space X offsets so the three models stand side-by-side.
+/// Per-model uniform scale. The three Khronos reference models have
+/// no shared scale convention; these factors compensate. Will be
+/// removed once custom assets with a consistent scale replace them.
+const MODEL_SCALES: [f32; 3] = [1.0, 1.0, 2.0];
+/// World-space X offsets placing the three models side-by-side.
+/// Temporary test-scene scaffolding; see MODEL_SCALES.
+const MODEL_OFFSETS: [[f32; 3]; 3] =
+    [[-3.0, 0.0, 0.0], [0.0, 0.0, 0.0], [3.0, 0.0, 0.0]];
 
 /// Depth format candidates tried in preference order.
 const DEPTH_FORMAT_CANDIDATES: &[vk::Format] = &[
@@ -548,7 +584,7 @@ struct RunningState {
     pipeline: DynamicPipeline,
     vertex_buffer: DeviceLocalBuffer,
     index_buffer: DeviceLocalBuffer,
-    index_count: u32,
+    submesh_draws: Vec<SubmeshDraw>,
     pipeline_color_format: vk::Format,
     command_pool: ResettableCommandPool,
     frames: Vec<FrameSync>,
@@ -571,7 +607,7 @@ struct RunningState {
     /// used to drive the rotation animation.
     start_time: Instant,
     asset_map: AssetMap,
-    texture: Texture,
+    textures: Vec<Texture>,
     sampler: Sampler,
 }
 
@@ -606,7 +642,7 @@ struct SuspendedState {
     pipeline: DynamicPipeline,
     vertex_buffer: DeviceLocalBuffer,
     index_buffer: DeviceLocalBuffer,
-    index_count: u32,
+    submesh_draws: Vec<SubmeshDraw>,
     pipeline_color_format: vk::Format,
     sample_count: vk::SampleCountFlags,
     command_pool: ResettableCommandPool,
@@ -621,7 +657,7 @@ struct SuspendedState {
     material_descriptor_set: DescriptorSet,
     start_time: Instant,
     asset_map: AssetMap,
-    texture: Texture,
+    textures: Vec<Texture>,
     sampler: Sampler,
 }
 #[derive(Debug)]
@@ -694,7 +730,7 @@ impl ApplicationHandler for AppRunner {
                 pipeline,
                 vertex_buffer,
                 index_buffer,
-                index_count,
+                submesh_draws,
                 pipeline_color_format,
                 command_pool,
                 frames,
@@ -709,7 +745,7 @@ impl ApplicationHandler for AppRunner {
                 material_descriptor_set,
                 start_time,
                 asset_map,
-                texture,
+                textures,
                 sampler,
             } = running_state;
 
@@ -729,7 +765,7 @@ impl ApplicationHandler for AppRunner {
                 pipeline,
                 vertex_buffer,
                 index_buffer,
-                index_count,
+                submesh_draws,
                 pipeline_color_format,
                 sample_count,
                 command_pool,
@@ -744,7 +780,7 @@ impl ApplicationHandler for AppRunner {
                 material_descriptor_set,
                 start_time,
                 asset_map,
-                texture,
+                textures,
                 sampler,
             });
         }
@@ -999,11 +1035,11 @@ impl AppRunner {
         let aspect = extent.width as f32 / extent.height as f32;
 
         let view = look_at_rh(
-            Vec3::new(0.0, 300.0, 220.0),
-            Vec3::new(0.0, 0.0, 87.0),
+            Vec3::new(0.0, 10.0, 5.0),
+            Vec3::new(0.0, 0.0, 0.5),
             Vec3::unit_z(),
         );
-        let proj = perspective_rh_zo(PI32 / 3.0, aspect, 1.0, 1000.0);
+        let proj = perspective_rh_zo_infinite_rev(PI32 / 3.0, aspect, 0.1);
         let ubo = Ubo {
             view_proj: proj * view,
         };
@@ -1014,10 +1050,6 @@ impl AppRunner {
         }
 
         const TAU32: f32 = PI32 * 2.0;
-        // Model — uploaded as a push constant each frame.
-        // Use Z-up right-handed coordinates: rotate around +Z axis.
-        let model = Mat4::<f32>::rotation_z(elapsed / 5.0 * TAU32);
-        let push = PushConstants { model };
 
         let pipeline_handle = state.pipeline.raw_pipeline();
         let frame_cmd = &mut frame_objs.command_buffer;
@@ -1110,7 +1142,7 @@ impl AppRunner {
         };
         let depth_clear = vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
-                depth: 1.0,
+                depth: 0.0,
                 stencil: 0,
             },
         };
@@ -1171,17 +1203,6 @@ impl AppRunner {
                 ],
             )
         };
-        // SAFETY: recording state; layout is compatible with the bound
-        // pipeline; VERTEX stage and offset 0 match the declared range;
-        // push is sized within the minimum 128-byte guarantee.
-        unsafe {
-            frame_cmd.push_constants(
-                &state.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                std::slice::from_ref(&push),
-            )
-        };
         // SAFETY: inside render pass recording; buffer is valid
         unsafe { frame_cmd.bind_vertex_buffer(0, &state.vertex_buffer, 0) };
 
@@ -1215,10 +1236,48 @@ impl AppRunner {
             )
         };
 
-        // Draw a rectangle using the index buffer.
-        // SAFETY: all required dynamic state has been set;
-        // render pass is active; index buffer is bound.
-        unsafe { frame_cmd.draw_indexed(state.index_count, 1, 0, 0, 0) };
+        // Per-submesh draw loop: push model+tex_idx, then indexed draw.
+        // SAFETY: all required dynamic state set; render pass active;
+        // vertex and index buffers bound; pipeline_layout compatible.
+        let rotation = Mat4::<f32>::rotation_z(elapsed / 5.0 * TAU32);
+        for draw in &state.submesh_draws {
+            let offset = MODEL_OFFSETS[draw.model_idx];
+            let scale = Mat4::<f32>::scaling_3d(Vec3::broadcast(
+                MODEL_SCALES[draw.model_idx],
+            ));
+            let placement = Mat4::<f32>::translation_3d(Vec3::new(
+                offset[0], offset[1], offset[2],
+            )) * rotation
+                * scale;
+            let push = PushConstants {
+                model: placement * draw.sub_trs,
+                tex_idx: draw.tex_idx as u32,
+            };
+            // SAFETY: layout compatible with bound pipeline; VERTEX|FRAGMENT
+            // stage and offset 0 match the declared range; push fits in the
+            // minimum 128-byte guarantee.
+            unsafe {
+                frame_cmd.push_constants(
+                    &state.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX
+                        | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    std::slice::from_ref(&push),
+                )
+            };
+            // SAFETY: dynamic state set; render pass active; vertex and
+            // index buffers bound; first_index + vertex_offset valid for
+            // this submesh within the combined buffer.
+            unsafe {
+                frame_cmd.draw_indexed(
+                    draw.index_count,
+                    1,
+                    draw.first_index,
+                    draw.vertex_offset,
+                    0,
+                )
+            };
+        }
 
         // SAFETY: inside a dynamic render pass.
         unsafe { frame_cmd.end_rendering() };
@@ -1341,6 +1400,7 @@ where
             stages: &[vert, frag],
             color_attachment_formats: &[color_format],
             depth_attachment_format: Some(depth_format),
+            depth_compare_op: vk::CompareOp::GREATER_OR_EQUAL,
             vertex_bindings: &vertex_bindings,
             vertex_attributes: &vertex_attributes,
             layout,
@@ -1410,88 +1470,149 @@ impl AppRunner {
 
         let assets_dir = state.self_dir.join("assets");
 
-        let duck_filename = asset_map
-            .get(mesh_id("duck"))
-            .ok_or_else(|| eyre::eyre!("asset 'duck' not in map"))?;
-        let duck = MeshAsset::open(&assets_dir.join(duck_filename))
-            .map_err(|e| eyre::eyre!("load duck mesh: {e}"))?;
-        let positions = duck
-            .positions()
-            .map_err(|e| eyre::eyre!("duck positions: {e}"))?;
-        let tex_coords = duck
-            .tex_coords0()
-            .map_err(|e| eyre::eyre!("duck tex_coords0: {e}"))?;
-        let scene_indices = duck
-            .indices()
-            .map_err(|e| eyre::eyre!("duck indices: {e}"))?;
-        let scene_vertices =
-            positions.zip(tex_coords).map(|(pos, tex_coords)| Vertex {
-                position: pos.into(),
-                tex_coord: tex_coords.into(),
-            });
-
-        let index_count = scene_indices.len() as u32;
-
-        let albedo_id = duck
-            .tex_refs
-            .iter()
-            .find(|(role, _)| *role == TexRole::Albedo)
-            .map(|(_, id)| *id)
-            .ok_or_else(|| eyre::eyre!("duck has no albedo tex_ref"))?;
-        let albedo_name = asset_map
-            .name_of(albedo_id)
-            .unwrap_or("duck-albedo")
-            .to_owned();
-        let albedo_filename = asset_map
-            .get(albedo_id)
-            .ok_or_else(|| eyre::eyre!("albedo asset not in map"))?;
-        let duck_tex = TexAsset::open(&assets_dir.join(albedo_filename))
-            .map_err(|e| eyre::eyre!("load {albedo_name}: {e}"))?;
-        let tex_width = duck_tex.info.width;
-        let tex_height = duck_tex.info.height;
-        let tex_format =
-            tex_vk_format(duck_tex.info.format, duck_tex.info.color_space);
-        let mip_count = duck_tex.info.mip_count as u32;
-
-        // Collect all mip levels into (data, byte_offset) pairs so we
-        // can allocate one contiguous staging buffer.
-        let mut mip_data: Vec<(Vec<u8>, usize)> = Vec::new();
-        let mut running_offset: usize = 0;
-        for mip_result in duck_tex.mips() {
-            let mip_iter = mip_result.map_err(|e| {
-                eyre::eyre!(
-                    "{albedo_name} mip \
-                    iter: {e}"
-                )
-            })?;
-            let data: Vec<u8> = mip_iter.map(|[b]| b).collect();
-            mip_data.push((data, running_offset));
-            running_offset += mip_data.last().unwrap().0.len();
+        // Load all three meshes into a combined vertex/index buffer.
+        // Textures are deduped by TextureId and loaded once per unique
+        // albedo; each SubmeshDraw stores the bindless slot index.
+        struct TexLoadInfo {
+            width: u32,
+            height: u32,
+            format: vk::Format,
+            mip_count: u32,
+            name: String,
+            mip_data: Vec<(Vec<u8>, usize)>,
+            total_bytes: usize,
         }
-        let total_tex_bytes = running_offset;
+
+        let mesh_names: [&str; 3] = ["duck", "damaged-helmet", "flight-helmet"];
+        let mut scene_vertices: Vec<Vertex> = Vec::new();
+        let mut scene_indices: Vec<u32> = Vec::new();
+        let mut submesh_draws: Vec<SubmeshDraw> = Vec::new();
+        let mut tex_id_to_slot: HashMap<u64, u16> = HashMap::new();
+        let mut tex_load_infos: Vec<TexLoadInfo> = Vec::new();
+
+        for (model_idx, &mesh_name) in mesh_names.iter().enumerate() {
+            let mesh_filename = asset_map
+                .get(mesh_id(mesh_name))
+                .ok_or_else(|| eyre::eyre!("asset '{mesh_name}' not in map"))?;
+            let mesh = MeshAsset::open(&assets_dir.join(mesh_filename))
+                .map_err(|e| eyre::eyre!("load {mesh_name} mesh: {e}"))?;
+
+            let vertex_offset = scene_vertices.len() as i32;
+            let index_offset = scene_indices.len() as u32;
+
+            let positions = mesh
+                .positions()
+                .map_err(|e| eyre::eyre!("{mesh_name} positions: {e}"))?;
+            let tex_coords = mesh
+                .tex_coords0()
+                .map_err(|e| eyre::eyre!("{mesh_name} tex_coords0: {e}"))?;
+            for (pos, tc) in positions.zip(tex_coords) {
+                scene_vertices.push(Vertex {
+                    position: pos.into(),
+                    tex_coord: tc.into(),
+                });
+            }
+
+            let indices_iter = mesh
+                .indices()
+                .map_err(|e| eyre::eyre!("{mesh_name} indices: {e}"))?;
+            scene_indices.extend(indices_iter);
+
+            for (sub_idx, sub) in mesh.sub_meshes.iter().enumerate() {
+                let albedo_id = mesh
+                    .sub_mesh_albedos
+                    .get(sub_idx)
+                    .copied()
+                    .unwrap_or(TextureId::from_hash(0));
+                if albedo_id.0 == 0 {
+                    continue;
+                }
+                let tex_slot = if let Some(&s) =
+                    tex_id_to_slot.get(&albedo_id.0)
+                {
+                    s
+                } else {
+                    if tex_load_infos.len() >= MAX_BINDLESS_TEXTURES {
+                        eyre::bail!(
+                            "too many unique albedo textures \
+                             (max {MAX_BINDLESS_TEXTURES})"
+                        );
+                    }
+                    let tex_name = asset_map
+                        .name_of(albedo_id)
+                        .unwrap_or("unknown")
+                        .to_owned();
+                    let tex_file =
+                        asset_map.get(albedo_id).ok_or_else(|| {
+                            eyre::eyre!("albedo '{tex_name}' not in asset map")
+                        })?;
+                    let tex_asset = TexAsset::open(&assets_dir.join(tex_file))
+                        .map_err(|e| eyre::eyre!("load {tex_name}: {e}"))?;
+                    let fmt = tex_vk_format(
+                        tex_asset.info.format,
+                        tex_asset.info.color_space,
+                    );
+                    let w = tex_asset.info.width;
+                    let h = tex_asset.info.height;
+                    let mc = tex_asset.info.mip_count as u32;
+                    let mut mip_data: Vec<(Vec<u8>, usize)> = Vec::new();
+                    let mut off: usize = 0;
+                    for mip_res in tex_asset.mips() {
+                        let mip_iter = mip_res
+                            .map_err(|e| eyre::eyre!("{tex_name} mip: {e}"))?;
+                        let data: Vec<u8> = mip_iter.map(|[b]| b).collect();
+                        mip_data.push((data, off));
+                        off += mip_data.last().unwrap().0.len();
+                    }
+                    let slot = tex_load_infos.len() as u16;
+                    tex_id_to_slot.insert(albedo_id.0, slot);
+                    tex_load_infos.push(TexLoadInfo {
+                        width: w,
+                        height: h,
+                        format: fmt,
+                        mip_count: mc,
+                        name: tex_name,
+                        mip_data,
+                        total_bytes: off,
+                    });
+                    slot
+                };
+                let sub_trs =
+                    trs_to_mat4(sub.translation, sub.rotation, sub.scale);
+                submesh_draws.push(SubmeshDraw {
+                    first_index: sub.index_base + index_offset,
+                    index_count: sub.index_count,
+                    vertex_offset,
+                    tex_idx: tex_slot,
+                    model_idx,
+                    sub_trs,
+                });
+            }
+        }
+
+        let max_mip_count = tex_load_infos
+            .iter()
+            .map(|t| t.mip_count)
+            .max()
+            .unwrap_or(1);
 
         let vertex_buffer_size =
             (scene_vertices.len() * size_of::<Vertex>()) as vk::DeviceSize;
-        // Create staging vertex buffer by streaming vertices through
-        // an iterator chain and initializing the buffer from the
-        // produced `u8` iterator. This avoids allocating an intermediate
-        // `Vec<Vertex>`.
-
         let mut staging_vertex_buffer = HostVisibleBuffer::new(
             &device,
             vertex_buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
-            Some("Vertex staging buffer"),
+            Some("vertex staging buffer"),
         )?;
-
-        staging_vertex_buffer.write_pod_iter_exact(scene_vertices)?;
+        staging_vertex_buffer
+            .write_pod_iter_exact(scene_vertices.into_iter())?;
 
         let mut vertex_buffer = DeviceLocalBuffer::new(
             &device,
             vertex_buffer_size,
             vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST,
-            Some("duck vertex buffer"),
+            Some("vertex buffer"),
         )?;
 
         let index_buffer_size =
@@ -1500,16 +1621,16 @@ impl AppRunner {
             &device,
             index_buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
-            Some("duck staging index buffer"),
+            Some("index staging buffer"),
         )?;
-        staging_index_buffer.write_pod_iter_exact(scene_indices)?;
+        staging_index_buffer.write_pod_iter_exact(scene_indices.into_iter())?;
 
         let mut index_buffer = DeviceLocalBuffer::new(
             &device,
             index_buffer_size,
             vk::BufferUsageFlags::INDEX_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST,
-            Some("duck index buffer"),
+            Some("index buffer"),
         )?;
 
         let upload_command_pool = ResettableCommandPool::new(
@@ -1608,13 +1729,15 @@ impl AppRunner {
             }],
             Some("camera set layout"),
         )?);
-        // Set 1: material — texture sampler, bound once at load time.
+        // Set 1: material — bindless texture array, bound once at load
+        // time. All MAX_BINDLESS_TEXTURES slots must be written before
+        // any draw call references them.
         let material_set_layout = Arc::new(DescriptorSetLayout::new(
             &device,
             &[DescriptorBindingDesc {
                 binding: 0,
                 descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                count: 1,
+                count: MAX_BINDLESS_TEXTURES as u32,
                 stage_flags: vk::ShaderStageFlags::FRAGMENT,
             }],
             Some("material set layout"),
@@ -1627,7 +1750,8 @@ impl AppRunner {
                 // PushConstants struct (model: Mat4 = 64 bytes),
                 // accessible from the vertex stage only.
                 push_constant_ranges: &[vk::PushConstantRange {
-                    stage_flags: vk::ShaderStageFlags::VERTEX,
+                    stage_flags: vk::ShaderStageFlags::VERTEX
+                        | vk::ShaderStageFlags::FRAGMENT,
                     offset: 0,
                     size: size_of::<PushConstants>() as u32,
                 }],
@@ -1734,6 +1858,7 @@ impl AppRunner {
             .collect::<Result<Vec<_>, _>>()?;
 
         // One camera set per frame + one material set = FIF + 1 total.
+        // The material set holds MAX_BINDLESS_TEXTURES sampler slots.
         let descriptor_pool = DescriptorPool::new(
             &device,
             (MAX_FRAMES_IN_FLIGHT + 1) as u32,
@@ -1744,7 +1869,7 @@ impl AppRunner {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    descriptor_count: 1,
+                    descriptor_count: MAX_BINDLESS_TEXTURES as u32,
                 },
             ],
             Some("descriptor pool"),
@@ -1779,33 +1904,11 @@ impl AppRunner {
             .expect("allocated exactly one material set");
         material_descriptor_set.set_name(&device, Some("material set"));
 
-        let tex_staging_name = format!("{albedo_name} staging");
-        let mut tex_staging = HostVisibleBuffer::new(
-            &device,
-            total_tex_bytes as vk::DeviceSize,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            Some(tex_staging_name.as_str()),
-        )?;
-        for (data, offset) in &mip_data {
-            tex_staging.write_pod_at(data.as_slice(), *offset)?;
-        }
-
-        let texture = rgpu_vk::image::Texture::new(
-            &device,
-            tex_width,
-            tex_height,
-            tex_format,
-            mip_count,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            Some(albedo_name.as_str()),
-        )?;
-
-        // Record all uploads into a single command buffer, then
-        // submit once and wait for completion before the staging
-        // buffers are dropped.
+        // Create one staging buffer + Texture per unique albedo, then
+        // record all copies into the shared upload command buffer.
         //
         // SAFETY: upload_cmd is in the recording state (begun above);
-        // all buffers remain alive until wait_idle below completes.
+        // all staging buffers remain alive until the fence wait below.
         unsafe {
             vertex_buffer
                 .record_upload_from(&mut upload_cmd, &staging_vertex_buffer)
@@ -1816,80 +1919,107 @@ impl AppRunner {
                 .record_upload_from(&mut upload_cmd, &staging_index_buffer)
         }?;
 
-        // Record a single synchronization2 image transition before any copies.
-        let layout_to_transfer = texture
-            .whole_image_barrier2()
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-            .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-        // SAFETY: recording state and handles valid.
-        unsafe {
-            upload_cmd.pipeline_barrier2_by_barriers(
-                &[],
-                &[],
-                std::slice::from_ref(&layout_to_transfer),
-            )
-        };
+        let mut tex_stagings: Vec<HostVisibleBuffer> = Vec::new();
+        let mut textures: Vec<Texture> = Vec::new();
 
-        let mut image_copy_regions = Vec::with_capacity(mip_data.len());
-
-        // Copy all mip levels.
-        // SAFETY: `upload_cmd` is recording; `texture` and `tex_staging`
-        // remain alive until after `device.wait_idle()` therefore
-        // every recorded copy is valid.
-        for (level, (_data, offset)) in mip_data.iter().enumerate() {
-            let level = level as u32;
-            let mip_w = (tex_width >> level).max(1);
-            let mip_h = (tex_height >> level).max(1);
-            let mip_extent = vk::Extent3D {
-                width: mip_w,
-                height: mip_h,
-                depth: 1,
+        for tli in &tex_load_infos {
+            let mut staging = HostVisibleBuffer::new(
+                &device,
+                tli.total_bytes as vk::DeviceSize,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                Some(&format!("{} staging", tli.name)),
+            )?;
+            for (data, offset) in &tli.mip_data {
+                staging.write_pod_at(data.as_slice(), *offset)?;
+            }
+            let texture = Texture::new(
+                &device,
+                tli.width,
+                tli.height,
+                tli.format,
+                tli.mip_count,
+                vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::SAMPLED,
+                Some(tli.name.as_str()),
+            )?;
+            // Transition: UNDEFINED → TRANSFER_DST_OPTIMAL.
+            let to_xfer = texture
+                .whole_image_barrier2()
+                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            // SAFETY: recording state; texture valid.
+            unsafe {
+                upload_cmd.pipeline_barrier2_by_barriers(
+                    &[],
+                    &[],
+                    std::slice::from_ref(&to_xfer),
+                )
             };
-
-            let mip_copy = texture.buffer_image_copy_for_mip(
-                *offset as u64,
-                level,
-                mip_extent,
-            );
-
-            image_copy_regions.push(mip_copy);
+            // Copy all mip levels from staging into the texture.
+            let mut regions = Vec::with_capacity(tli.mip_data.len());
+            for (level, (_data, off)) in tli.mip_data.iter().enumerate() {
+                let level = level as u32;
+                let mip_w = (tli.width >> level).max(1);
+                let mip_h = (tli.height >> level).max(1);
+                let extent = vk::Extent3D {
+                    width: mip_w,
+                    height: mip_h,
+                    depth: 1,
+                };
+                regions.push(texture.buffer_image_copy_for_mip(
+                    *off as u64,
+                    level,
+                    extent,
+                ));
+            }
+            // SAFETY: regions reference valid mip levels; staging and
+            // texture remain alive until fence wait below.
+            unsafe {
+                upload_cmd.copy_buffer_to_image(
+                    staging.raw_buffer(),
+                    texture.raw_image(),
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &regions,
+                )
+            };
+            // Release / transition to SHADER_READ_ONLY.
+            let to_shader = texture
+                .whole_image_barrier2()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(if dedicated_transfer {
+                    vk::PipelineStageFlags2::BOTTOM_OF_PIPE
+                } else {
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER
+                })
+                .dst_access_mask(if dedicated_transfer {
+                    vk::AccessFlags2::NONE
+                } else {
+                    vk::AccessFlags2::SHADER_READ
+                })
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(if dedicated_transfer {
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                } else {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                })
+                .src_queue_family_index(transfer_queue_family)
+                .dst_queue_family_index(graphics_queue_family);
+            // SAFETY: recording state and handles valid.
+            unsafe {
+                upload_cmd.pipeline_barrier2_by_barriers(
+                    &[],
+                    &[],
+                    std::slice::from_ref(&to_shader),
+                )
+            };
+            tex_stagings.push(staging);
+            textures.push(texture);
         }
-
-        // SAFETY: We know all these copies are to valid mip levels with valid
-        // regions and offsets in the buffer
-        unsafe {
-            upload_cmd.copy_buffer_to_image(
-                tex_staging.raw_buffer(),
-                texture.raw_image(),
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &image_copy_regions,
-            )
-        };
-
-        // Transition image to shader-readable at the end of the upload
-        // command buffer (single post-copy barrier).
-        let image_to_shader = texture
-            .whole_image_barrier2()
-            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(if dedicated_transfer {
-                vk::PipelineStageFlags2::BOTTOM_OF_PIPE
-            } else {
-                vk::PipelineStageFlags2::FRAGMENT_SHADER
-            })
-            .dst_access_mask(if dedicated_transfer {
-                vk::AccessFlags2::NONE
-            } else {
-                vk::AccessFlags2::SHADER_READ
-            })
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_queue_family_index(transfer_queue_family)
-            .dst_queue_family_index(graphics_queue_family);
 
         let mut buffer_barriers = Vec::new();
         if queue_config.dedicated_transfer {
@@ -1911,14 +2041,17 @@ impl AppRunner {
 
             buffer_barriers = vec![vertex_buffer_barrier, index_buffer_barrier];
         }
-        // SAFETY: recording state and handles valid.
-        unsafe {
-            upload_cmd.pipeline_barrier2_by_barriers(
-                &[],
-                &buffer_barriers,
-                std::slice::from_ref(&image_to_shader),
-            )
-        };
+        if !buffer_barriers.is_empty() {
+            // SAFETY: recording state; buffer handles valid for the
+            // duration of this command buffer.
+            unsafe {
+                upload_cmd.pipeline_barrier2_by_barriers(
+                    &[],
+                    &buffer_barriers,
+                    &[],
+                )
+            };
+        }
 
         upload_cmd.end()?;
 
@@ -1949,18 +2082,25 @@ impl AppRunner {
                 .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_INPUT)
                 .src_queue_family_index(transfer_family)
                 .dst_queue_family_index(graphics_family);
-            let img_barrier = texture
-                .whole_image_barrier2()
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(transfer_family)
-                .dst_queue_family_index(graphics_family);
+            // Acquire all textures on the graphics queue and
+            // transition each from TRANSFER_DST to SHADER_READ_ONLY.
+            let img_barriers: Vec<_> = textures
+                .iter()
+                .map(|tex| {
+                    tex.whole_image_barrier2()
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .dst_stage_mask(
+                            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                        )
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_queue_family_index(transfer_family)
+                        .dst_queue_family_index(graphics_family)
+                })
+                .collect();
 
             let buffer_barriers = [vb_barrier, ib_barrier];
-            let img_barriers = [img_barrier];
             // SAFETY: recording state and handles valid.
             unsafe {
                 graphics_upload_cmd.pipeline_barrier2_by_barriers(
@@ -2065,17 +2205,35 @@ impl AppRunner {
             vk::Filter::LINEAR,
             vk::Filter::LINEAR,
             vk::SamplerAddressMode::CLAMP_TO_EDGE,
-            mip_count,
-            Some("duck-tex sampler"),
+            max_mip_count,
+            Some("albedo sampler"),
         )?;
 
-        // SAFETY: texture and sampler live in RunningState /
-        // SuspendedState and outlive any command buffer that
-        // references this descriptor set.
-        unsafe {
-            material_descriptor_set
-                .write_texture_sampler(&device, 0, &texture, &sampler)
-        };
+        // Write all loaded textures into the bindless descriptor array.
+        // Fill unused trailing slots with slot 0 so every descriptor
+        // in the fixed-size array is valid (Vulkan requires this without
+        // VK_EXT_descriptor_indexing PARTIALLY_BOUND).
+        let fallback_view = textures[0].raw_image_view();
+        for slot in 0..MAX_BINDLESS_TEXTURES {
+            let view = textures
+                .get(slot)
+                .map(|t| t.raw_image_view())
+                .unwrap_or(fallback_view);
+            // SAFETY: textures and sampler live in RunningState /
+            // SuspendedState and outlive any command buffer that
+            // references this descriptor set; images are in
+            // SHADER_READ_ONLY_OPTIMAL after the upload fence wait.
+            unsafe {
+                material_descriptor_set.write_combined_image_sampler(
+                    &device,
+                    0,
+                    slot as u32,
+                    view,
+                    sampler.raw_sampler(),
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                )
+            };
+        }
 
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
         let idle_guard =
@@ -2096,7 +2254,7 @@ impl AppRunner {
             pipeline,
             vertex_buffer,
             index_buffer,
-            index_count,
+            submesh_draws,
             pipeline_color_format,
             command_pool,
             frames,
@@ -2111,7 +2269,7 @@ impl AppRunner {
             material_descriptor_set,
             start_time: Instant::now(),
             asset_map,
-            texture,
+            textures,
             sampler,
         })
     }
@@ -2249,7 +2407,7 @@ impl AppRunner {
             pipeline,
             vertex_buffer: state.vertex_buffer,
             index_buffer: state.index_buffer,
-            index_count: state.index_count,
+            submesh_draws: state.submesh_draws,
             pipeline_color_format,
             command_pool: state.command_pool,
             frames: state.frames,
@@ -2264,7 +2422,7 @@ impl AppRunner {
             material_descriptor_set: state.material_descriptor_set,
             start_time: state.start_time,
             asset_map: state.asset_map,
-            texture: state.texture,
+            textures: state.textures,
             sampler: state.sampler,
         })
     }

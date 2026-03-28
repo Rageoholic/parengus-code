@@ -128,6 +128,18 @@ pub struct MeshAsset {
     file: fs::File,
     sections: Vec<SectionHeader>,
     pub tex_refs: Vec<(TexRole, TextureId)>,
+    pub sub_meshes: Vec<SubMeshInfo>,
+    pub sub_mesh_albedos: Vec<TextureId>,
+    pub material_data: Vec<[f32; 14]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubMeshInfo {
+    pub translation: [f32; 3],
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
+    pub index_base: u32,
+    pub index_count: u32,
 }
 
 // Read chunk size for SectionElemIter I/O (both paths).
@@ -472,10 +484,104 @@ impl MeshAsset {
             Vec::new()
         };
 
+        // Decode SubMeshTable (48B per entry): translation(3f32),
+        // rotation(4f32), scale(3f32), index_base(u32), index_count(u32)
+        let sub_meshes = if let Some(hdr) = sections
+            .iter()
+            .find(|h| h.kind == SectionKind::MeshSubMeshTable)
+        {
+            let raw = read_section_data(&file, hdr, Compression::None)?;
+            if raw.len() % 48 != 0 {
+                return Err(fmt_err(format!(
+                    "MeshSubMeshTable: expected {}B entries, got {}B",
+                    48,
+                    raw.len()
+                )));
+            }
+            let mut out = Vec::new();
+            for chunk in raw.chunks_exact(48) {
+                let mut floats = [0f32; 10];
+                for i in 0..10 {
+                    floats[i] = f32::from_le_bytes(
+                        chunk[i * 4..i * 4 + 4].try_into().unwrap(),
+                    );
+                }
+                let index_base =
+                    u32::from_le_bytes(chunk[40..44].try_into().unwrap());
+                let index_count =
+                    u32::from_le_bytes(chunk[44..48].try_into().unwrap());
+                out.push(SubMeshInfo {
+                    translation: [floats[0], floats[1], floats[2]],
+                    rotation: [floats[3], floats[4], floats[5], floats[6]],
+                    scale: [floats[7], floats[8], floats[9]],
+                    index_base,
+                    index_count,
+                });
+            }
+            out
+        } else {
+            Vec::new()
+        };
+
+        // Decode MeshMaterialData (56B per entry = 14 f32)
+        let material_data = if let Some(hdr) = sections
+            .iter()
+            .find(|h| h.kind == SectionKind::MeshMaterialData)
+        {
+            let raw = read_section_data(&file, hdr, Compression::None)?;
+            if raw.len() % 56 != 0 {
+                return Err(fmt_err(format!(
+                    "MeshMaterialData: expected {}B entries, got {}B",
+                    56,
+                    raw.len()
+                )));
+            }
+            let mut out = Vec::new();
+            for chunk in raw.chunks_exact(56) {
+                let mut vals = [0f32; 14];
+                for i in 0..14 {
+                    vals[i] = f32::from_le_bytes(
+                        chunk[i * 4..i * 4 + 4].try_into().unwrap(),
+                    );
+                }
+                out.push(vals);
+            }
+            out
+        } else {
+            Vec::new()
+        };
+
+        // Decode MeshSubMeshAlbedo (8B per entry = one u64 TextureId)
+        let sub_mesh_albedos = if let Some(hdr) = sections
+            .iter()
+            .find(|h| h.kind == SectionKind::MeshSubMeshAlbedo)
+        {
+            let raw = read_section_data(&file, hdr, Compression::None)?;
+            if raw.len() % 8 != 0 {
+                return Err(fmt_err(format!(
+                    "MeshSubMeshAlbedo: expected 8B entries, \
+                     got {}B",
+                    raw.len()
+                )));
+            }
+            raw.chunks_exact(8)
+                .map(|c| {
+                    AssetId::from_hash(u64::from_le_bytes(
+                        c.try_into().unwrap(),
+                    ))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             file,
             sections,
             tex_refs,
+            sub_meshes,
+            sub_mesh_albedos,
+            material_data,
         })
     }
 
@@ -537,6 +643,9 @@ impl MeshAsset {
             file: self.file.try_clone()?,
             sections: self.sections.clone(),
             tex_refs: self.tex_refs.clone(),
+            sub_meshes: self.sub_meshes.clone(),
+            sub_mesh_albedos: self.sub_mesh_albedos.clone(),
+            material_data: self.material_data.clone(),
         })
     }
 
@@ -549,6 +658,16 @@ impl MeshAsset {
         let hdr = self.require(kind)?;
         let compression = mesh_section_compression(kind);
         make_section_elem_iter(&self.file, hdr, compression)
+    }
+
+    /// Number of sub-meshes recorded in the MeshSubMeshTable.
+    pub fn sub_mesh_count(&self) -> usize {
+        self.sub_meshes.len()
+    }
+
+    /// Returns a clone of the `SubMeshInfo` at `idx` if present.
+    pub fn sub_mesh(&self, idx: usize) -> Option<SubMeshInfo> {
+        self.sub_meshes.get(idx).cloned()
     }
 
     fn require(&self, kind: SectionKind) -> Result<&SectionHeader, LoadError> {
@@ -597,7 +716,10 @@ fn read_section_data(
 /// sections are Lz4; MeshTexRef is uncompressed.
 fn mesh_section_compression(kind: SectionKind) -> Compression {
     match kind {
-        SectionKind::MeshTexRef => Compression::None,
+        SectionKind::MeshTexRef
+        | SectionKind::MeshSubMeshTable
+        | SectionKind::MeshSubMeshAlbedo
+        | SectionKind::MeshMaterialData => Compression::None,
         _ => Compression::Lz4,
     }
 }
