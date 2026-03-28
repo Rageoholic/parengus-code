@@ -3,10 +3,6 @@ name = "phoenix-shader"
 type = "shader"
 
 [[asset]]
-name = "phoenix-shader-debug"
-type = "shader"
-
-[[asset]]
 name = "duck"
 type = "mesh"
 
@@ -23,7 +19,7 @@ name = "dh-albedo"
 type = "image"
 
 [[asset]]
-name = "dh-ao"
+name = "dh-orm"
 type = "image"
 
 [[asset]]
@@ -32,10 +28,6 @@ type = "image"
 
 [[asset]]
 name = "dh-emissive"
-type = "image"
-
-[[asset]]
-name = "dh-metal-rough"
 type = "image"
 
 [[asset]]

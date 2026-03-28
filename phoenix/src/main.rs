@@ -404,7 +404,7 @@ pub fn main() -> eyre::Result<()> {
     // object does.
     let instance = Arc::new(unsafe {
         rgpu_vk::instance::Instance::new(
-            "samp-app",
+            "phoenix",
             cli_args.graphics_debug_level.map(Into::into),
             Some(&event_loop),
             InstanceConfig {
@@ -1675,29 +1675,16 @@ impl AppRunner {
             Some(Arc::new(swapchain))
         };
 
-        let shader_name = if state.shader_debug_info {
-            "phoenix-shader-debug"
-        } else {
-            "phoenix-shader"
-        };
-        let shader_filename = asset_map
-            .get(shader_id(shader_name))
-            .ok_or_else(|| eyre::eyre!("asset '{shader_name}' not in map"))?;
-        let shader_path = assets_dir.join(shader_filename);
-        let shader_path = if state.shader_debug_info && !shader_path.exists() {
-            tracing::warn!(
-                path = %shader_path.display(),
-                "Shader debug info requested but debug shader was not \
-                 found; falling back to non-debug shader"
-            );
-            let fallback =
-                asset_map.get(shader_id("phoenix-shader")).ok_or_else(
-                    || eyre::eyre!("asset 'phoenix-shader' not in map"),
-                )?;
-            assets_dir.join(fallback)
-        } else {
-            shader_path
-        };
+        let shader_path = assets_dir.join(
+            asset_map
+                .get_shader(
+                    shader_id("phoenix-shader"),
+                    state.shader_debug_info,
+                )
+                .ok_or_else(|| {
+                    eyre::eyre!("asset 'phoenix-shader' not in map")
+                })?,
+        );
         let shader = {
             let _span = tracing::trace_span!(
                 "shader_load",

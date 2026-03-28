@@ -47,6 +47,14 @@ pub struct ManifestEntry {
     /// For shader assets: extra arguments passed to `slangc`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compile_args: Vec<String>,
+    /// For shader assets: output path for the debug variant (compiled
+    /// with `-g` appended). When set, both variants are always built.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_path_serde"
+    )]
+    pub debug_file: Option<PathBuf>,
     /// For mesh assets: texture references — role string → asset name.
 
     /// For image assets: target compressed format ("bc7", "rgba8", …).
