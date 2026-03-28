@@ -4,3 +4,6 @@
 /.claude/*.local.*
 tmpclaude-*
 *.rdc
+.venv/
+venv/
+env/

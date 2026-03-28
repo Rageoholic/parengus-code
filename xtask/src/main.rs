@@ -222,8 +222,17 @@ fn all_tasks(force: bool, no_compress: bool) -> Result<Vec<Task>> {
                     .unwrap_or("spv")
                     .to_string();
                 let args = entry.compile_args.clone();
+                let debug_ext = entry.debug_file.as_ref().and_then(|df| {
+                    df.extension().and_then(|s| s.to_str()).map(str::to_string)
+                });
                 Box::new(move || {
-                    compile_shader_asset(&src, &name, &ext, &args, force)
+                    compile_shader_asset(&src, &name, &ext, &args, force)?;
+                    if let Some(ref dext) = debug_ext {
+                        let mut dargs = args.clone();
+                        dargs.push("-g".into());
+                        compile_shader_asset(&src, &name, dext, &dargs, force)?;
+                    }
+                    Ok(())
                 })
             }
             AssetType::Mesh => {

@@ -51,11 +51,14 @@ fn fmt_err(s: impl Into<String>) -> LoadError {
 pub struct AssetMap {
     by_hash: HashMap<u64, PathBuf>,
     by_hash_name: HashMap<u64, String>,
+    by_hash_debug: HashMap<u64, PathBuf>,
 }
 
 #[derive(serde::Deserialize)]
 struct RawAssetMap {
     map: BTreeMap<String, String>,
+    #[serde(default)]
+    shader_debug: BTreeMap<String, String>,
 }
 
 impl AssetMap {
@@ -70,13 +73,28 @@ impl AssetMap {
             by_hash.insert(hash, PathBuf::from(p));
             by_hash_name.insert(hash, name);
         }
+        let mut by_hash_debug = HashMap::new();
+        for (name, p) in raw.shader_debug {
+            by_hash_debug.insert(fnv1a(&name), PathBuf::from(p));
+        }
         Ok(Self {
             by_hash,
             by_hash_name,
+            by_hash_debug,
         })
     }
 
     pub fn get<T>(&self, id: AssetId<T>) -> Option<&Path> {
+        self.by_hash.get(&id.0).map(PathBuf::as_path)
+    }
+
+    /// Look up a shader by ID. Returns the debug variant's path when
+    /// `debug` is `true` and a debug file was baked; falls back to the
+    /// release path if the debug variant is absent.
+    pub fn get_shader<T>(&self, id: AssetId<T>, debug: bool) -> Option<&Path> {
+        if debug && let Some(p) = self.by_hash_debug.get(&id.0) {
+            return Some(p.as_path());
+        }
         self.by_hash.get(&id.0).map(PathBuf::as_path)
     }
 

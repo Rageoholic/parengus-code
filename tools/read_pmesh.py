@@ -57,7 +57,7 @@ def fnv1a(s: str) -> int:
 
 KNOWN_ASSETS = [
     "duck-albedo",
-    "dh-albedo", "dh-normal", "dh-emissive", "dh-ao", "dh-metal-rough",
+    "dh-albedo", "dh-normal", "dh-emissive", "dh-orm",
     "fh-rubber-albedo", "fh-glass-albedo", "fh-metal-albedo",
     "fh-leather-albedo", "fh-lenses-albedo",
     "fh-rubber-normal", "fh-glass-normal", "fh-metal-normal",

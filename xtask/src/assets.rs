@@ -16,6 +16,8 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(serde::Serialize)]
 struct AssetMapFile {
     map: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    shader_debug: BTreeMap<String, String>,
 }
 
 /// Copy compiled assets from the shared cache into `dst_dir` for the
@@ -44,6 +46,7 @@ pub(crate) fn copy_assets(
     fs::create_dir_all(dst_dir)?;
 
     let mut map = BTreeMap::new();
+    let mut shader_debug: BTreeMap<String, String> = BTreeMap::new();
 
     for req in &app_assets.asset {
         let entry = index.get(req.name.as_str()).ok_or_else(|| {
@@ -85,10 +88,40 @@ pub(crate) fn copy_assets(
         })?;
 
         map.insert(req.name.clone(), compiled_name);
+
+        // Copy debug shader variant if the manifest entry declares one.
+        if entry.asset_type == AssetType::Shader
+            && let Some(ref df) = entry.debug_file
+        {
+            let debug_ext =
+                df.extension().and_then(|s| s.to_str()).unwrap_or("spv");
+            let debug_compiled = df.to_string_lossy().into_owned();
+            let debug_src = cache::artifact_path(&req.name, debug_ext);
+            let debug_dst = dst_dir.join(&debug_compiled);
+            fs::copy(&debug_src, &debug_dst).map_err(|e| {
+                format!(
+                    "failed to copy debug shader '{}' from \
+                         cache: {e}",
+                    req.name
+                )
+            })?;
+            shader_debug.insert(
+                req.name.clone(),
+                std::path::PathBuf::from(debug_compiled)
+                    .to_slash_lossy()
+                    .into_owned(),
+            );
+        }
     }
 
     let asset_map = AssetMapFile {
         map: map
+            .into_iter()
+            .map(|(k, v)| {
+                (k, std::path::PathBuf::from(v).to_slash_lossy().into_owned())
+            })
+            .collect(),
+        shader_debug: shader_debug
             .into_iter()
             .map(|(k, v)| {
                 (k, std::path::PathBuf::from(v).to_slash_lossy().into_owned())

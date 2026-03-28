@@ -1,28 +1,16 @@
 [[asset]]
 name = "shader"
 file = "shader.spv"
+debug_file = "shader.debug.spv"
 type = "shader"
 source_file = "shaders/shader.slang"
-
-[[asset]]
-name = "shader-debug"
-file = "shader.debug.spv"
-type = "shader"
-source_file = "shaders/shader.slang"
-compile_args = ["-g"]
 
 [[asset]]
 name = "phoenix-shader"
 file = "phoenix.spv"
+debug_file = "phoenix.debug.spv"
 type = "shader"
 source_file = "shaders/phoenix.slang"
-
-[[asset]]
-name = "phoenix-shader-debug"
-file = "phoenix.debug.spv"
-type = "shader"
-source_file = "shaders/phoenix.slang"
-compile_args = ["-g"]
 
 [[asset]]
 name = "duck"
@@ -46,7 +34,7 @@ license = "CC-BY 4.0"
 
 [[asset]]
 name = "damaged-helmet"
-file = "DamagedHelmet.gltf"
+file = "damaged-helmet.gltf"
 type = "mesh"
 source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
 author = "Khronos Group"
@@ -55,7 +43,7 @@ license = "CC-BY 4.0"
 
 [[asset]]
 name = "dh-albedo"
-file = "tex/Default_albedo.jpg"
+file = "tex/dh-albedo.jpg"
 type = "image"
 format = "bc7"
 color_space = "srgb"
@@ -65,8 +53,8 @@ author = "Khronos Group"
 license = "CC-BY 4.0"
 
 [[asset]]
-name = "dh-ao"
-file = "tex/Default_AO.jpg"
+name = "dh-orm"
+file = "tex/dh-orm.jpg"
 type = "image"
 format = "bc7"
 color_space = "linear"
@@ -77,7 +65,7 @@ license = "CC-BY 4.0"
 
 [[asset]]
 name = "dh-normal"
-file = "tex/Default_normal.jpg"
+file = "tex/dh-normal.jpg"
 type = "image"
 format = "bc5"
 color_space = "linear"
@@ -89,7 +77,7 @@ license = "CC-BY 4.0"
 
 [[asset]]
 name = "dh-emissive"
-file = "tex/Default_emissive.jpg"
+file = "tex/dh-emissive.jpg"
 type = "image"
 format = "bc7"
 color_space = "srgb"
@@ -99,19 +87,8 @@ author = "Khronos Group"
 license = "CC-BY 4.0"
 
 [[asset]]
-name = "dh-metal-rough"
-file = "tex/Default_metalRoughness.jpg"
-type = "image"
-format = "bc7"
-color_space = "linear"
-mips = true
-source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
-author = "Khronos Group"
-license = "CC-BY 4.0"
-
-[[asset]]
 name = "flight-helmet"
-file = "FlightHelmet.gltf"
+file = "flight-helmet.gltf"
 type = "mesh"
 source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
 author = "Khronos Group"
