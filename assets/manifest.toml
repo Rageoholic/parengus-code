@@ -82,6 +82,7 @@ type = "image"
 format = "bc5"
 color_space = "linear"
 mips = true
+normal_map = true
 source = "https://github.com/KhronosGroup/glTF-Sample-Assets"
 author = "Khronos Group"
 license = "CC-BY 4.0"
@@ -123,6 +124,7 @@ type = "image"
 format = "bc5"
 color_space = "linear"
 mips = true
+normal_map = true
 
 [[asset]]
 name = "fh-rubber-orm"
@@ -147,6 +149,7 @@ type = "image"
 format = "bc5"
 color_space = "linear"
 mips = true
+normal_map = true
 
 [[asset]]
 name = "fh-glass-orm"
@@ -171,6 +174,7 @@ type = "image"
 format = "bc5"
 color_space = "linear"
 mips = true
+normal_map = true
 
 [[asset]]
 name = "fh-metal-orm"
@@ -195,6 +199,7 @@ type = "image"
 format = "bc5"
 color_space = "linear"
 mips = true
+normal_map = true
 
 [[asset]]
 name = "fh-leather-orm"
@@ -219,6 +224,7 @@ type = "image"
 format = "bc5"
 color_space = "linear"
 mips = true
+normal_map = true
 
 [[asset]]
 name = "fh-lenses-orm"

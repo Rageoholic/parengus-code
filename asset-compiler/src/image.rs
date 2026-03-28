@@ -23,6 +23,7 @@ pub fn compile(
     format: TexFormat,
     color_space: ColorSpace,
     mips: bool,
+    normal_map: bool,
 ) -> Result<(), String> {
     // Decode source image to RGBA8
     let img = image::open(src)
@@ -40,8 +41,16 @@ pub fn compile(
         ));
     }
 
-    // Build mip chain (mip 0 = full size)
-    let mut mip_images: Vec<image::RgbaImage> = vec![img];
+    // Build mip chain (mip 0 = full size).
+    // Capacity: floor(log2(max(w,h))) additional levels + 1 for mip 0.
+    let mip_capacity = if mips {
+        (base_w.max(base_h).ilog2() + 1) as usize
+    } else {
+        1
+    };
+    let mut mip_images: Vec<image::RgbaImage> =
+        Vec::with_capacity(mip_capacity);
+    mip_images.push(img);
     if mips {
         let mut w = base_w;
         let mut h = base_h;
@@ -49,12 +58,16 @@ pub fn compile(
             w = (w / 2).max(1);
             h = (h / 2).max(1);
             let prev = mip_images.last().unwrap();
-            let next = image::imageops::resize(
-                prev,
-                w,
-                h,
-                image::imageops::FilterType::Lanczos3,
-            );
+            let next = if normal_map {
+                downsample_normal_mip(prev, w, h)
+            } else {
+                image::imageops::resize(
+                    prev,
+                    w,
+                    h,
+                    image::imageops::FilterType::Lanczos3,
+                )
+            };
             mip_images.push(next);
         }
     }
@@ -159,6 +172,45 @@ fn compression_for_format(format: TexFormat) -> Compression {
     }
 }
 
+/// Downsample a normal-map mip by box-filtering decoded XYZ vectors.
+/// RG channels encode XY normals as unsigned-normalized bytes;
+/// Z is reconstructed. Does NOT renormalize — the shader reconstructs
+/// Z from stored XY, giving unit-length normals regardless.
+fn downsample_normal_mip(
+    src: &image::RgbaImage,
+    dst_w: u32,
+    dst_h: u32,
+) -> image::RgbaImage {
+    let scale_x = (src.width() / dst_w).max(1);
+    let scale_y = (src.height() / dst_h).max(1);
+    let count = (scale_x * scale_y) as f32;
+    let mut buf = Vec::with_capacity((dst_w * dst_h * 4) as usize);
+    for dy in 0..dst_h {
+        for dx in 0..dst_w {
+            let (mut sx, mut sy, mut sz) = (0.0f32, 0.0f32, 0.0f32);
+            for ky in 0..scale_y {
+                for kx in 0..scale_x {
+                    let p = src.get_pixel(dx * scale_x + kx, dy * scale_y + ky);
+                    let nx = p[0] as f32 / 255.0 * 2.0 - 1.0;
+                    let ny = p[1] as f32 / 255.0 * 2.0 - 1.0;
+                    let nz = (1.0 - nx * nx - ny * ny).max(0.0).sqrt();
+                    sx += nx;
+                    sy += ny;
+                    sz += nz;
+                }
+            }
+            let ax = sx / count;
+            let ay = sy / count;
+            let az = sz / count;
+            // -1.0 → 0, 0.0 → 127.5 (rounds to 128), 1.0 → 255
+            let enc = |v: f32| -> u8 { ((v + 1.0) * 127.5).round() as u8 };
+            buf.extend_from_slice(&[enc(ax), enc(ay), enc(az), 255]);
+        }
+    }
+    image::RgbaImage::from_raw(dst_w, dst_h, buf)
+        .expect("buffer length exact by construction")
+}
+
 fn encode_mip(
     img: &image::RgbaImage,
     format: TexFormat,
@@ -194,7 +246,19 @@ fn encode_mip(
             params.set_color_space(bu_cs);
             let w = img.width();
             let h = img.height();
-            params.source_image_mut(0).init(rgba, w, h, 4);
+            // basis BC5_RG uses channel 0 and channel 3 (alpha) from
+            // the source. For BC5 we want R and G, so extract just
+            // those two channels and pass channel_count=2, letting
+            // basis treat them as ch0 and ch1.
+            if format == TexFormat::Bc5 {
+                let rg: Vec<u8> = rgba
+                    .chunks_exact(4)
+                    .flat_map(|px| [px[0], px[1]])
+                    .collect();
+                params.source_image_mut(0).init(&rg, w, h, 2);
+            } else {
+                params.source_image_mut(0).init(rgba, w, h, 4);
+            }
 
             let mut compressor = Compressor::default();
             let ok = unsafe { compressor.init(&params) };
