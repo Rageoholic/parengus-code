@@ -55,6 +55,9 @@ pub struct ManifestEntry {
     pub color_space: Option<String>,
     /// For image assets: whether to generate a full mip chain.
     pub mips: Option<bool>,
+    /// For image assets: treat RG channels as a tangent-space normal
+    /// map and generate mips by averaging decoded XYZ vectors.
+    pub normal_map: Option<bool>,
     pub source: Option<String>,
     pub author: Option<String>,
     pub license: Option<String>,

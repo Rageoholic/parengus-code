@@ -59,6 +59,17 @@ fn try_main() -> Result<()> {
         /// Force recompile all assets even if cache is up-to-date
         #[clap(long = "force", short = 'f')]
         force: bool,
+
+        /// Run BC4/BC5/BC7 texture encoding (default: true).
+        /// Omit to let PARENGUS_NO_BC env var decide; set explicitly
+        /// to override. e.g. --bc=false skips BC even on machines
+        /// without the env var.
+        #[clap(
+            long = "bc",
+            default_missing_value = "true",
+            num_args = 0..=1
+        )]
+        bc: Option<bool>,
     }
 
     let cli = Cli::parse();
@@ -108,12 +119,15 @@ fn try_main() -> Result<()> {
         cli.no_color,
     )
     .map_err(|e| format!("init tracing: {e}"))?;
+    let no_bc = !cli
+        .bc
+        .unwrap_or_else(|| env::var("PARENGUS_NO_BC").is_err());
     if let Some(task) = cli.task.as_deref() {
-        execute_graph(task, cli.force)
+        execute_graph(task, cli.force, no_bc)
     } else {
         eprintln!("Usage: cargo xtask <task>\n");
         eprintln!("Tasks:");
-        for task in &all_tasks(false)? {
+        for task in &all_tasks(false, false)? {
             eprintln!("  {}", task.name);
         }
         std::process::exit(1);
@@ -158,7 +172,7 @@ const TASK_BUILD: &str = "build";
 // Root / aggregate task names
 const TASK_BUILD_ALL: &str = "build-all";
 
-fn all_tasks(force: bool) -> Result<Vec<Task>> {
+fn all_tasks(force: bool, no_compress: bool) -> Result<Vec<Task>> {
     let mut tasks: Vec<Task> = Vec::new();
 
     let root = workspace_root();
@@ -219,13 +233,19 @@ fn all_tasks(force: bool) -> Result<Vec<Task>> {
             }
             AssetType::Image => {
                 let src = assets_dir.join(&entry.file);
-                let fmt =
-                    entry.format.clone().unwrap_or_else(|| "rgba8".into());
+                let fmt = if no_compress {
+                    "rgba8".into()
+                } else {
+                    entry.format.clone().unwrap_or_else(|| "rgba8".into())
+                };
                 let cs =
                     entry.color_space.clone().unwrap_or_else(|| "srgb".into());
                 let mips = entry.mips.unwrap_or(false);
+                let normal_map = entry.normal_map.unwrap_or(false);
                 Box::new(move || {
-                    compile_image_asset(&src, &name, &fmt, &cs, mips, force)
+                    compile_image_asset(
+                        &src, &name, &fmt, &cs, mips, normal_map, force,
+                    )
                 })
             }
             _ => {
@@ -352,8 +372,8 @@ fn collect_topo(
     Ok(())
 }
 
-fn execute_graph(target: &str, force: bool) -> Result<()> {
-    let tasks = all_tasks(force)?;
+fn execute_graph(target: &str, force: bool, no_compress: bool) -> Result<()> {
+    let tasks = all_tasks(force, no_compress)?;
     let mut visited = vec![false; tasks.len()];
     let mut order: Vec<usize> = Vec::new();
     collect_topo(&tasks, target, &mut visited, &mut order)?;
@@ -577,11 +597,13 @@ fn compile_image_asset(
     format: &str,
     color_space: &str,
     mips: bool,
+    normal_map: bool,
     force: bool,
 ) -> Result<()> {
     cache::ensure_cache_dir()?;
     if !force
-        && cache::lookup_image(name, src, format, color_space, mips).is_some()
+        && cache::lookup_image(name, src, format, color_space, mips, normal_map)
+            .is_some()
     {
         println!("Up-to-date: image {name}");
         return Ok(());
@@ -603,11 +625,16 @@ fn compile_image_asset(
             return Err(format!("unknown color-space '{other}'").into());
         }
     };
-    image::compile(src, &dst, fmt, cs, mips)
+    image::compile(src, &dst, fmt, cs, mips, normal_map)
         .map_err(|e| format!("image compile '{name}': {e}"))?;
-    if let Err(e) =
-        cache::write_image_meta(name, src, format, color_space, mips)
-    {
+    if let Err(e) = cache::write_image_meta(
+        name,
+        src,
+        format,
+        color_space,
+        mips,
+        normal_map,
+    ) {
         eprintln!("warning: image meta for {name}: {e}");
     }
     Ok(())

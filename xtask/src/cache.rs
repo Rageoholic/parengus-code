@@ -9,6 +9,7 @@ struct CacheMeta {
     format: String,
     color_space: String,
     mips: bool,
+    normal_map: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +48,7 @@ pub fn lookup_image(
     format: &str,
     color_space: &str,
     mips: bool,
+    normal_map: bool,
 ) -> Option<PathBuf> {
     let meta_p = meta_path(name, "ptex");
     let art_p = artifact_path(name, "ptex");
@@ -64,6 +66,7 @@ pub fn lookup_image(
         && meta.format == format
         && meta.color_space == color_space
         && meta.mips == mips
+        && meta.normal_map == normal_map
     {
         Some(art_p)
     } else {
@@ -104,6 +107,7 @@ pub(crate) fn write_image_meta(
     format: &str,
     color_space: &str,
     mips: bool,
+    normal_map: bool,
 ) -> std::io::Result<()> {
     let meta_p = meta_path(name, "ptex");
     let src_mtime = fs::metadata(src)?.modified()?;
@@ -116,6 +120,7 @@ pub(crate) fn write_image_meta(
         format: format.to_string(),
         color_space: color_space.to_string(),
         mips,
+        normal_map,
     };
     let tom = toml::to_string(&meta).unwrap();
     let mut f = fs::File::create(&meta_p)?;

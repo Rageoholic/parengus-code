@@ -745,6 +745,8 @@ impl Texture {
         usage: vk::ImageUsageFlags,
         name: Option<&str>,
     ) -> Result<Self, CreateTextureError> {
+        let image_name = name.map(|n| format!("{n} image"));
+        let view_name = name.map(|n| format!("{n} view"));
         let image = DeviceLocalImage::new(
             device,
             width,
@@ -753,9 +755,10 @@ impl Texture {
             mip_levels,
             usage,
             vk::SampleCountFlags::TYPE_1,
-            name,
+            image_name.as_deref(),
         )?;
-        let view = ImageView::new(device, &image, mip_levels, name)?;
+        let view =
+            ImageView::new(device, &image, mip_levels, view_name.as_deref())?;
         Ok(Self { view, image })
     }
 
@@ -908,6 +911,8 @@ impl DepthImage {
         samples: vk::SampleCountFlags,
         name: Option<&str>,
     ) -> Result<Self, CreateTextureError> {
+        let image_name = name.map(|n| format!("{n} image"));
+        let view_name = name.map(|n| format!("{n} view"));
         let image = DeviceLocalImage::new(
             device,
             width,
@@ -916,9 +921,9 @@ impl DepthImage {
             1,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             samples,
-            name,
+            image_name.as_deref(),
         )?;
-        let view = ImageView::new_depth(device, &image, name)?;
+        let view = ImageView::new_depth(device, &image, view_name.as_deref())?;
         Ok(Self { view, image })
     }
 
@@ -973,6 +978,8 @@ impl MsaaImage {
         samples: vk::SampleCountFlags,
         name: Option<&str>,
     ) -> Result<Self, CreateTextureError> {
+        let image_name = name.map(|n| format!("{n} image"));
+        let view_name = name.map(|n| format!("{n} view"));
         let image = DeviceLocalImage::new(
             device,
             width,
@@ -982,9 +989,9 @@ impl MsaaImage {
             vk::ImageUsageFlags::COLOR_ATTACHMENT
                 | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
             samples,
-            name,
+            image_name.as_deref(),
         )?;
-        let view = ImageView::new(device, &image, 1, name)?;
+        let view = ImageView::new(device, &image, 1, view_name.as_deref())?;
         Ok(Self { view, image })
     }
 

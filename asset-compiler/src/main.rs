@@ -47,6 +47,10 @@ enum Command {
         /// Generate full mip chain
         #[arg(long)]
         mips: bool,
+        /// Treat RG channels as tangent-space normals and generate
+        /// mips by averaging decoded XYZ vectors.
+        #[arg(long)]
+        normal_map: bool,
     },
 }
 
@@ -111,6 +115,7 @@ fn run(cli: Cli) -> Result<(), String> {
             format,
             color_space,
             mips,
+            normal_map,
         } => {
             let fmt = match format.as_str() {
                 "bc7" => asset_shared::TexFormat::Bc7,
@@ -125,7 +130,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     return Err(format!("unknown color-space '{color_space}'"));
                 }
             };
-            image::compile(&input, &output, fmt, cs, mips)
+            image::compile(&input, &output, fmt, cs, mips, normal_map)
         }
     }
 }
