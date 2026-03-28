@@ -1,7 +1,7 @@
 ---
 id: t022
 title: "Implement LearnOpenGL-style Blinn-Phong renderer"
-status: planned
+status: active
 created: 2026-03-24
 updated: 2026-03-24
 parent: null

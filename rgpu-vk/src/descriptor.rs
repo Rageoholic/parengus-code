@@ -263,6 +263,7 @@ impl DescriptorSet {
         &self,
         device: &Arc<Device>,
         binding: u32,
+        array_element: u32,
         image_view: vk::ImageView,
         sampler: vk::Sampler,
         image_layout: vk::ImageLayout,
@@ -274,6 +275,7 @@ impl DescriptorSet {
         let write = vk::WriteDescriptorSet::default()
             .dst_set(self.handle)
             .dst_binding(binding)
+            .dst_array_element(array_element)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(std::slice::from_ref(&image_info));
         // SAFETY: Caller guarantees device, image_view, sampler, and
@@ -304,6 +306,7 @@ impl DescriptorSet {
             self.write_combined_image_sampler(
                 device,
                 binding,
+                0,
                 texture.raw_image_view(),
                 sampler.raw_sampler(),
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,

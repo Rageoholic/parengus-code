@@ -182,7 +182,60 @@ fn encode_mip(
             Ok((blocks, len))
         }
         TexFormat::Bc4 | TexFormat::Bc5 => {
-            Err(format!("format {format:?} not yet supported"))
+            // Encode single-channel (BC4) or two-channel (BC5) targets by
+            // producing a UASTC basis file and transcoding to the desired
+            // block-compressed format.
+            let mut params = CompressorParams::new();
+            params.set_basis_format(BasisTextureFormat::UASTC4x4);
+            let bu_cs = match color_space {
+                ColorSpace::Srgb => BuColorSpace::Srgb,
+                ColorSpace::Linear => BuColorSpace::Linear,
+            };
+            params.set_color_space(bu_cs);
+            let w = img.width();
+            let h = img.height();
+            params.source_image_mut(0).init(rgba, w, h, 4);
+
+            let mut compressor = Compressor::default();
+            let ok = unsafe { compressor.init(&params) };
+            if !ok {
+                return Err("basis compressor init failed".to_string());
+            }
+            unsafe {
+                compressor
+                    .process()
+                    .map_err(|e| format!("basis compress failed: {e:?}"))?;
+            }
+
+            let basis_data = compressor.basis_file().to_vec();
+
+            // Transcode to the requested BC4/BC5 format
+            let mut transcoder = Transcoder::new();
+            transcoder
+                .prepare_transcoding(&basis_data)
+                .map_err(|_| "basis prepare_transcoding failed".to_string())?;
+
+            let target = match format {
+                TexFormat::Bc4 => TranscoderTextureFormat::BC4_R,
+                TexFormat::Bc5 => TranscoderTextureFormat::BC5_RG,
+                _ => unreachable!(),
+            };
+
+            let bc = transcoder
+                .transcode_image_level(
+                    &basis_data,
+                    target,
+                    TranscodeParameters {
+                        image_index: 0,
+                        level_index: 0,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| format!("transcode failed: {e:?}"))?;
+
+            transcoder.end_transcoding();
+            let len = bc.len() as u32;
+            Ok((bc, len))
         }
     }
 }

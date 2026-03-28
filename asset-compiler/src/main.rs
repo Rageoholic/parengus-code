@@ -114,6 +114,7 @@ fn run(cli: Cli) -> Result<(), String> {
         } => {
             let fmt = match format.as_str() {
                 "bc7" => asset_shared::TexFormat::Bc7,
+                "bc5" => asset_shared::TexFormat::Bc5,
                 "rgba8" => asset_shared::TexFormat::Rgba8,
                 _ => return Err(format!("unknown format '{format}'")),
             };

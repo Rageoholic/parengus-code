@@ -1,10 +1,13 @@
 mod assets;
 
+use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
 use asset_compiler::{image, mesh};
@@ -15,6 +18,7 @@ use parengus_tracing::{TracingLogLevel, init_default};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+mod cache;
 // ----------------------------------------------------------------
 // Entry point
 // ----------------------------------------------------------------
@@ -36,7 +40,8 @@ fn try_main() -> Result<()> {
         #[clap(long = "tracing-level", value_enum, default_value_t = TracingLogLevel::Off)]
         tracing_level: TracingLogLevel,
 
-        /// Per-target tracing overrides, repeatable: e.g. --trace-target rgpu_vk=debug
+        /// Per-target tracing overrides, repeatable:
+        /// e.g. --trace-target rgpu_vk=debug
         #[clap(long = "trace-target")]
         trace_target: Vec<String>,
 
@@ -47,9 +52,27 @@ fn try_main() -> Result<()> {
         /// Disable ANSI color in stdout logs
         #[clap(long = "no-color")]
         no_color: bool,
+        /// Number of worker threads for parallel compilation (0 = auto)
+        #[clap(long = "threads", default_value_t = num_cpus::get())]
+        threads: usize,
+
+        /// Force recompile all assets even if cache is up-to-date
+        #[clap(long = "force", short = 'f')]
+        force: bool,
     }
 
     let cli = Cli::parse();
+
+    // Configure Rayon global thread pool to the requested size.
+    let threads = if cli.threads == 0 {
+        num_cpus::get()
+    } else {
+        cli.threads
+    };
+    ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .map_err(|e| format!("failed to configure thread pool: {e}"))?;
 
     // Build target-level map from `--trace-target` entries
     let mut target_levels: HashMap<String, TracingLogLevel> = HashMap::new();
@@ -70,7 +93,8 @@ fn try_main() -> Result<()> {
             target_levels.insert(k.to_string(), lvl);
         } else {
             eprintln!(
-                "Invalid --trace-target value '{}', expected target=level",
+                "Invalid --trace-target value '{}', \
+                 expected target=level",
                 t
             );
         }
@@ -85,11 +109,11 @@ fn try_main() -> Result<()> {
     )
     .map_err(|e| format!("init tracing: {e}"))?;
     if let Some(task) = cli.task.as_deref() {
-        execute_graph(task)
+        execute_graph(task, cli.force)
     } else {
         eprintln!("Usage: cargo xtask <task>\n");
         eprintln!("Tasks:");
-        for task in &all_tasks() {
+        for task in &all_tasks(false)? {
             eprintln!("  {}", task.name);
         }
         std::process::exit(1);
@@ -119,35 +143,27 @@ const APPS: &[App] = &[
 struct Task {
     name: String,
     deps: Vec<String>,
-    run: Box<dyn Fn() -> Result<()>>,
+    run: Box<dyn Fn() -> Result<()> + Send + Sync>,
 }
 
 // Shared task names
 const TASK_CHECK_COLLISIONS: &str = "check-collisions";
 
 // Per-app task name prefixes
-const TASK_COMPILE_SHADERS: &str = "compile-shaders";
-const TASK_COMPILE_MESHES: &str = "compile-meshes";
-const TASK_COMPILE_IMAGES: &str = "compile-images";
 const TASK_CARGO_BUILD: &str = "cargo-build";
 const TASK_COPY_EXE: &str = "copy-exe";
 const TASK_COPY_ASSETS: &str = "copy-assets";
 const TASK_BUILD: &str = "build";
-const TASK_CLEAN: &str = "clean";
 
 // Root / aggregate task names
 const TASK_BUILD_ALL: &str = "build-all";
 
-const TASKS_SHARED: usize = 1; // check-collisions
-const TASKS_PER_APP: usize = 8; // compile-shaders, compile-meshes,
-// compile-images, cargo-build,
-// copy-exe, copy-assets, build-{app}, clean-{app}
-const TASKS_ROOT: usize = 3; // build, build-all, clean
-const TASK_COUNT: usize =
-    TASKS_SHARED + TASKS_PER_APP * APPS.len() + TASKS_ROOT;
+fn all_tasks(force: bool) -> Result<Vec<Task>> {
+    let mut tasks: Vec<Task> = Vec::new();
 
-fn all_tasks() -> Vec<Task> {
-    let mut tasks: Vec<Task> = Vec::with_capacity(TASK_COUNT);
+    let root = workspace_root();
+    let manifest = Arc::new(manifest()?);
+    let assets_dir = root.join("assets");
 
     // ── Shared ───────────────────────────────────────────────────
 
@@ -157,39 +173,95 @@ fn all_tasks() -> Vec<Task> {
         run: Box::new(check_collisions),
     });
 
-    assert!(tasks.len() == TASKS_SHARED, "shared task count incorrect");
+    // ── Per-asset compile tasks (deduped across apps) ─────────────
+    //
+    // Collect the union of asset names so we only compile assets
+    // that are actually referenced by at least one app.
+    let all_app_assets: Vec<AppAssets> = APPS
+        .iter()
+        .map(|a| app_assets(a.name))
+        .collect::<Result<_>>()?;
 
-    // ── Per-app ──────────────────────────────────────────────────
+    let needed: HashSet<String> = all_app_assets
+        .iter()
+        .flat_map(|a| a.asset.iter().map(|r| r.name.clone()))
+        .collect();
 
-    for app in APPS {
+    for entry in &manifest.asset {
+        if !needed.contains(&entry.name) {
+            continue;
+        }
+
+        let name = entry.name.clone();
+        let run: Box<dyn Fn() -> Result<()> + Send + Sync> = match entry
+            .asset_type
+        {
+            AssetType::Shader => {
+                let Some(sf) = &entry.source_file else {
+                    continue;
+                };
+                let src = assets_dir.join(sf);
+                let ext = entry
+                    .file
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("spv")
+                    .to_string();
+                let args = entry.compile_args.clone();
+                Box::new(move || {
+                    compile_shader_asset(&src, &name, &ext, &args, force)
+                })
+            }
+            AssetType::Mesh => {
+                let src = assets_dir.join(&entry.file);
+                let mf = manifest.clone();
+                Box::new(move || compile_mesh_asset(&src, &name, &mf, force))
+            }
+            AssetType::Image => {
+                let src = assets_dir.join(&entry.file);
+                let fmt =
+                    entry.format.clone().unwrap_or_else(|| "rgba8".into());
+                let cs =
+                    entry.color_space.clone().unwrap_or_else(|| "srgb".into());
+                let mips = entry.mips.unwrap_or(false);
+                Box::new(move || {
+                    compile_image_asset(&src, &name, &fmt, &cs, mips, force)
+                })
+            }
+            _ => {
+                return Err(format!(
+                    "unsupported asset type for '{}'",
+                    entry.name
+                )
+                .into());
+            }
+        };
+
+        tasks.push(Task {
+            name: format!("compile-asset-{}", entry.name),
+            deps: vec![],
+            run,
+        });
+    }
+
+    // ── Per-app tasks ─────────────────────────────────────────────
+
+    for (app, app_assets) in APPS.iter().zip(all_app_assets.iter()) {
         let n = app.name;
 
-        let compile_shaders = format!("{TASK_COMPILE_SHADERS}-{n}");
-        let compile_meshes = format!("{TASK_COMPILE_MESHES}-{n}");
-        let compile_images = format!("{TASK_COMPILE_IMAGES}-{n}");
         let cargo_build = format!("{TASK_CARGO_BUILD}-{n}");
         let copy_exe = format!("{TASK_COPY_EXE}-{n}");
-        let copy_assets = format!("{TASK_COPY_ASSETS}-{n}");
+        let copy_assets_task = format!("{TASK_COPY_ASSETS}-{n}");
         let build = format!("{TASK_BUILD}-{n}");
         let clean = format!("clean-{n}");
 
-        let pre = tasks.len();
+        // copy-assets waits for collision check + every asset this
+        // app needs
+        let mut copy_deps = vec![TASK_CHECK_COLLISIONS.into()];
+        for req in &app_assets.asset {
+            copy_deps.push(format!("compile-asset-{}", req.name));
+        }
 
-        tasks.push(Task {
-            name: compile_shaders.clone(),
-            deps: vec![],
-            run: Box::new(move || compile_shaders_for(n)),
-        });
-        tasks.push(Task {
-            name: compile_meshes.clone(),
-            deps: vec![],
-            run: Box::new(move || compile_meshes_for(n)),
-        });
-        tasks.push(Task {
-            name: compile_images.clone(),
-            deps: vec![],
-            run: Box::new(move || compile_images_for(n)),
-        });
         tasks.push(Task {
             name: cargo_build.clone(),
             deps: vec![],
@@ -201,30 +273,20 @@ fn all_tasks() -> Vec<Task> {
             run: Box::new(move || copy_exe_for(n)),
         });
         tasks.push(Task {
-            name: copy_assets.clone(),
-            deps: vec![
-                TASK_CHECK_COLLISIONS.into(),
-                compile_shaders,
-                compile_meshes,
-                compile_images,
-            ],
+            name: copy_assets_task.clone(),
+            deps: copy_deps,
             run: Box::new(move || copy_assets_for(n)),
         });
         tasks.push(Task {
-            name: clean.clone(),
+            name: clean,
             deps: vec![],
             run: Box::new(move || clean_for(n)),
         });
         tasks.push(Task {
             name: build,
-            deps: vec![copy_exe, copy_assets],
+            deps: vec![copy_exe, copy_assets_task],
             run: Box::new(|| Ok(())),
         });
-
-        assert!(
-            tasks.len() - pre == TASKS_PER_APP,
-            "per-app task count incorrect"
-        );
     }
 
     // ── Root / aggregate ─────────────────────────────────────────
@@ -234,16 +296,13 @@ fn all_tasks() -> Vec<Task> {
         .map(|a| format!("{TASK_BUILD}-{}", a.name))
         .collect();
 
-    let pre_root = tasks.len();
-
     tasks.push(Task {
         name: TASK_BUILD.into(),
         deps: build_deps,
         run: Box::new(|| Ok(())),
     });
-    // Root clean: remove compiled cache and out/ directory.
     tasks.push(Task {
-        name: TASK_CLEAN.into(),
+        name: "clean".into(),
         deps: vec![],
         run: Box::new(clean_root),
     });
@@ -253,14 +312,7 @@ fn all_tasks() -> Vec<Task> {
         run: Box::new(|| Ok(())),
     });
 
-    assert!(
-        tasks.len() - pre_root == TASKS_ROOT,
-        "root task count incorrect"
-    );
-
-    assert!(tasks.len() == TASK_COUNT, "total task count incorrect");
-
-    tasks
+    Ok(tasks)
 }
 
 // ----------------------------------------------------------------
@@ -300,33 +352,66 @@ fn collect_topo(
     Ok(())
 }
 
-fn execute_graph(target: &str) -> Result<()> {
-    let tasks = all_tasks();
+fn execute_graph(target: &str, force: bool) -> Result<()> {
+    let tasks = all_tasks(force)?;
     let mut visited = vec![false; tasks.len()];
     let mut order: Vec<usize> = Vec::new();
     collect_topo(&tasks, target, &mut visited, &mut order)?;
 
+    // Compute DAG depth: level 0 = no deps; level n = max dep level + 1.
+    // Walking topo order guarantees all deps are resolved first.
+    let mut level = vec![0usize; tasks.len()];
+    for &idx in &order {
+        for dep in &tasks[idx].deps {
+            let di = task_index(&tasks, dep)?;
+            if level[di] + 1 > level[idx] {
+                level[idx] = level[di] + 1;
+            }
+        }
+    }
+
+    // Group topo-ordered indices by level.
+    let max_level = order.iter().map(|&i| level[i]).max().unwrap_or(0);
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); max_level + 1];
+    for &idx in &order {
+        groups[level[idx]].push(idx);
+    }
+
     let mut statuses: Vec<Option<Status>> = vec![None; tasks.len()];
 
-    for &idx in &order {
-        let task = &tasks[idx];
-        let blocked = task.deps.iter().any(|dep| {
-            let di = tasks.iter().position(|t| t.name == *dep).unwrap();
-            matches!(statuses[di], Some(Status::Failed | Status::Skipped))
-        });
+    for group in &groups {
+        // Partition blocked vs runnable before entering par_iter
+        // (avoids aliasing `statuses` across threads).
+        let (blocked, runnable): (Vec<usize>, Vec<usize>) =
+            group.iter().copied().partition(|&idx| {
+                tasks[idx].deps.iter().any(|dep| {
+                    let di = tasks.iter().position(|t| t.name == *dep).unwrap();
+                    matches!(
+                        statuses[di],
+                        Some(Status::Failed | Status::Skipped)
+                    )
+                })
+            });
 
-        if blocked {
-            eprintln!("skip: {}", task.name);
+        for idx in blocked {
+            eprintln!("skip: {}", tasks[idx].name);
             statuses[idx] = Some(Status::Skipped);
-            continue;
         }
 
-        match (task.run)() {
-            Ok(()) => statuses[idx] = Some(Status::Succeeded),
-            Err(e) => {
-                eprintln!("failed: {} — {e}", task.name);
-                statuses[idx] = Some(Status::Failed);
-            }
+        // Run all ready tasks at this level in parallel.
+        let results: Vec<(usize, Status)> = runnable
+            .par_iter()
+            .map(|&idx| match (tasks[idx].run)() {
+                Ok(()) => (idx, Status::Succeeded),
+                Err(e) => {
+                    eprintln!("failed: {} — {e}", tasks[idx].name);
+                    (idx, Status::Failed)
+                }
+            })
+            .collect();
+
+        for (idx, st) in results {
+            statuses[idx] = Some(st);
         }
     }
 
@@ -378,12 +463,8 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn copy_if_changed(src: &Path, dst: &Path) -> Result<bool> {
-    if is_up_to_date(src, dst) {
-        return Ok(false);
-    }
-    fs::copy(src, dst)?;
-    Ok(true)
+fn cargo() -> String {
+    env::var("CARGO").unwrap_or_else(|_| "cargo".into())
 }
 
 fn manifest() -> Result<Manifest> {
@@ -397,14 +478,6 @@ fn app_assets(app_name: &str) -> Result<AppAssets> {
     let text = fs::read_to_string(root.join(app_name).join("assets.toml"))?;
     Ok(toml::from_str(&text)?)
 }
-
-fn cargo() -> String {
-    env::var("CARGO").unwrap_or_else(|_| "cargo".into())
-}
-
-// ----------------------------------------------------------------
-// Task implementations
-// ----------------------------------------------------------------
 
 fn check_collisions() -> Result<()> {
     let manifest = manifest()?;
@@ -423,8 +496,8 @@ fn check_collisions() -> Result<()> {
         };
         if let Some(prev) = bucket.insert(hash, entry.name.as_str()) {
             return Err(format!(
-                "AssetId collision: '{}' and '{}' \
-                 both hash to {hash:016x}",
+                "AssetId collision: '{}' and '{}' both hash \
+                 to {hash:016x}",
                 prev, entry.name
             )
             .into());
@@ -438,156 +511,111 @@ fn check_collisions() -> Result<()> {
     Ok(())
 }
 
-fn compile_shaders_for(app_name: &str) -> Result<()> {
-    let root = workspace_root();
-    let assets_dir = root.join("assets");
-    let out_assets_dir =
-        root.join("out").join(app_name).join("debug").join("assets");
-    fs::create_dir_all(&out_assets_dir)?;
-
-    let manifest = manifest()?;
-    let app = app_assets(app_name)?;
-
-    let index: HashMap<&str, _> = manifest
-        .asset
-        .iter()
-        .map(|e| (e.name.as_str(), e))
-        .collect();
-
-    let mut compiled = 0u32;
-
-    for req in &app.asset {
-        if req.asset_type != AssetType::Shader {
-            continue;
-        }
-        let entry = index
-            .get(req.name.as_str())
-            .ok_or_else(|| format!("shader '{}' not in manifest", req.name))?;
-        let Some(source_file) = &entry.source_file else {
-            continue;
-        };
-
-        let src = assets_dir.join(source_file);
-        let dst = out_assets_dir.join(&entry.file);
-
-        // Always recompile shaders to avoid caching issues.
-        println!("Compiling shader {} → {}", entry.name, entry.file.display());
-        run(Command::new("slangc")
-            .arg(&src)
-            .args(["-target", "spirv", "-o"])
-            .arg(&dst)
-            .args(&entry.compile_args))?;
-        compiled += 1;
+fn copy_if_changed(src: &Path, dst: &Path) -> Result<bool> {
+    if is_up_to_date(src, dst) {
+        return Ok(false);
     }
+    fs::copy(src, dst)?;
+    Ok(true)
+}
 
-    println!("{app_name} shaders: {compiled} compiled");
+// ----------------------------------------------------------------
+// Single-asset compile functions (output directly to cache)
+// ----------------------------------------------------------------
+
+fn compile_shader_asset(
+    src: &Path,
+    name: &str,
+    ext: &str,
+    compile_args: &[String],
+    force: bool,
+) -> Result<()> {
+    cache::ensure_cache_dir()?;
+    if !force && cache::lookup_shader(name, src, compile_args, ext).is_some() {
+        println!("Up-to-date: shader {name}");
+        return Ok(());
+    }
+    let dst = cache::artifact_path(name, ext);
+    println!("Compiling shader {name}");
+    run(Command::new("slangc")
+        .arg(src)
+        .args(["-target", "spirv", "-o"])
+        .arg(&dst)
+        .args(compile_args))?;
+    if let Err(e) = cache::write_shader_meta(name, src, compile_args, ext) {
+        eprintln!("warning: shader meta for {name}: {e}");
+    }
     Ok(())
 }
 
-fn compile_meshes_for(app_name: &str) -> Result<()> {
-    let root = workspace_root();
-    let assets_dir = root.join("assets");
-
-    let out_assets_dir =
-        root.join("out").join(app_name).join("debug").join("assets");
-    fs::create_dir_all(&out_assets_dir)?;
-
-    let manifest = manifest()?;
-    let app = app_assets(app_name)?;
-
-    let index: HashMap<&str, _> = manifest
-        .asset
-        .iter()
-        .map(|e| (e.name.as_str(), e))
-        .collect();
-
-    let mut compiled = 0u32;
-
-    for req in &app.asset {
-        if req.asset_type != AssetType::Mesh {
-            continue;
-        }
-        let entry = index
-            .get(req.name.as_str())
-            .ok_or_else(|| format!("mesh '{}' not in manifest", req.name))?;
-
-        let src = assets_dir.join(&entry.file);
-        let dst = out_assets_dir.join(format!("{}.pmesh", req.name));
-
-        // Always recompile meshes.
-        println!("Compiling mesh {} → {}.pmesh", req.name, req.name);
-        mesh::compile(&src, &dst, &manifest, req.name.as_str()).map_err(
-            |e| {
-                Box::<dyn std::error::Error>::from(std::io::Error::other(
-                    format!("mesh compile: {e}"),
-                ))
-            },
-        )?;
-        compiled += 1;
+fn compile_mesh_asset(
+    src: &Path,
+    name: &str,
+    manifest: &Manifest,
+    force: bool,
+) -> Result<()> {
+    cache::ensure_cache_dir()?;
+    let dst = cache::artifact_path(name, "pmesh");
+    if !force && is_up_to_date(src, &dst) {
+        println!("Up-to-date: mesh {name}");
+        return Ok(());
     }
-
-    println!("{app_name} meshes: {compiled} compiled");
+    println!("Compiling mesh {name}");
+    let tmp = dst.with_extension("pmesh.tmp");
+    mesh::compile(src, &tmp, manifest, name)
+        .map_err(|e| format!("mesh compile '{name}': {e}"))?;
+    if std::fs::rename(&tmp, &dst).is_err() {
+        std::fs::copy(&tmp, &dst)?;
+        let _ = std::fs::remove_file(&tmp);
+    }
     Ok(())
 }
 
-fn compile_images_for(app_name: &str) -> Result<()> {
-    let root = workspace_root();
-    let assets_dir = root.join("assets");
-    let out_assets_dir =
-        root.join("out").join(app_name).join("debug").join("assets");
-    fs::create_dir_all(&out_assets_dir)?;
-
-    let manifest = manifest()?;
-    let app = app_assets(app_name)?;
-
-    let index: HashMap<&str, _> = manifest
-        .asset
-        .iter()
-        .map(|e| (e.name.as_str(), e))
-        .collect();
-
-    let mut compiled = 0u32;
-
-    for req in &app.asset {
-        if req.asset_type != AssetType::Image {
-            continue;
-        }
-        let entry = index
-            .get(req.name.as_str())
-            .ok_or_else(|| format!("image '{}' not in manifest", req.name))?;
-
-        let src = assets_dir.join(&entry.file);
-        let dst = out_assets_dir.join(format!("{}.ptex", req.name));
-
-        let format = entry.format.as_deref().unwrap_or("rgba8");
-        let color_space = entry.color_space.as_deref().unwrap_or("srgb");
-        let mips = entry.mips.unwrap_or(false);
-
-        // Always recompile images.
-        println!("Compiling image {} → {}.ptex", req.name, req.name);
-        let fmt = match format {
-            "bc7" => asset_shared::TexFormat::Bc7,
-            "rgba8" => asset_shared::TexFormat::Rgba8,
-            other => return Err(format!("unknown format '{other}'").into()),
-        };
-        let cs = match color_space {
-            "srgb" => asset_shared::ColorSpace::Srgb,
-            "linear" => asset_shared::ColorSpace::Linear,
-            other => {
-                return Err(format!("unknown color-space '{other}'").into());
-            }
-        };
-        image::compile(&src, &dst, fmt, cs, mips).map_err(|e| {
-            Box::<dyn std::error::Error>::from(std::io::Error::other(format!(
-                "image compile: {e}"
-            )))
-        })?;
-        compiled += 1;
+fn compile_image_asset(
+    src: &Path,
+    name: &str,
+    format: &str,
+    color_space: &str,
+    mips: bool,
+    force: bool,
+) -> Result<()> {
+    cache::ensure_cache_dir()?;
+    if !force
+        && cache::lookup_image(name, src, format, color_space, mips).is_some()
+    {
+        println!("Up-to-date: image {name}");
+        return Ok(());
     }
-
-    println!("{app_name} images: {compiled} compiled");
+    let dst = cache::artifact_path(name, "ptex");
+    println!("Compiling image {name}");
+    let fmt = match format {
+        "bc7" => asset_shared::TexFormat::Bc7,
+        "bc5" => asset_shared::TexFormat::Bc5,
+        "rgba8" => asset_shared::TexFormat::Rgba8,
+        other => {
+            return Err(format!("unknown format '{other}'").into());
+        }
+    };
+    let cs = match color_space {
+        "srgb" => asset_shared::ColorSpace::Srgb,
+        "linear" => asset_shared::ColorSpace::Linear,
+        other => {
+            return Err(format!("unknown color-space '{other}'").into());
+        }
+    };
+    image::compile(src, &dst, fmt, cs, mips)
+        .map_err(|e| format!("image compile '{name}': {e}"))?;
+    if let Err(e) =
+        cache::write_image_meta(name, src, format, color_space, mips)
+    {
+        eprintln!("warning: image meta for {name}: {e}");
+    }
     Ok(())
 }
+
+// ----------------------------------------------------------------
+// Per-app build steps
+// ----------------------------------------------------------------
 
 fn cargo_build_pkg(pkg: &str) -> Result<()> {
     let root = workspace_root();
@@ -633,8 +661,6 @@ fn copy_assets_for(app_name: &str) -> Result<()> {
 }
 
 fn clean_for(app_name: &str) -> Result<()> {
-    // Remove compiled assets for this app from the out assets directory
-    // Load the app's asset list to determine compiled filenames
     let app = app_assets(app_name)?;
     let manifest = manifest()?;
     let index: HashMap<&str, _> = manifest
@@ -660,13 +686,11 @@ fn clean_for(app_name: &str) -> Result<()> {
             .join(&compiled_name);
         if path.exists() {
             fs::remove_file(&path)?;
-            println!("Removed cached {}", compiled_name);
+            println!("Removed {compiled_name}");
         }
     }
 
-    // Run `cargo clean -p <pkg>` to remove build artifacts for the package
     cargo_clean_pkg(app_name)?;
-    // Remove copied runtime outputs under `out/<app>`
     remove_out_for(app_name)?;
     Ok(())
 }

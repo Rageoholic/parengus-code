@@ -1,4 +1,4 @@
-next_id: t028
+next_id: t029
 ---
 
 # Task Graph Index
@@ -15,7 +15,7 @@ AI conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 
 ## Active Tree
 
-- t027 Import DamagedHelmet test asset [active]
+- t022 Implement LearnOpenGL-style Blinn-Phong renderer [active]
 
 ---
 
@@ -44,9 +44,10 @@ AI conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 | t019 | Resource state tracker              | planned   | renderer |                          |
 | t020 | Generate Slang compiler metadata    | planned   | pipeline |                          |
 | t021 | Emit SPIR-V 1.0 from PSIR emitter   | planned   | psir     |                          |
-| t022 | Implement LearnOpenGL-style Blinn-Phong renderer | planned | phoenix | parent task; baseline renderer path |
+| t022 | Implement LearnOpenGL-style Blinn-Phong renderer | active  | phoenix | parent task; baseline renderer path |
 | t023 | Blinn-Phong shader path            | planned   | phoenix  | child of t022 |
 | t024 | Blinn-Phong material plumbing      | planned   | phoenix  | child of t022 |
 | t025 | Blinn-Phong lighting uniforms      | planned   | phoenix  | child of t022 |
 | t026 | Blinn-Phong visual validation      | planned   | phoenix  | child of t022 |
-| t027 | Import DamagedHelmet test asset    | active    | phoenix  | child of t022 |
+| t027 | Import DamagedHelmet test asset    | done      | phoenix  | child of t022 |
+| t028 | Enable asset bake caching          | done      | pipeline | avoid recompressing unchanged assets |
