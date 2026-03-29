@@ -1,4 +1,4 @@
-next_id: t029
+next_id: t038
 ---
 
 # Task Graph Index
@@ -9,7 +9,7 @@ This is the entry point for the Parengus Task Graph (PTG), a
 lightweight hierarchical task system where each task is a markdown
 file. Read this file first each session, then open the specific task
 file(s) you need. For the full specification (file format, ID scheme,
-AI conventions), see [CONVENTIONS.md](CONVENTIONS.md).
+and AI interaction conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 
 ---
 
@@ -17,6 +17,8 @@ AI conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 
 - t003 Implement PBR shading [active]
   - t024 Material plumbing and SSBO infrastructure [active]
+  - t035 Directional lighting [planned, blocked by t024]
+- t001 Parengus Shader IR (PSIR) [planned, blocked by t033, t035]
 
 ---
 
@@ -52,3 +54,12 @@ AI conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 | t026 | Blinn-Phong visual validation      | dropped   | phoenix  | child of t022 |
 | t027 | Import DamagedHelmet test asset    | done      | phoenix  | child of t022 |
 | t028 | Enable asset bake caching          | done      | pipeline | avoid recompressing unchanged assets |
+| t029 | UI system with text rendering and buttons | planned | phoenix |                 |
+| t030 | Font import pipeline (TTF → SDF atlas) | planned | pipeline | child of t029 |
+| t031 | Text rendering system (SSBO-indexed quads) | planned | phoenix | child of t029; widgets are follow-up |
+| t032 | Observable/event system                    | planned | phoenix |               |
+| t033 | UI widget system                           | planned | phoenix | child of t029 |
+| t034 | Error dialog / fatal message display       | planned | infra   |               |
+| t035 | Directional lighting                       | planned | phoenix | child of t003 |
+| t036 | Custom Vulkan memory allocator             | idea    | rgpu-vk | explicitly deferred |
+| t037 | Harden state machine transitions with replace_with | planned | infra   |               |
