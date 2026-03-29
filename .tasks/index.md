@@ -15,7 +15,8 @@ AI conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 
 ## Active Tree
 
-- t022 Implement LearnOpenGL-style Blinn-Phong renderer [active]
+- t003 Implement PBR shading [active]
+  - t024 Material plumbing and SSBO infrastructure [active]
 
 ---
 
@@ -25,7 +26,7 @@ AI conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 |------|-------------------------------------|-----------|----------|--------------------------|
 | t001 | Parengus Shader IR (PSIR)           | planned   | psir     |                          |
 | t002 | xtask: smart rebuild-required check | planned   | infra    |                          |
-| t003 | Implement PBR shading               | planned   | phoenix  | deferred; depends on t022 |
+| t003 | Implement PBR shading               | active    | phoenix  |                          |
 | t004 | Implement TUI                       | planned   | phoenix  |                          |
 | t005 | Import renderer task graph          | completed | renderer | import of external graph |
 | t006 | RenderGraph / Executor split        | planned   | renderer |                          |
@@ -44,10 +45,10 @@ AI conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 | t019 | Resource state tracker              | planned   | renderer |                          |
 | t020 | Generate Slang compiler metadata    | planned   | pipeline |                          |
 | t021 | Emit SPIR-V 1.0 from PSIR emitter   | planned   | psir     |                          |
-| t022 | Implement LearnOpenGL-style Blinn-Phong renderer | active  | phoenix | parent task; baseline renderer path |
-| t023 | Blinn-Phong shader path            | planned   | phoenix  | child of t022 |
-| t024 | Blinn-Phong material plumbing      | planned   | phoenix  | child of t022 |
-| t025 | Blinn-Phong lighting uniforms      | planned   | phoenix  | child of t022 |
-| t026 | Blinn-Phong visual validation      | planned   | phoenix  | child of t022 |
+| t022 | Implement LearnOpenGL-style Blinn-Phong renderer | dropped | phoenix | pivoted to PBR directly |
+| t023 | Blinn-Phong shader path            | dropped   | phoenix  | child of t022 |
+| t024 | Material plumbing and SSBO infrastructure | active | phoenix | child of t003 |
+| t025 | Blinn-Phong lighting uniforms      | dropped   | phoenix  | child of t022 |
+| t026 | Blinn-Phong visual validation      | dropped   | phoenix  | child of t022 |
 | t027 | Import DamagedHelmet test asset    | done      | phoenix  | child of t022 |
 | t028 | Enable asset bake caching          | done      | pipeline | avoid recompressing unchanged assets |

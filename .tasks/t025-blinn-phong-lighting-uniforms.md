@@ -1,9 +1,9 @@
 ---
 id: t025
 title: "Blinn-Phong lighting uniforms"
-status: planned
+status: dropped
 created: 2026-03-24
-updated: 2026-03-24
+updated: 2026-03-29
 parent: t022
 children: []
 depends_on:
@@ -36,4 +36,5 @@ light types remain follow-up work.
 
 ## Outcome
 
-(not yet filled — task is planned)
+Dropped 2026-03-29. Parent task t022 (Blinn-Phong renderer) was
+dropped; the project pivots directly to PBR (t003).

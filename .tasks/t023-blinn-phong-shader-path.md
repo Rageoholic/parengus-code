@@ -1,9 +1,9 @@
 ---
 id: t023
 title: "Blinn-Phong shader path"
-status: planned
+status: dropped
 created: 2026-03-24
-updated: 2026-03-24
+updated: 2026-03-29
 parent: t022
 children: []
 depends_on: []
@@ -37,4 +37,5 @@ work are split into sibling child tasks.
 
 ## Outcome
 
-(not yet filled — task is planned)
+Dropped 2026-03-29. Parent task t022 (Blinn-Phong renderer) was
+dropped; the project pivots directly to PBR (t003).

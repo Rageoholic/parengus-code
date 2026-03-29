@@ -6,8 +6,10 @@ created: 2026-03-14
 updated: 2026-03-14
 parent: null
 children: []
-depends_on: []
-blocked_by: []
+depends_on:
+    - t003
+blocked_by:
+    - t003
 area: psir
 ---
 
