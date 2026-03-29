@@ -12,7 +12,9 @@ echo "Running rustfmt check..."
 cargo fmt -- --check
 
 echo "Running per-package clippy checks..."
-for pkg in rgpu-vk samp-app; do
+for pkg in \
+    asset-compiler asset-loader asset-pipeline asset-shared \
+    parengus-tracing phoenix rgpu-vk samp-app samp-app-noext xtask; do
     echo "  Checking $pkg..."
     cargo clippy -p "$pkg" --all-targets -- -D warnings
 done

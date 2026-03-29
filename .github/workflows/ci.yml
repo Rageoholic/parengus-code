@@ -27,8 +27,8 @@ jobs:
       matrix:
         package:
             [ asset-compiler, asset-loader, asset-pipeline,
-              asset-shared, phoenix, rgpu-vk, samp-app,
-              samp-app-noext, xtask ]
+              asset-shared, parengus-tracing, phoenix, rgpu-vk,
+              samp-app, samp-app-noext, xtask ]
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/rust-setup
