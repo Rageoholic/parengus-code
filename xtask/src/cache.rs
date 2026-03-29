@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
 struct CacheMeta {
-    src_mtime: u64,
+    src_hash: String,
     format: String,
     color_space: String,
     mips: bool,
@@ -14,7 +14,7 @@ struct CacheMeta {
 
 #[derive(Serialize, Deserialize)]
 struct ShaderMeta {
-    src_mtime: u64,
+    src_hash: String,
     compile_args: Vec<String>,
 }
 
@@ -42,6 +42,11 @@ pub(crate) fn artifact_path(name: &str, ext: &str) -> PathBuf {
     p
 }
 
+fn hash_file(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(blake3::hash(&bytes).to_hex().to_string())
+}
+
 pub fn lookup_image(
     name: &str,
     src: &Path,
@@ -57,12 +62,7 @@ pub fn lookup_image(
     }
     let meta_txt = fs::read_to_string(&meta_p).ok()?;
     let meta: CacheMeta = toml::from_str(&meta_txt).ok()?;
-    let src_mtime = fs::metadata(src).and_then(|m| m.modified()).ok()?;
-    let src_mtime = src_mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    if meta.src_mtime == src_mtime
+    if hash_file(src)? == meta.src_hash
         && meta.format == format
         && meta.color_space == color_space
         && meta.mips == mips
@@ -87,12 +87,7 @@ pub fn lookup_shader(
     }
     let meta_txt = fs::read_to_string(&meta_p).ok()?;
     let meta: ShaderMeta = toml::from_str(&meta_txt).ok()?;
-    let src_mtime = fs::metadata(src).and_then(|m| m.modified()).ok()?;
-    let src_mtime = src_mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    if meta.src_mtime == src_mtime && meta.compile_args == compile_args {
+    if hash_file(src)? == meta.src_hash && meta.compile_args == compile_args {
         Some(art_p)
     } else {
         None
@@ -110,13 +105,11 @@ pub(crate) fn write_image_meta(
     normal_map: bool,
 ) -> std::io::Result<()> {
     let meta_p = meta_path(name, "ptex");
-    let src_mtime = fs::metadata(src)?.modified()?;
-    let src_mtime = src_mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let src_hash = hash_file(src).ok_or_else(|| {
+        std::io::Error::other(format!("failed to hash {}", src.display()))
+    })?;
     let meta = CacheMeta {
-        src_mtime,
+        src_hash,
         format: format.to_string(),
         color_space: color_space.to_string(),
         mips,
@@ -137,13 +130,11 @@ pub(crate) fn write_shader_meta(
     ext: &str,
 ) -> std::io::Result<()> {
     let meta_p = meta_path(name, ext);
-    let src_mtime = fs::metadata(src)?.modified()?;
-    let src_mtime = src_mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let src_hash = hash_file(src).ok_or_else(|| {
+        std::io::Error::other(format!("failed to hash {}", src.display()))
+    })?;
     let meta = ShaderMeta {
-        src_mtime,
+        src_hash,
         compile_args: compile_args.to_vec(),
     };
     let tom = toml::to_string(&meta).unwrap();

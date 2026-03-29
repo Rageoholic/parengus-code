@@ -12,7 +12,7 @@ clap = { version = "4", features = ["derive"] }
 bevy_mikktspace = "1.0"
 gltf = "1"
 image = "0.25"
-lz4_flex = { version = "0.12", features = ["frame"] }
+lz4_flex = { version = "0.13", features = ["frame"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
