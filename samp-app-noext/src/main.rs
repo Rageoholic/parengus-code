@@ -400,6 +400,7 @@ fn main() -> eyre::Result<()> {
         queue_config_strict: cli_args.queue_config_strict,
         min_sample_count: cli_args.aa.sample_count(),
         min_sample_count_strict: cli_args.aa_strict,
+        descriptor_indexing: false,
     };
     let requested_sample_count = cli_args.aa.sample_count();
 
@@ -1375,6 +1376,7 @@ impl AppRunner {
                 descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
                 count: 1,
                 stage_flags: vk::ShaderStageFlags::VERTEX,
+                binding_flags: vk::DescriptorBindingFlags::empty(),
             }],
             Some("camera set layout"),
         )?);
@@ -1385,6 +1387,7 @@ impl AppRunner {
                 descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 count: 1,
                 stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                binding_flags: vk::DescriptorBindingFlags::empty(),
             }],
             Some("material set layout"),
         )?);

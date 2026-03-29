@@ -10,14 +10,26 @@ struct CameraUbo
 [[vk::binding(0, 0)]]
 ConstantBuffer<CameraUbo> camera;
 
-// Set 1 — material: bindless texture array, bound once at load time.
+// Set 1 — material: bindless texture array (binding 0, unbounded,
+// PARTIALLY_BOUND) and material SSBO (binding 1).
 [[vk::binding(0, 1)]]
-Sampler2D textures[16];
+Sampler2D textures[];
+
+struct MaterialGpu
+{
+    uint albedo_idx;
+    uint normal_idx;
+    uint orm_idx;
+    int  emissive_idx; // negative = no emissive texture
+};
+
+[[vk::binding(1, 1)]]
+StructuredBuffer<MaterialGpu> materials;
 
 struct PushConstants
 {
     VekMat4 model;
-    uint tex_idx;
+    uint material_idx;
 };
 
 [[vk::push_constant]]
@@ -55,5 +67,9 @@ VertexOutput vert_main(VertexInput input)
 [shader("fragment")]
 float4 frag_main(VertexOutput in_vert) : SV_Target
 {
-    return textures[push.tex_idx].Sample(in_vert.tex_coord);
+    // Look up this submesh's material and sample its albedo texture.
+    // Normal, ORM, and emissive channels are wired up here but shading
+    // is deferred to t023 (Blinn-Phong shader path).
+    MaterialGpu mat = materials[push.material_idx];
+    return textures[mat.albedo_idx].Sample(in_vert.tex_coord);
 }

@@ -330,6 +330,11 @@ pub struct DeviceConfig {
     /// default), unsupported devices are still considered but
     /// score lower.
     pub min_sample_count_strict: bool,
+    /// Enable `VkPhysicalDeviceDescriptorIndexingFeatures` with
+    /// `descriptor_binding_partially_bound`. Core in Vulkan 1.2;
+    /// on older devices requires `VK_EXT_descriptor_indexing`
+    /// and its dependency `VK_KHR_maintenance3`.
+    pub descriptor_indexing: bool,
 }
 
 impl Device {
@@ -403,6 +408,9 @@ impl Device {
             /// True when VK_EXT_memory_budget is supported and
             /// should be enabled.
             enable_memory_budget: bool,
+            /// True when `VK_EXT_descriptor_indexing` must be
+            /// enabled (pre-1.2 device).
+            use_descriptor_indexing_ext: bool,
         }
 
         //Capacity here is upper bound
@@ -430,6 +438,9 @@ impl Device {
             let is_pre_1_3 = instance.strict_1_0()
                 || dev_api.major() < 1
                 || (dev_api.major() == 1 && dev_api.minor() < 3);
+            let is_pre_1_2 = instance.strict_1_0()
+                || dev_api.major() < 1
+                || (dev_api.major() == 1 && dev_api.minor() < 2);
             let is_pre_1_1 = instance.strict_1_0()
                 || dev_api.major() < 1
                 || (dev_api.major() == 1 && dev_api.minor() < 1);
@@ -509,6 +520,28 @@ impl Device {
             let enable_shader_non_semantic = config.shader_non_semantic_info
                 && is_pre_1_3
                 && has_ext(ash::khr::shader_non_semantic_info::NAME);
+
+            // VK_EXT_descriptor_indexing: core in 1.2; required
+            // extension on older devices when requested — hard
+            // filter. Also requires VK_KHR_maintenance3.
+            let use_descriptor_indexing_ext =
+                if config.descriptor_indexing && is_pre_1_2 {
+                    if has_ext(ash::khr::maintenance3::NAME)
+                        && has_ext(ash::ext::descriptor_indexing::NAME)
+                    {
+                        true
+                    } else {
+                        tracing::debug!(
+                            "Skipping {:?}: missing \
+                             VK_EXT_descriptor_indexing or \
+                             VK_KHR_maintenance3",
+                            props.device_name_as_c_str().unwrap_or(c"unknown"),
+                        );
+                        continue 'dev;
+                    }
+                } else {
+                    false
+                };
 
             // VK_EXT_memory_budget: optional device extension.
             // Enables accurate heap-usage/budget queries via
@@ -626,6 +659,7 @@ impl Device {
                 use_maintenance1_ext,
                 enable_shader_non_semantic,
                 enable_memory_budget,
+                use_descriptor_indexing_ext,
             });
         }
 
@@ -643,6 +677,7 @@ impl Device {
         let use_sync2_ext = best.use_sync2_ext;
         let use_dr_ext = best.use_dr_ext;
         let use_maintenance1_ext = best.use_maintenance1_ext;
+        let use_descriptor_indexing_ext = best.use_descriptor_indexing_ext;
         // SAFETY: physical_device was selected from this instance.
         let memory_properties = unsafe {
             instance.get_raw_physical_device_memory_properties(physical_device)
@@ -795,6 +830,9 @@ impl Device {
         //                 └── VK_KHR_maintenance2 (1.1 core)
         //   VK_KHR_maintenance1
         //     (no deps)
+        //   VK_EXT_descriptor_indexing
+        //     └── VK_KHR_maintenance3
+        //           (no device-ext deps)
         let mut mandatory_exts: HashSet<&CStr> = HashSet::new();
         if config.swapchain {
             mandatory_exts.insert(ash::khr::swapchain::NAME);
@@ -822,6 +860,10 @@ impl Device {
         if use_maintenance1_ext {
             mandatory_exts.insert(ash::khr::maintenance1::NAME);
         }
+        if use_descriptor_indexing_ext {
+            mandatory_exts.insert(ash::khr::maintenance3::NAME);
+            mandatory_exts.insert(ash::ext::descriptor_indexing::NAME);
+        }
 
         let ext_ptrs: Vec<*const i8> =
             mandatory_exts.iter().map(|e| e.as_ptr()).collect();
@@ -835,6 +877,11 @@ impl Device {
         let mut dr_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default()
                 .dynamic_rendering(true);
+        // Enable descriptor indexing: partially-bound descriptors
+        // (core 1.2 or via VK_EXT_descriptor_indexing).
+        let mut descriptor_indexing_features =
+            vk::PhysicalDeviceDescriptorIndexingFeatures::default()
+                .descriptor_binding_partially_bound(true);
 
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
@@ -863,6 +910,16 @@ impl Device {
             } else {
                 device_create_info =
                     device_create_info.push_next(&mut dr_features);
+            }
+        }
+        if config.descriptor_indexing {
+            if use_descriptor_indexing_ext {
+                features2 =
+                    features2.push_next(&mut descriptor_indexing_features);
+                use_features2 = true;
+            } else {
+                device_create_info = device_create_info
+                    .push_next(&mut descriptor_indexing_features);
             }
         }
         if use_features2 {

@@ -29,6 +29,10 @@ pub struct DescriptorBindingDesc {
     pub count: u32,
     /// Shader stages that can access this binding.
     pub stage_flags: vk::ShaderStageFlags,
+    /// Per-binding descriptor indexing flags (e.g.
+    /// `PARTIALLY_BOUND_EXT`). Leave empty (`DescriptorBindingFlags
+    /// ::empty()`) when not using descriptor indexing.
+    pub binding_flags: vk::DescriptorBindingFlags,
 }
 
 impl From<DescriptorBindingDesc> for vk::DescriptorSetLayoutBinding<'static> {
@@ -70,8 +74,23 @@ impl DescriptorSetLayout {
     ) -> Result<Self, vk::Result> {
         let vk_bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> =
             bindings.iter().copied().map(Into::into).collect();
-        let create_info =
+        let mut create_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&vk_bindings);
+        // If any binding requests per-binding flags (e.g.
+        // PARTIALLY_BOUND_EXT), chain a binding flags create-info.
+        // The flags vec must be one entry per binding in the same
+        // order, with empty flags for bindings that don't need them.
+        let any_flags = bindings.iter().any(|b| !b.binding_flags.is_empty());
+        let binding_flags_vec: Vec<vk::DescriptorBindingFlags>;
+        let mut binding_flags_info;
+        if any_flags {
+            binding_flags_vec =
+                bindings.iter().map(|b| b.binding_flags).collect();
+            binding_flags_info =
+                vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                    .binding_flags(&binding_flags_vec);
+            create_info = create_info.push_next(&mut binding_flags_info);
+        }
         // SAFETY: create_info references valid binding descriptions
         // for the duration of this call.
         let handle =
@@ -311,6 +330,37 @@ impl DescriptorSet {
                 sampler.raw_sampler(),
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             )
+        }
+    }
+
+    /// Update this descriptor set's binding with a storage buffer.
+    ///
+    /// # Safety
+    /// - `buffer` must be a valid buffer created from `device` with
+    ///   `STORAGE_BUFFER` usage.
+    /// - `range` must not exceed the buffer's size.
+    /// - The buffer must remain valid for as long as this descriptor
+    ///   set is bound in any submitted command buffer.
+    pub unsafe fn write_storage_buffer<B: BufferHandle>(
+        &self,
+        device: &Arc<Device>,
+        binding: u32,
+        buffer: &B,
+        range: vk::DeviceSize,
+    ) {
+        let buffer_info = vk::DescriptorBufferInfo::default()
+            .buffer(buffer.raw_buffer())
+            .offset(0)
+            .range(range);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.handle)
+            .dst_binding(binding)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&buffer_info));
+        // SAFETY: Caller guarantees device, buffer, and range
+        // validity.
+        unsafe {
+            device.update_raw_descriptor_sets(std::slice::from_ref(&write), &[])
         }
     }
 

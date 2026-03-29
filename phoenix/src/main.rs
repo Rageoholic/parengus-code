@@ -7,7 +7,9 @@ use std::{
 };
 
 use asset_loader::{AssetMap, MeshAsset, TexAsset};
-use asset_shared::{ColorSpace, TexFormat, TextureId, mesh_id, shader_id};
+use asset_shared::{
+    ColorSpace, TexFormat, TexRole, TextureId, mesh_id, shader_id,
+};
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use parengus_tracing::{TracingLogLevel, init_default};
@@ -62,15 +64,29 @@ struct Ubo {
     view_proj: Mat4<f32>,
 }
 
-/// Push-constant block — model matrix + texture slot index.
+/// Push-constant block — model matrix + material index.
 ///
-/// Updated per submesh draw. model (64 B) + tex_idx (4 B) = 68 B
+/// Updated per submesh draw. model (64 B) + material_idx (4 B) = 68 B
 /// total; visible to both vertex and fragment stages.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct PushConstants {
     model: Mat4<f32>,
-    tex_idx: u32,
+    material_idx: u32,
+}
+
+/// Per-material GPU data stored in the material SSBO.
+///
+/// One entry per submesh draw, indexed via `material_idx` in the
+/// push constants. Indices point into the bindless texture array;
+/// `emissive_idx` is negative when no emissive texture is present.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct MaterialGpu {
+    albedo_idx: u32,
+    normal_idx: u32,
+    orm_idx: u32,
+    emissive_idx: i32,
 }
 
 /// Per-submesh draw record built at load time from SubMeshInfo.
@@ -82,9 +98,8 @@ struct SubmeshDraw {
     /// mesh (passed as the `vertex_offset` parameter of
     /// `vkCmdDrawIndexed`).
     vertex_offset: i32,
-    /// Slot into the bindless texture array (widened to u32 at push
-    /// time).
-    tex_idx: u16,
+    /// Index into the material SSBO for this submesh.
+    material_idx: u32,
     /// Index into MODEL_SCALES / MODEL_OFFSETS.
     model_idx: usize,
     /// Pre-baked TRS from the glTF node, in Z-up space.
@@ -429,6 +444,7 @@ pub fn main() -> eyre::Result<()> {
         queue_config_strict: cli_args.queue_config_strict,
         min_sample_count: cli_args.aa.sample_count(),
         min_sample_count_strict: cli_args.aa_strict,
+        descriptor_indexing: true,
     };
 
     let mut app = AppRunner(Some(App::Initializing(InitializingState {
@@ -455,7 +471,10 @@ enum App {
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
-const MAX_BINDLESS_TEXTURES: usize = 16;
+const MAX_BINDLESS_TEXTURES: usize = 256;
+const DEFAULT_ALBEDO_SLOT: u32 = 0;
+const DEFAULT_NORMAL_SLOT: u32 = 1;
+const DEFAULT_ORM_SLOT: u32 = 2;
 /// World-space X offsets so the three models stand side-by-side.
 /// Per-model uniform scale. The three Khronos reference models have
 /// no shared scale convention; these factors compensate. Will be
@@ -609,6 +628,8 @@ struct RunningState {
     asset_map: AssetMap,
     textures: Vec<Texture>,
     sampler: Sampler,
+    /// Host-visible SSBO holding one MaterialGpu per submesh draw.
+    material_ssbo: HostVisibleBuffer,
 }
 
 impl std::fmt::Debug for RunningState {
@@ -659,6 +680,7 @@ struct SuspendedState {
     asset_map: AssetMap,
     textures: Vec<Texture>,
     sampler: Sampler,
+    material_ssbo: HostVisibleBuffer,
 }
 #[derive(Debug)]
 struct ExitingState {}
@@ -747,6 +769,7 @@ impl ApplicationHandler for AppRunner {
                 asset_map,
                 textures,
                 sampler,
+                material_ssbo,
             } = running_state;
 
             if let Err(e) = device.wait_idle() {
@@ -782,6 +805,7 @@ impl ApplicationHandler for AppRunner {
                 asset_map,
                 textures,
                 sampler,
+                material_ssbo,
             });
         }
     }
@@ -1236,7 +1260,7 @@ impl AppRunner {
             )
         };
 
-        // Per-submesh draw loop: push model+tex_idx, then indexed draw.
+        // Per-submesh draw loop: push model+material_idx, then draw.
         // SAFETY: all required dynamic state set; render pass active;
         // vertex and index buffers bound; pipeline_layout compatible.
         let rotation = Mat4::<f32>::rotation_z(elapsed / 5.0 * TAU32);
@@ -1251,7 +1275,7 @@ impl AppRunner {
                 * scale;
             let push = PushConstants {
                 model: placement * draw.sub_trs,
-                tex_idx: draw.tex_idx as u32,
+                material_idx: draw.material_idx,
             };
             // SAFETY: layout compatible with bound pipeline; VERTEX|FRAGMENT
             // stage and offset 0 match the declared range; push fits in the
@@ -1471,8 +1495,9 @@ impl AppRunner {
         let assets_dir = state.self_dir.join("assets");
 
         // Load all three meshes into a combined vertex/index buffer.
-        // Textures are deduped by TextureId and loaded once per unique
-        // albedo; each SubmeshDraw stores the bindless slot index.
+        // Textures are deduped by TextureId (u64 hash). The first
+        // DEFAULT_TEX_COUNT slots are reserved for the hardcoded
+        // defaults; real textures follow.
         struct TexLoadInfo {
             width: u32,
             height: u32,
@@ -1487,8 +1512,100 @@ impl AppRunner {
         let mut scene_vertices: Vec<Vertex> = Vec::new();
         let mut scene_indices: Vec<u32> = Vec::new();
         let mut submesh_draws: Vec<SubmeshDraw> = Vec::new();
-        let mut tex_id_to_slot: HashMap<u64, u16> = HashMap::new();
+        let mut material_gpus: Vec<MaterialGpu> = Vec::new();
+        // Maps TextureId hash → slot index in the bindless array.
+        let mut tex_id_to_slot: HashMap<u64, u32> = HashMap::new();
         let mut tex_load_infos: Vec<TexLoadInfo> = Vec::new();
+
+        // Default textures occupy the first DEFAULT_TEX_COUNT slots.
+        // Slot 0: magenta albedo (R8G8B8A8_SRGB)
+        tex_load_infos.push(TexLoadInfo {
+            width: 1,
+            height: 1,
+            format: vk::Format::R8G8B8A8_SRGB,
+            mip_count: 1,
+            name: "default-albedo".to_owned(),
+            mip_data: vec![(vec![255u8, 0, 255, 255], 0)],
+            total_bytes: 4,
+        });
+        // Slot 1: flat normal (R8G8_UNORM, (127, 127) ≈ (0, 0, 1))
+        tex_load_infos.push(TexLoadInfo {
+            width: 1,
+            height: 1,
+            format: vk::Format::R8G8_UNORM,
+            mip_count: 1,
+            name: "default-normal".to_owned(),
+            mip_data: vec![(vec![127u8, 127], 0)],
+            total_bytes: 2,
+        });
+        // Slot 2: default ORM (R8G8B8A8_UNORM, O=1.0, R=0.5, M=0.0)
+        // R8G8B8_UNORM is not reliably supported; use RGBA and ignore A.
+        tex_load_infos.push(TexLoadInfo {
+            width: 1,
+            height: 1,
+            format: vk::Format::R8G8B8A8_UNORM,
+            mip_count: 1,
+            name: "default-orm".to_owned(),
+            mip_data: vec![(vec![255u8, 128, 0, 255], 0)],
+            total_bytes: 4,
+        });
+
+        // Resolve a TextureId to a slot, loading the texture if needed.
+        // Returns the default slot for the given role on failure/absence.
+        let resolve_tex = |id: TextureId,
+                           role_default: u32,
+                           tex_id_to_slot: &mut HashMap<u64, u32>,
+                           tex_load_infos: &mut Vec<TexLoadInfo>,
+                           asset_map: &AssetMap,
+                           assets_dir: &std::path::Path|
+         -> eyre::Result<u32> {
+            if id.0 == 0 {
+                return Ok(role_default);
+            }
+            if let Some(&s) = tex_id_to_slot.get(&id.0) {
+                return Ok(s);
+            }
+            if tex_load_infos.len() >= MAX_BINDLESS_TEXTURES {
+                eyre::bail!(
+                    "too many unique textures (max {MAX_BINDLESS_TEXTURES})"
+                );
+            }
+            let tex_name =
+                asset_map.name_of(id).unwrap_or("unknown").to_owned();
+            let tex_file = asset_map.get(id).ok_or_else(|| {
+                eyre::eyre!("texture '{tex_name}' not in asset map")
+            })?;
+            let tex_asset = TexAsset::open(&assets_dir.join(tex_file))
+                .map_err(|e| eyre::eyre!("load {tex_name}: {e}"))?;
+            let fmt = tex_vk_format(
+                tex_asset.info.format,
+                tex_asset.info.color_space,
+            );
+            let w = tex_asset.info.width;
+            let h = tex_asset.info.height;
+            let mc = tex_asset.info.mip_count;
+            let mut mip_data: Vec<(Vec<u8>, usize)> = Vec::new();
+            let mut off: usize = 0;
+            for mip_res in tex_asset.mips() {
+                let mip_iter =
+                    mip_res.map_err(|e| eyre::eyre!("{tex_name} mip: {e}"))?;
+                let data: Vec<u8> = mip_iter.map(|[b]| b).collect();
+                mip_data.push((data, off));
+                off += mip_data.last().unwrap().0.len();
+            }
+            let slot = tex_load_infos.len() as u32;
+            tex_id_to_slot.insert(id.0, slot);
+            tex_load_infos.push(TexLoadInfo {
+                width: w,
+                height: h,
+                format: fmt,
+                mip_count: mc,
+                name: tex_name,
+                mip_data,
+                total_bytes: off,
+            });
+            Ok(slot)
+        };
 
         for (model_idx, &mesh_name) in mesh_names.iter().enumerate() {
             let mesh_filename = asset_map
@@ -1518,72 +1635,75 @@ impl AppRunner {
                 .map_err(|e| eyre::eyre!("{mesh_name} indices: {e}"))?;
             scene_indices.extend(indices_iter);
 
+            // Resolve global (per-mesh) texture roles once.
+            let find_global = |role: TexRole| -> TextureId {
+                mesh.tex_refs
+                    .iter()
+                    .find(|(r, _)| *r == role)
+                    .map(|(_, id)| *id)
+                    .unwrap_or(TextureId::from_hash(0))
+            };
+            let normal_id = find_global(TexRole::Normal);
+            let orm_id = find_global(TexRole::MetallicRoughness);
+            let emissive_id = find_global(TexRole::Emissive);
+
+            let normal_slot = resolve_tex(
+                normal_id,
+                DEFAULT_NORMAL_SLOT,
+                &mut tex_id_to_slot,
+                &mut tex_load_infos,
+                &asset_map,
+                &assets_dir,
+            )?;
+            let orm_slot = resolve_tex(
+                orm_id,
+                DEFAULT_ORM_SLOT,
+                &mut tex_id_to_slot,
+                &mut tex_load_infos,
+                &asset_map,
+                &assets_dir,
+            )?;
+            let emissive_slot: i32 = if emissive_id.0 != 0 {
+                resolve_tex(
+                    emissive_id,
+                    DEFAULT_ALBEDO_SLOT,
+                    &mut tex_id_to_slot,
+                    &mut tex_load_infos,
+                    &asset_map,
+                    &assets_dir,
+                )? as i32
+            } else {
+                -1
+            };
+
             for (sub_idx, sub) in mesh.sub_meshes.iter().enumerate() {
                 let albedo_id = mesh
                     .sub_mesh_albedos
                     .get(sub_idx)
                     .copied()
                     .unwrap_or(TextureId::from_hash(0));
-                if albedo_id.0 == 0 {
-                    continue;
-                }
-                let tex_slot = if let Some(&s) =
-                    tex_id_to_slot.get(&albedo_id.0)
-                {
-                    s
-                } else {
-                    if tex_load_infos.len() >= MAX_BINDLESS_TEXTURES {
-                        eyre::bail!(
-                            "too many unique albedo textures \
-                             (max {MAX_BINDLESS_TEXTURES})"
-                        );
-                    }
-                    let tex_name = asset_map
-                        .name_of(albedo_id)
-                        .unwrap_or("unknown")
-                        .to_owned();
-                    let tex_file =
-                        asset_map.get(albedo_id).ok_or_else(|| {
-                            eyre::eyre!("albedo '{tex_name}' not in asset map")
-                        })?;
-                    let tex_asset = TexAsset::open(&assets_dir.join(tex_file))
-                        .map_err(|e| eyre::eyre!("load {tex_name}: {e}"))?;
-                    let fmt = tex_vk_format(
-                        tex_asset.info.format,
-                        tex_asset.info.color_space,
-                    );
-                    let w = tex_asset.info.width;
-                    let h = tex_asset.info.height;
-                    let mc = tex_asset.info.mip_count as u32;
-                    let mut mip_data: Vec<(Vec<u8>, usize)> = Vec::new();
-                    let mut off: usize = 0;
-                    for mip_res in tex_asset.mips() {
-                        let mip_iter = mip_res
-                            .map_err(|e| eyre::eyre!("{tex_name} mip: {e}"))?;
-                        let data: Vec<u8> = mip_iter.map(|[b]| b).collect();
-                        mip_data.push((data, off));
-                        off += mip_data.last().unwrap().0.len();
-                    }
-                    let slot = tex_load_infos.len() as u16;
-                    tex_id_to_slot.insert(albedo_id.0, slot);
-                    tex_load_infos.push(TexLoadInfo {
-                        width: w,
-                        height: h,
-                        format: fmt,
-                        mip_count: mc,
-                        name: tex_name,
-                        mip_data,
-                        total_bytes: off,
-                    });
-                    slot
-                };
+                let albedo_slot = resolve_tex(
+                    albedo_id,
+                    DEFAULT_ALBEDO_SLOT,
+                    &mut tex_id_to_slot,
+                    &mut tex_load_infos,
+                    &asset_map,
+                    &assets_dir,
+                )?;
+                let material_idx = material_gpus.len() as u32;
+                material_gpus.push(MaterialGpu {
+                    albedo_idx: albedo_slot,
+                    normal_idx: normal_slot,
+                    orm_idx: orm_slot,
+                    emissive_idx: emissive_slot,
+                });
                 let sub_trs =
                     trs_to_mat4(sub.translation, sub.rotation, sub.scale);
                 submesh_draws.push(SubmeshDraw {
                     first_index: sub.index_base + index_offset,
                     index_count: sub.index_count,
                     vertex_offset,
-                    tex_idx: tex_slot,
+                    material_idx,
                     model_idx,
                     sub_trs,
                 });
@@ -1713,20 +1833,31 @@ impl AppRunner {
                 descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
                 count: 1,
                 stage_flags: vk::ShaderStageFlags::VERTEX,
+                binding_flags: vk::DescriptorBindingFlags::empty(),
             }],
             Some("camera set layout"),
         )?);
-        // Set 1: material — bindless texture array, bound once at load
-        // time. All MAX_BINDLESS_TEXTURES slots must be written before
-        // any draw call references them.
+        // Set 1: material — bindless texture array (binding 0,
+        // PARTIALLY_BOUND so unused slots need not be written) plus
+        // the material SSBO (binding 1).
         let material_set_layout = Arc::new(DescriptorSetLayout::new(
             &device,
-            &[DescriptorBindingDesc {
-                binding: 0,
-                descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                count: MAX_BINDLESS_TEXTURES as u32,
-                stage_flags: vk::ShaderStageFlags::FRAGMENT,
-            }],
+            &[
+                DescriptorBindingDesc {
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    count: MAX_BINDLESS_TEXTURES as u32,
+                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                    binding_flags: vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+                },
+                DescriptorBindingDesc {
+                    binding: 1,
+                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                    count: 1,
+                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                    binding_flags: vk::DescriptorBindingFlags::empty(),
+                },
+            ],
             Some("material set layout"),
         )?);
         let pipeline_layout = Arc::new(PipelineLayout::new(
@@ -1845,7 +1976,8 @@ impl AppRunner {
             .collect::<Result<Vec<_>, _>>()?;
 
         // One camera set per frame + one material set = FIF + 1 total.
-        // The material set holds MAX_BINDLESS_TEXTURES sampler slots.
+        // The material set holds the bindless texture array (binding 0)
+        // and the material SSBO (binding 1).
         let descriptor_pool = DescriptorPool::new(
             &device,
             (MAX_FRAMES_IN_FLIGHT + 1) as u32,
@@ -1857,6 +1989,10 @@ impl AppRunner {
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                     descriptor_count: MAX_BINDLESS_TEXTURES as u32,
+                },
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    descriptor_count: 1,
                 },
             ],
             Some("descriptor pool"),
@@ -2196,17 +2332,11 @@ impl AppRunner {
             Some("albedo sampler"),
         )?;
 
-        // Write all loaded textures into the bindless descriptor array.
-        // Fill unused trailing slots with slot 0 so every descriptor
-        // in the fixed-size array is valid (Vulkan requires this without
-        // VK_EXT_descriptor_indexing PARTIALLY_BOUND).
-        let fallback_view = textures[0].raw_image_view();
-        for slot in 0..MAX_BINDLESS_TEXTURES {
-            let view = textures
-                .get(slot)
-                .map(|t| t.raw_image_view())
-                .unwrap_or(fallback_view);
-            // SAFETY: textures and sampler live in RunningState /
+        // Write only the slots we actually populated into the bindless
+        // descriptor array. PARTIALLY_BOUND means unused slots do not
+        // need to be backed by valid descriptors.
+        for (slot, tex) in textures.iter().enumerate() {
+            // SAFETY: tex and sampler live in RunningState /
             // SuspendedState and outlive any command buffer that
             // references this descriptor set; images are in
             // SHADER_READ_ONLY_OPTIMAL after the upload fence wait.
@@ -2215,12 +2345,33 @@ impl AppRunner {
                     &device,
                     0,
                     slot as u32,
-                    view,
+                    tex.raw_image_view(),
                     sampler.raw_sampler(),
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 )
             };
         }
+
+        // Upload the material SSBO (host-visible; written once at load).
+        let material_ssbo_size =
+            (material_gpus.len() * size_of::<MaterialGpu>()) as vk::DeviceSize;
+        let mut material_ssbo = HostVisibleBuffer::new(
+            &device,
+            material_ssbo_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            Some("material ssbo"),
+        )?;
+        material_ssbo.write_pod_iter_exact(material_gpus.into_iter())?;
+        // SAFETY: material_ssbo lives in RunningState/SuspendedState and
+        // outlives any command buffer referencing this descriptor set.
+        unsafe {
+            material_descriptor_set.write_storage_buffer(
+                &device,
+                1,
+                &material_ssbo,
+                material_ssbo_size,
+            )
+        };
 
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
         let idle_guard =
@@ -2258,6 +2409,7 @@ impl AppRunner {
             asset_map,
             textures,
             sampler,
+            material_ssbo,
         })
     }
 
@@ -2411,6 +2563,7 @@ impl AppRunner {
             asset_map: state.asset_map,
             textures: state.textures,
             sampler: state.sampler,
+            material_ssbo: state.material_ssbo,
         })
     }
 

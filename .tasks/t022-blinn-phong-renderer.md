@@ -1,9 +1,9 @@
 ---
 id: t022
 title: "Implement LearnOpenGL-style Blinn-Phong renderer"
-status: active
+status: dropped
 created: 2026-03-24
-updated: 2026-03-24
+updated: 2026-03-29
 parent: null
 children:
       - t023
@@ -54,4 +54,7 @@ of blocking near-term renderer progress.
 
 ## Outcome
 
-(not yet filled — task is planned)
+Dropped 2026-03-29. The Blinn-Phong intermediate step was removed in
+favour of going straight to PBR (t003). The material/SSBO
+infrastructure built under t024 carries forward unchanged, re-parented
+to t003, as it was always targeting PBR-appropriate texture slots.
