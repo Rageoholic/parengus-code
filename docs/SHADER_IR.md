@@ -63,7 +63,7 @@ Light(0) := load_elem lights idx
 result := add f32(0) f32(0)
 
 // Named — bare identifier, type inferred
-albedo := sample tex(0) uv LinearWrap
+albedo := sample tex(0) uv Linear Repeat
 
 // Annotated — explicit type verified against inference
 quad : f32 = add double double   // errors if inferred type != f32
@@ -110,78 +110,133 @@ in a separate debug section mapping register index to a debug-name entry.
 - `mat2<T>`, `mat3<T>`, `mat4<T>` — matrix; column-major (matches vek and engine
   convention)
 - array — fixed-size
-- **Texture types** — opaque resource handles. Logically each texture is a
-  physical index paired with a `SamplingPolicy` describing how to interpret
-  the texel data. The encoding is opaque to the shader; the shader calls
-  `sample` and receives a `vec4<f32>`. May appear as struct fields, entry
-  point resources, or explicit helper arguments. Cannot appear as vector
-  components or `ReadBuffer` element types. `Optional<T>` is valid for any
-  texture type. SPIR-V does not allow opaque types as struct members; the
-  emitter unpacks them during lowering.
+- **`ReadTexture*<T>`** / **`WriteTexture*<T>`** — parameterized opaque
+  texture handles. T determines the access shape:
+  - **Struct T** (named interface): fields name the channels; all leaf
+    fields are `vec4<f32>`. Structs may be nested — the engine assigns
+    an integer ID to every node in the struct tree (not just leaves), so
+    both sub-structs and leaf channels are directly addressable. `sample`
+    / `texel_fetch` on the root return the full nested struct;
+    `texel_store_channel` writes a named field. The engine owns physical
+    binding, texel interpretation, and fallback.
+  - **Numeric T** (raw): a scalar or `vec2`/`vec3`/`vec4` numeric type.
+    Single-texture handle with no engine-managed channel layout.
+    `sample` / `texel_fetch` return T directly; `texel_store` writes T.
 
-  Sampler mode is an immediate on every sample op (not a type or binding).
-  Builtin modes: `LinearClamp` (default), `LinearWrap`, `LinearMirror`,
-  `NearestClamp`, `NearestWrap`, `NearestMirror`. See Instruction Set §
-  Textures for full sample op syntax.
+  The variant pins the coordinate type and layer convention. Declared as
+  entry point resources with `read_texture(T)` / `write_texture(T)`.
+  All channels share a single coordinate space; different coordinate
+  needs belong in a separate handle. `ReadWriteTexture*` is deferred —
+  see Open Questions.
 
-  Concrete texture types:
-  - **`Texture1D`** — 1D texture (LUTs, color grading curves). `pos`: `f32`.
-    `color := sample lut u`
-  - **`Texture1DArray`** — array of 1D textures. `pos`: `f32`, `layer`: int.
-    `color := sample luts u layer`
-  - **`Texture2D`** — 2D texture. `pos`: `vec2<f32>`.
-    `color := sample tex uv LinearWrap`
-  - **`TextureArray2D`** — array of 2D textures (terrain layers, sprites).
-    `pos`: `vec2<f32>`, `layer`: int.
-    `color := sample arr uv layer`
-  - **`Texture3D`** — volumetric texture (volumetric effects, 3D LUTs).
-    `pos`: `vec3<f32>`.
-    `color := sample vol uvw`
-  - **`TextureCube`** — cube map (environment maps, skyboxes, specular IBL).
-    `pos`: `vec3<f32>` direction; need not be normalized.
-    `color := sample env dir`
-  - **`TextureCubeArray`** — array of cube maps (point light shadow maps).
-    `pos`: `vec3<f32>` direction, `layer`: int.
-    `color := sample envs dir layer`
+  Sampler parameters are three optional immediates on every `sample` op
+  (not a type or binding): a filter, a tiling mode, and a mip mode.
+  - Filter: `Linear` (default), `Nearest`, `Anisotropic`
+  - Tiling: `Repeat` (default), `ClampToEdge`, `Mirror`, `BlackBorder`,
+    `WhiteBorder`, `TransparentBorder`
+  - Mip: `LinearMip` (default), `NearestMip`
+  Any combination may be specified in any order; the parser identifies
+  each by name (the three sets are disjoint). Omitted parameters take
+  their defaults. To sample with no mipmapping use `sample_lod` with
+  lod `0`. Ignored for struct T — engine-owned. See Instruction Set
+  § Textures for full sample op syntax.
 
-  **`SamplingPolicy`** — a PSIR builtin sum type carried as part of every
-  texture handle (not user-declarable); applies to all texture types. During
-  backend lowering, a texture handle materializes as
-  `{ indices: u64, policy: SamplingPolicy }` where
-  `indices` packs up to 4×16-bit physical texture indices (one per output
-  channel). The emitter matches on the policy to inline channel-gather and
-  reconstruction logic; when the handle is statically known the branch folds
-  away. Sum types are therefore present in the lowering IR at minimum even if
-  not exposed at the authored PSIR surface. The lowered struct shape is not yet
-  final. Efficiently lowering multi-index textures to bindful slots is an open
-  question (up to 4 slots per logical texture, breaking the 1:1 assumption in
-  slot allocation and DCE). sRGB decode and signed unpack are handled by the
-  image view/texture format on all targets (Vulkan, DXIL, Metal), not the
-  policy.
+  Dimensionality variants (Cube/CubeArray write variants excluded — no
+  target supports them as storage images):
 
-  Policy variants (non-exhaustive — new variants may be added):
-  - `Standard` — pass-through; samples index slot 0.
-  - `Broadcast(u2 channel)` — samples slot 0, selects one channel,
-    returns `(c, c, c, 1.0)`.
-  - `ReconstructNormalZ` — samples slot 0 for X and Y, computes
-    `Z = sqrt(1 - X² - Y²)`, returns `(X, Y, Z, 0.0)`.
-  - `SelectReconstructNormalZ(u2 x_slot, u2 y_slot)` — same but X and Y
-    sourced from specified index slots.
-  - `SelectMask(u2 r_slot, u2 g_slot, u2 b_slot, u2 a_slot)` — each output
-    channel taken from the corresponding source slot. A post-lowering pass
-    deduplicates sample ops so each slot is sampled at most once.
-  - `Swizzle(u2 r, u2 g, u2 b, u2 a)` — single-slot channel reorder; each
-    component selects which source channel to read from slot 0.
+  | `ReadTexture*<T>`      | `WriteTexture*<T>`      |
+  |------------------------|-------------------------|
+  | `ReadTexture1D`        | `WriteTexture1D`        |
+  | `ReadTexture1DArray`   | `WriteTexture1DArray`   |
+  | `ReadTexture2D`        | `WriteTexture2D`        |
+  | `ReadTexture2DArray`   | `WriteTexture2DArray`   |
+  | `ReadTexture3D`        | `WriteTexture3D`        |
+  | `ReadTextureCube`      | —                       |
+  | `ReadTextureCubeArray` | —                       |
 
-- `ReadBuffer<T>` — opaque read-only resource handle; T may be any non-opaque
-  type (scalars, vectors, matrices, arrays, structs); declared as a resource on
-  entry points with `storage(name)`; elements accessed via `load_elem`
-- **Opaque types** (all texture types and `ReadBuffer<T>`) cannot appear as
-  vector components or `ReadBuffer` element types.
+  Named interface read example:
+  ```
+  struct PbrChannels {
+      albedo:   vec4<f32>,
+      normal:   vec4<f32>,
+      orm:      vec4<f32>,
+      emissive: Optional<vec4<f32>>,
+  }
+
+  entry_point fragment pbr_frag(
+      mat: read_texture(PbrChannels),
+      ...
+  ) {
+      // Returns full PbrChannels struct; DCE removes sample ops for
+      // fields that are never read.
+      s      := sample mat uv
+      albedo := s.albedo
+      normal := s.normal
+      orm    := s.orm
+      // emissive is absent when the engine provides no emissive map;
+      // use with_default for a constant fallback:
+      emissive := with_default s.emissive (vec4<f32> 0.0 0.0 0.0 0.0)
+      // or if_some for a full branch:
+      color := if_some s.emissive as em {
+          out { val: vec4<f32> }
+          then { ... use em ... }
+          else { ... fallback ... }
+      }
+      ...
+  }
+  ```
+
+  Named interface write example:
+  ```
+  struct GBuffer {
+      position: vec4<f32>,
+      normal:   vec4<f32>,
+      albedo:   vec4<f32>,
+  }
+
+  entry_point compute gbuffer_fill(
+      gbuf: write_texture(GBuffer),
+      ...
+  ) {
+      // write all channels at once
+      texel_store gbuf coord (GBuffer pos_value normal_value albedo_value)
+      // or write individual channels
+      texel_store_channel gbuf position coord pos_value
+      texel_store_channel gbuf normal   coord normal_value
+      texel_store_channel gbuf albedo   coord albedo_value
+  }
+  ```
+
+  Raw numeric example:
+  ```
+  entry_point compute blur(
+      src: read_texture(vec4<f32>),
+      dst: write_texture(vec4<f32>),
+      ...
+  ) {
+      val := texel_fetch src coord
+      texel_store dst coord blurred_val
+  }
+  ```
+
+- `ReadBuffer<T>` — opaque read-only storage buffer handle; T may be any
+  non-opaque type (scalars, vectors, matrices, arrays, structs); declared
+  as a resource on entry points with `storage(name)`; elements accessed
+  via `load_elem`
+- `WriteBuffer<T>` — opaque write-only storage buffer handle; same T
+  constraints as `ReadBuffer<T>`; declared with `write_storage(name)`;
+  elements written via `store_elem`. Safe when each element is written by
+  at most one invocation (e.g. index determined by thread ID or a
+  statically unique input). Dynamic index allocation requiring atomic
+  counters is deferred — see Open Questions.
+- **Opaque types** (`ReadTexture*`, `WriteTexture*`, `ReadBuffer<T>`, and
+  `WriteBuffer<T>`) cannot appear as vector components or `ReadBuffer` /
+  `WriteBuffer` element types.
 - `struct Name` — named product type declared at module level; fields are typed
   and named; layout is engine-determined (see Struct Types section)
 - `Optional<T>` — optional value; T may be any non-Optional type; primary use
-  case is optional resource slots (e.g. emissive texture); see Optional section
+  case is optional channels in texture interface structs (e.g.
+  `emissive: Optional<vec4<f32>>`); see Optional section
 - bundle — anonymous multi-value group — see Bundles section
 
 Type annotations on arithmetic/logic result registers are optional and verified
@@ -204,6 +259,11 @@ text→binary pass lowers them to `extract` (component by index → scalar) and
 `shuffle` (component subset / reorder → vector). The binary IR, executor, and
 emitter never see swizzle syntax. The textual IR does not need to be 1:1 with
 the binary IR; pseudo-ops are fine.
+
+Dot-field access (`val.field`) is likewise textual sugar for
+`extract val field` and lowers to an integer field index at text→binary time.
+Works on structs and bundles alike. May appear in any argument position —
+`add s.x s.y` is valid textual IR. Not part of the binary IR.
 
 ---
 
@@ -359,10 +419,10 @@ struct Light {
 
 fn compute_pbr {
   in {
-    albedo_texture: Texture2D
-    normal_texture: Texture2D
-    orm_texture: Texture2D
-    emissive_texture: Optional<Texture2D>
+    albedo_texture: ReadTexture2D<vec4<f32>>
+    normal_texture: ReadTexture2D<vec4<f32>>
+    orm_texture: ReadTexture2D<vec4<f32>>
+    emissive_texture: Optional<ReadTexture2D<vec4<f32>>>
     model_matrix: mat4<f32>
     view_matrix: mat4<f32>
     lights: ReadBuffer<Light>
@@ -663,30 +723,55 @@ first.
 
 ### Textures
 
-- `sample tex pos [layer] [mode]` — sample a texture; `pos` type is
-  determined by the texture type (`f32` for 1D, `vec2<f32>` for 2D,
-  `vec3<f32>` for 3D); `layer` is an integer index present only for array
-  texture types; `mode` defaults to `LinearClamp`. Implicit LOD —
-  fragment shader only.
-- `sample_lod tex pos [layer] lod [mode]` — explicit LOD level (`f32`)
-- `sample_grad tex pos [layer] grad... [mode]` — explicit derivatives,
-  one per texture dimension (e.g. `ddx ddy` for 2D, `ddx ddy ddz` for
-  3D), each a scalar or vector matching the dimensionality of `pos`
-- `texel_fetch` — integer-coordinate fetch, no sampler; optional LOD argument
-  (i32), defaults to mip 0 if omitted
+All texture ops come in a whole-T form and a single-channel form:
 
-### Read Buffers
+- `sample tex pos [layer] [filter] [tiling] [mip]` — sample a
+  `ReadTexture*<T>`; returns the full T (struct or numeric). `pos`
+  type determined by the texture variant (`f32` for 1D, `vec2<f32>` for
+  2D, `vec3<f32>` for 3D); `layer` present only for array types; defaults
+  `Linear Repeat LinearMip`. When T is a struct, DCE eliminates sample
+  ops for fields never read. Filter/tiling/mip are engine-owned for
+  `ReadTexture*` and ignored if specified. Implicit LOD — fragment
+  shader only.
+- `sample_channel tex channel pos [layer]` — sample a named node from a
+  `ReadTexture*<struct>`; `channel` is a dot-separated path in textual IR
+  (e.g. `maps.normal` or just `maps`); resolved to a flat integer channel
+  ID at text→binary time. Returns the sub-struct if `channel` names an
+  inner struct node, or `vec4<f32>` if it names a leaf. Engine-owned
+  filter/tiling/mip. Implicit LOD — fragment shader only.
+- `sample_lod tex pos [layer] lod [filter] [tiling] [mip]` — explicit
+  LOD level (`f32`); whole-T form only
+- `sample_grad tex pos [layer] grad... [filter] [tiling] [mip]` —
+  explicit derivatives, one per texture dimension (e.g. `ddx ddy` for
+  2D, `ddx ddy ddz` for 3D); whole-T form only
+- `texel_fetch tex coord [layer]` — integer-coordinate unfiltered read
+  on a `ReadTexture*<T>`; returns the full T; optional LOD
+  argument (i32), defaults to mip 0 if omitted
+- `texel_fetch_channel tex channel coord [layer]` — integer-coordinate
+  read of a named node from a `ReadTexture*<struct>`; same `channel` dot
+  syntax as `sample_channel`; returns sub-struct or `vec4<f32>`
+- `texel_store tex coord [layer] value` — integer-coordinate write to a
+  `WriteTexture*<T>`; `value` must be the full T
+- `texel_store_channel tex channel coord [layer] value` — write a named
+  node of a `WriteTexture*<struct>`; same `channel` dot syntax; `value`
+  must match the node's type (sub-struct or `vec4<f32>`)
 
-- `load_elem buf idx` — load one element of `ReadBuffer<T>` at runtime index
-  `idx`; result type is T; index may be any integer type
+### Buffers
+
+- `load_elem buf idx` — load one element of `ReadBuffer<T>` at runtime
+  index `idx`; result type is T; index may be any integer type
+- `store_elem buf idx value` — write one element of `WriteBuffer<T>` at
+  runtime index `idx`; `value` type must match T
 
 ### Optional
 
 - `some val` — wrap a value in `Optional<T>`; T inferred from `val`
 - `none Optional<T>` — absent value; T must be stated explicitly (no operand to
-  infer from): `x := none Optional<Texture2D>`
+  infer from): `x := none Optional<ReadTexture2D<vec4<f32>>>`
 - `is_some opt` → `bool` — test presence without branching; useful when the bool
   needs to be stored or passed to a helper
+- `with_default opt default` — unwrap `Optional<T>` with a fallback; returns
+  the inner value if present, `default` otherwise; `default` must match T
 
 ### Math Intrinsics
 
@@ -838,10 +923,10 @@ interface ScenePBR {
   id: 1
 
   // slot_id <name> <direction> <type>
-  slot 1  albedo_texture      in  Texture2D
-  slot 2  normal_texture      in  Texture2D
-  slot 3  orm_texture         in  Texture2D
-  slot 4  emissive_texture    in  Optional<Texture2D>
+  slot 1  albedo_texture      in  ReadTexture2D<vec4<f32>>
+  slot 2  normal_texture      in  ReadTexture2D<vec4<f32>>
+  slot 3  orm_texture         in  ReadTexture2D<vec4<f32>>
+  slot 4  emissive_texture    in  Optional<ReadTexture2D<vec4<f32>>>
   slot 5  model_matrix        in  mat4<f32>
   slot 6  view_matrix         in  mat4<f32>
   slot 7  lights_buffer       in  ReadBuffer<Light>
@@ -1215,12 +1300,6 @@ diagnosing the emitter or executor itself.
 ---
 
 ## Open Questions / Future Work
-- `TextureArray3D`: Vulkan has no 3D array image type, so this has no direct
-  hardware mapping. Not planned; revisit if a concrete use case arises.
-- `SamplingPolicy` depth/stencil variants: reading depth or stencil as a
-  scalar channel requires platform-specific image view aspects and extensions
-  (e.g. stencil sampling on Vulkan needs extension support). Whether these
-  belong as policy variants or as an engine-level concern is unresolved.
 - Transcendental `_precise` variants: Precise variants are an open design
   question. If provided, `_precise` forms (for example `exp_precise`,
   `rsqrt_precise`) must provide stronger numeric guarantees and therefore will
@@ -1252,19 +1331,19 @@ diagnosing the emitter or executor itself.
   part of this design.
 - `switch` as sugar over nested if/else at the IR level vs. direct `OpSwitch`
   emit — current plan: direct `OpSwitch` from day one
-- `WriteBuffer<T>` / `ReadWriteBuffer<T>` — writable and read-write storage
-  buffers. A recurring pattern: payload buffers can be `WriteBuffer<T>` (e.g.
-  draw commands, OIT nodes), but the atomic counter that allocates slots in
-  those buffers requires `ReadWriteBuffer<u32>`. Examples: GPU culling writes
-  `WriteBuffer<DrawCommand>` but needs `ReadWriteBuffer<u32>` for the draw
-  count; OIT writes `WriteBuffer<OITNode>` but needs `ReadWriteBuffer<u32>` for
-  head pointers and counters. `WriteBuffer` alone is never sufficient when
-  dynamic allocation is involved. Approximate OIT via weighted blending needs
-  only render targets and is available now.
+- `ReadWriteBuffer<T>` / `ReadWriteTexture*<T>` — read-write resource
+  types. Both require atomic operations to be safe and are deferred until
+  atomics are designed. A recurring pattern: payload buffers can be
+  `WriteBuffer<T>` (e.g. draw commands, OIT nodes), but the atomic
+  counter that allocates slots requires `ReadWriteBuffer<u32>`. Examples:
+  GPU culling writes `WriteBuffer<DrawCommand>` but needs
+  `ReadWriteBuffer<u32>` for the draw count; OIT writes
+  `WriteBuffer<OITNode>` but needs `ReadWriteBuffer<u32>` for head
+  pointers and counters. Approximate OIT via weighted blending needs only
+  render targets and is available now.
 - Sum types (tagged unions / enum-with-data) — natural extension once structs
   land; useful for material variant dispatch and similar patterns
 - Compute shader entry points
-- Image stores (`store_texel`) for storage images
 - Shadow sampling: `sample_compare`, `sample_compare_lod` (depth texture +
   reference value; needed for shadow maps)
 - Gather: `gather`, `gather_compare` (4-texel component gather; useful for PCF
