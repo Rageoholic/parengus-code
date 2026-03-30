@@ -128,7 +128,7 @@ in a separate debug section mapping register index to a debug-name entry.
   - **`Texture1D`** — 1D texture (LUTs, color grading curves). `pos`: `f32`.
     `color := sample lut u`
   - **`Texture1DArray`** — array of 1D textures. `pos`: `f32`, `layer`: int.
-    `color := sample lut u layer`
+    `color := sample luts u layer`
   - **`Texture2D`** — 2D texture. `pos`: `vec2<f32>`.
     `color := sample tex uv LinearWrap`
   - **`TextureArray2D`** — array of 2D textures (terrain layers, sprites).
@@ -176,11 +176,8 @@ in a separate debug section mapping register index to a debug-name entry.
 - `ReadBuffer<T>` — opaque read-only resource handle; T may be any non-opaque
   type (scalars, vectors, matrices, arrays, structs); declared as a resource on
   entry points with `storage(name)`; elements accessed via `load_elem`
-- **Opaque types** (all texture types and `ReadBuffer<T>`) are resource handles.
-  They cannot appear as vector components or `ReadBuffer` element types.
-  `Optional<T>` where T is an opaque type is valid (e.g.
-  `Optional<Texture2D>`). SPIR-V does not allow opaque types as struct
-  members; the emitter unpacks them during lowering.
+- **Opaque types** (all texture types and `ReadBuffer<T>`) cannot appear as
+  vector components or `ReadBuffer` element types.
 - `struct Name` — named product type declared at module level; fields are typed
   and named; layout is engine-determined (see Struct Types section)
 - `Optional<T>` — optional value; T may be any non-Optional type; primary use
