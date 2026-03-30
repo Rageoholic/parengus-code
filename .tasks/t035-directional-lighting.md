@@ -7,9 +7,14 @@ updated: 2026-03-29
 parent: t003
 children: []
 depends_on:
-  - t024
+      - t024
 blocked_by:
-  - t024
+      - t024
+      - t038
+      - t039
+      - t040
+      - t041
+      - t042
 area: phoenix
 ---
 
@@ -25,6 +30,11 @@ produces shaded output rather than rendering albedo-only.
 Phoenix renders objects with a directional light contribution using
 the PBR BRDF (Cook-Torrance: GGX NDF, Smith G, Fresnel-Schlick).
 Light direction and colour are configurable at runtime.
+
+This task specifically targets a deferred lighting implementation: a
+G-buffer pass that writes material parameters (albedo, normal, ORM,
+emissive) followed by a lighting/compose pass that consumes the
+G-buffer. Implement this only when a deferred renderer is available.
 
 ## Plan
 
