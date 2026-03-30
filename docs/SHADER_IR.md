@@ -47,8 +47,8 @@ Typed infinite registers — each register is written exactly once (SSA), has a
 type, and lives for the duration of its scope. No register reuse, no aliasing.
 
 Every function has its own register namespace (no clobbering between caller and
-callee). Returns are passed via bundles for multiple return values or by value
-for single return values.
+callee). Functions always return a single value; multi-value returns use an
+auto-generated anonymous struct (see Multi-Value Returns).
 
 ### Textual Syntax
 
@@ -237,7 +237,6 @@ in a separate debug section mapping register index to a debug-name entry.
 - `Optional<T>` — optional value; T may be any non-Optional type; primary use
   case is optional channels in texture interface structs (e.g.
   `emissive: Optional<vec4<f32>>`); see Optional section
-- bundle — anonymous multi-value group — see Bundles section
 
 Type annotations on arithmetic/logic result registers are optional and verified
 when present. Casts are their own instruction; inference cannot cross a cast
@@ -262,7 +261,8 @@ the binary IR; pseudo-ops are fine.
 
 Dot-field access (`val.field`) is likewise textual sugar for
 `extract val field` and lowers to an integer field index at text→binary time.
-Works on structs and bundles alike. May appear in any argument position —
+Works on structs (and auto-generated return structs) alike. May appear in
+any argument position —
 `add s.x s.y` is valid textual IR. Not part of the binary IR.
 
 ---
@@ -326,9 +326,8 @@ encoding — not registers. A runtime register cannot be passed in an immediate
 position. Textual IR uses bare integer literals for immediates; they are not
 desugared to `const` instructions.
 
-- `extract` — component / field index. On structs and bundles, fields have
-  different types, so the index must be a compile-time constant for type
-  resolution. On vectors and matrices, the component type is uniform; runtime
+- `extract` — component / field index. On structs, fields have different
+  types, so the index must be a compile-time constant for type resolution. On vectors and matrices, the component type is uniform; runtime
   indexing is not currently supported and may be addressed by a separate
   instruction (see Open Questions).
 - `shuffle` — component index list. The output vector length (and therefore
@@ -340,44 +339,43 @@ desugared to `const` instructions.
 
 ---
 
-## Bundles (Multi-Value Groups)
+## Multi-Value Returns
 
-Used for function call arguments and multi-value return values. Bundles are
-not first-class values: they have no named type, cannot be stored in
-variables, and cannot appear anywhere a type is expected — not as struct
-fields, `in`/`out` block fields, resource declarations, `Optional<T>`
-parameters, or buffer element types. The only valid operations on a bundle
-result are `extract` and typed assignment (sugar for `extract 0`). Bundle
-is the transport mechanism for call boundaries, nothing more.
-
-Assigning a call result to a typed register is sugar for an implicit
-`extract 0` — the LHS type must match the callee's first output. Assigning
-to a bundle register (or using `:=` inference) captures all outputs; a
-one-element bundle is valid (if redundant). An explicit type annotation is
-required to trigger implicit extract — `:=` always infers a bundle. The
-type annotation may appear inline on the assignment or via a prior
-declaration in the enclosing `out` block. There is no other implicit
-unwrapping machinery.
+Functions always return a single register value. When a function declares
+multiple `out` fields, the compiler auto-generates an anonymous struct type
+for that function's return. The struct's field names and types match the
+`out` block exactly. Call sites receive a normal register and use dot syntax
+(or `extract`) to access individual fields.
 
 ```
-// Typed LHS: implicit extract 0
-x: vec4<f32> = some_fn bundle(arg0, arg1)
+fn min_max {
+  in  { a: f32, b: f32 }
+  out { lo: f32, hi: f32 }
+  body { ... }
+}
 
-// Bundle LHS: all outputs, extract explicitly
-b(0) = some_fn bundle(arg0, arg1)
-y := extract b(0) 1
+// Caller: result is the auto-generated struct
+r      := call min_max x y
+lo     := r.lo
+hi     := r.hi
+
+// Or extract by index (binary IR form):
+r      := call min_max x y
+lo     := extract r 0
+hi     := extract r 1
 ```
 
-Bundle types are resolved from the callee's declared return preamble;
-type-checking `extract` is just "look up index N in the callee's return bundle
-type." See SPIR-V Emit Notes for lowering details.
+Single-`out` functions return T directly — the result register is simply
+that type, with no wrapping or implicit extraction. Auto-generated structs
+are anonymous and never appear in user-authored type declarations; they are
+an emitter concern only.
 
 ---
 
 ## Function Structure
 
 Every function has a **preamble** that declares:
-- Input bundle (typed by index)
+- Input parameters (typed, named)
 - Output (return) registers (typed, named)
 - Local registers (typed or inferred)
 
@@ -491,7 +489,7 @@ result = if cond {
 ```
 
 `cond` must be `bool`. `out { ... }` is optional — omit it for pure control flow
-(no value produced, no bundle result). When `out { ... }` is present, every
+(no value produced). When `out { ... }` is present, every
 branch must write all declared outputs; the declared outputs become implicit phi
 nodes at the merge point.
 
@@ -594,7 +592,7 @@ implementation and should be avoided.
 ### Switch
 
 ```
-b(0) = switch selector {
+r = switch selector {
   out {
     val: f32
     index: u32
@@ -714,9 +712,8 @@ first.
   The binary IR stores struct construction positionally by field index.
 - `extract` — extract one sub-element by constant index; on a vector: yields a
   scalar; on a matrix: yields the column vector at that index; on an array or
-  struct: yields the field/element. Structs and bundles share the same op —
-  structs are named bundles with layout semantics. In the textual IR, `extract
-  light pos` is sugar for `extract light 0` (resolved at text→binary time).
+  struct: yields the field/element. In the textual IR, `extract light pos` is
+  sugar for `extract light 0` (resolved at text→binary time).
 - `shuffle` — reorder / subset vector components by constant index list
 - `extract_row` — extract row i from a matrix; yields a vector; more expensive
   than `extract` because matrices are column-major — decomposes to per-column
@@ -827,10 +824,9 @@ guarantees, see the Open Questions / Future Work section for `_precise` variants
 - `continue_if` — conditional continue; continues only when the condition is
   true (`continue_if cond`). Labeled form (`continue_if cond label`) targets the
   specified enclosing loop.
-- `call` — call a function; result type depends on the callee's `out:`
-  declaration: a single named struct `out:` yields that struct type directly
-  (`light := call get_light idx`); any other case yields a bundle (`b(0) = call
-  fn ...`)
+- `call fn arg...` — call a function; single-`out` returns the value
+  directly; multi-`out` returns an auto-generated anonymous struct (see
+  Multi-Value Returns)
 - `if_some` — structured optional branch; see If-Some Expression section
 
 ---
@@ -856,8 +852,9 @@ struct Light {
 }
 ```
 
-Structs are named bundles with layout semantics. `extract` and `construct` work
-on structs exactly as they do on bundles — no new composite ops. In the textual
+Structs are named product types with layout semantics. `extract` and
+`construct` are the composite ops — no struct-specific instructions. In the
+textual
 IR, `extract light pos` is sugar for `extract light 0` (field name resolved to
 index at text→binary time). Field names are semantic (not debug-only): they are
 encoded as integer field IDs in the binary IR type table entry `[(field_id: u32,
@@ -1213,8 +1210,8 @@ concern.
   `OpSConvert`/`OpUConvert`; integer→float to `OpConvertSToF`/`OpConvertUToF`;
   float→integer to `OpConvertFToS`/`OpConvertFToU`; float width change to
   `OpFConvert`.
-- Bundles lower to `OpTypeStruct` (type) / `OpCompositeConstruct` (construction)
-  / `OpCompositeExtract` (extraction).
+- Auto-generated multi-value return structs lower to `OpTypeStruct` /
+  `OpCompositeConstruct` / `OpCompositeExtract`.
 - `xor` on `bool` operands lowers to `OpLogicalNotEqual` — SPIR-V has no
   `OpLogicalXor`.
 - Struct types lower to `OpTypeStruct`. Field names are not present in SPIR-V;
