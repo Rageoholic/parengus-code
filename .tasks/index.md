@@ -1,4 +1,4 @@
-next_id: t038
+next_id: t044
 ---
 
 # Task Graph Index
@@ -61,5 +61,11 @@ and AI interaction conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 | t033 | UI widget system                           | planned | phoenix | child of t029 |
 | t034 | Error dialog / fatal message display       | planned | infra   |               |
 | t035 | Directional lighting                       | planned | phoenix | child of t003 |
+| t038 | Separate samplers from textures (sampler table) | active  | renderer | cleanup: sampler table and grouping |
+| t039 | Per-frame descriptor & command pools           | active  | renderer | cleanup: per-frame pools for descriptors/commands |
+| t040 | Optional device features (anisotropic optional) | active  | renderer | cleanup: optional device feature handling |
+| t041 | Single staging buffer with linear allocator     | active  | phoenix  | staging buffer & upload linear allocator |
+| t042 | Use Debug Utils labels for queues and submissions | active  | renderer | label queues/submissions for captures |
+| t043 | Re-enable queue naming and add Phoenix debug-label helpers | active | renderer | re-enable queue names; add Phoenix helper stubs |
 | t036 | Custom Vulkan memory allocator             | idea    | rgpu-vk | explicitly deferred |
 | t037 | Harden state machine transitions with replace_with | planned | infra   |               |

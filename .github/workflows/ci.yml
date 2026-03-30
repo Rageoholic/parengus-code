@@ -6,10 +6,12 @@ on:
     paths-ignore:
       - 'docs/**'
       - '**.md'
+      - '.tasks/**'
   pull_request:
     paths-ignore:
       - 'docs/**'
       - '**.md'
+      - '.tasks/**'
 
 env:
   CARGO_TERM_COLOR: always
