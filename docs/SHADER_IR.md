@@ -283,7 +283,9 @@ desugared to `const` instructions.
 ## Bundles (Multi-Value Groups)
 
 Used for function call arguments and multi-value return values. Bundles are
-anonymous and opaque in the IR — they are not named types.
+anonymous and opaque in the IR — they are not named types. Bundle is not a
+valid field type in `in` or `out` blocks; it is the transport mechanism for
+those blocks, not a value that can appear within them.
 
 Assigning a call result to a typed register is sugar for an implicit
 `extract 0` — the LHS type must match the callee's first output. Assigning
