@@ -425,7 +425,7 @@ impl DynamicPipeline {
 
         // SAFETY: handle is a valid pipeline created from device.
         let name_result = unsafe {
-            device.set_object_name_with(handle, || {
+            device.set_object_name_lazy(handle, || {
                 std::ffi::CString::new(name?()).ok()
             })
         };
@@ -711,7 +711,7 @@ impl RenderPassPipeline {
 
         // SAFETY: handle is a valid pipeline created from device.
         let name_result = unsafe {
-            device.set_object_name_with(handle, || {
+            device.set_object_name_lazy(handle, || {
                 std::ffi::CString::new(name?()).ok()
             })
         };

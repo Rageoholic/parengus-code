@@ -1,14 +1,14 @@
 //! Logical device wrapper ([`Device`]).
 //!
-//! `Device` wraps a `VkDevice` and centralises all per-device state:
-//! a `gpu-allocator` allocator (behind a `Mutex`), extension loaders
-//! for swapchain, dynamic rendering, synchronization2, and debug utils,
-//! plus queues for graphics/present, transfer, and compute roles.
+//! `Device` wraps a `VkDevice` and centralises all per-device state: a
+//! `gpu-allocator` allocator (behind a `Mutex`), extension loaders for
+//! swapchain, dynamic rendering, synchronization2, and debug utils, plus queues
+//! for graphics/present, transfer, and compute roles.
 //!
 //! # Queue model
 //!
-//! Queue behaviour is controlled by [`QueueConfig`] in
-//! [`DeviceConfig`]. Three independent boolean axes govern allocation:
+//! Queue behaviour is controlled by [`QueueConfig`] in [`DeviceConfig`]. Three
+//! independent boolean axes govern allocation:
 //!
 //! | Field | `true` | `false` |
 //! |-------|--------|---------|
@@ -16,32 +16,31 @@
 //! | `dedicated_compute` | dedicated family | shares gfx family |
 //! | `parallel` | all queues per family | one queue per family |
 //!
-//! When multiple queues are available for a role, callers pass a
-//! `queue_index` to submit methods to select one per frame in flight.
-//! Roles that share a family share the same underlying `Arc<Mutex<…>>`.
+//! When multiple queues are available for a role, callers pass a `queue_index`
+//! to submit methods to select one per frame in flight. Roles that share a
+//! family share the same underlying `Arc<Mutex<…>>`.
 //!
-//! [`Device::create_compatible`] tries to honour each requested axis.
-//! When `DeviceConfig::queue_config_strict = true`, any axis that
-//! could not be satisfied returns
-//! [`CreateCompatibleError::QueueConfigUnsatisfied`]; otherwise the
-//! device uses the best configuration the hardware provides.
+//! [`Device::create_compatible`] tries to honour each requested axis. When
+//! `DeviceConfig::queue_config_strict = true`, any axis that could not be
+//! satisfied returns [`CreateCompatibleError::QueueConfigUnsatisfied`];
+//! otherwise the device uses the best configuration the hardware provides.
 //!
 //! # Physical device selection
 //!
-//! Physical device selection uses a priority-based fold: discrete GPUs
-//! outrank integrated GPUs, and only devices that satisfy all required
-//! extensions and queue families are considered.
-//! [`Device::create_compatible`] wraps this selection and returns the
-//! highest-priority match.
+//! Physical device selection uses a priority-based fold: discrete GPUs outrank
+//! integrated GPUs, and only devices that satisfy all required extensions and
+//! queue families are considered. [`Device::create_compatible`] wraps this
+//! selection and returns the highest-priority match.
 //!
-//! All raw Vulkan operations on the device handle are surfaced as
-//! `unsafe fn` methods prefixed with `raw_` (e.g. `create_raw_buffer`).
-//! Higher-level wrappers in sibling modules call these rather than
-//! accessing `ash::Device` directly.
+//! All raw Vulkan operations on the device handle are surfaced as `unsafe fn`
+//! methods prefixed with `raw_` (e.g. `create_raw_buffer`). Higher-level
+//! wrappers in sibling modules call these rather than accessing `ash::Device`
+//! directly.
 
+use parking_lot::{Mutex, MutexGuard};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ash::vk::{self};
 use gpu_allocator::{
@@ -54,7 +53,7 @@ use gpu_allocator::{
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
 
-use crate::sync;
+use crate::sync::{self, Fence};
 use crate::{
     instance::{FetchPhysicalDeviceError, Instance},
     surface::Surface,
@@ -76,15 +75,14 @@ enum Synchronization2Loader {
 
 /// Describes how an allocation will be accessed by CPU and GPU.
 ///
-/// Passed to [`Device::allocate_memory`] to select the best-matching
-/// Vulkan memory type and determine whether atom-size padding is
-/// required for non-coherent flush alignment.
+/// Passed to [`Device::allocate_memory`] to select the best-matching Vulkan
+/// memory type and determine whether atom-size padding is required for
+/// non-coherent flush alignment.
 #[derive(Copy, Clone, Debug)]
 pub enum MemoryUsage {
     /// GPU-only storage. Highest bandwidth; not CPU-mappable.
     GpuOnly,
-    /// CPU-writable, GPU-readable. For staging buffers and
-    /// per-frame uploads.
+    /// CPU-writable, GPU-readable. For staging buffers and per-frame uploads.
     CpuToGpu,
     /// GPU-writable, CPU-readable. For readback.
     GpuToCpu,
@@ -92,14 +90,13 @@ pub enum MemoryUsage {
 
 /// A logical Vulkan device and its associated per-device state.
 ///
-/// Wraps an `ash::Device`, a `gpu-allocator` allocator (behind a
-/// `Mutex`), extension loaders for swapchain / dynamic rendering /
-/// synchronization2 / debug utils, and the graphics+present queue.
+/// Wraps an `ash::Device`, a `gpu-allocator` allocator (behind a `Mutex`),
+/// extension loaders for swapchain / dynamic rendering / synchronization2 /
+/// debug utils, and the graphics+present queue.
 ///
-/// Constructed via [`Device::create_compatible`], which selects the
-/// best physical device by priority (discrete > integrated). Raw
-/// Vulkan operations are exposed as `unsafe fn` methods prefixed
-/// with `raw_`.
+/// Constructed via [`Device::create_compatible`], which selects the best
+/// physical device by priority (discrete > integrated). Raw Vulkan operations
+/// are exposed as `unsafe fn` methods prefixed with `raw_`.
 #[allow(dead_code)]
 pub struct Device {
     parent: Arc<Instance>,
@@ -126,8 +123,8 @@ pub struct Device {
     transfer_family: u32,
     compute_queues: Arc<Mutex<vk::Queue>>,
     compute_family: u32,
-    /// The [`QueueConfig`] that was actually applied (may differ
-    /// from the requested config when strict mode is off).
+    /// The [`QueueConfig`] that was actually applied (may differ from the
+    /// requested config when strict mode is off).
     queue_config: QueueConfig,
 }
 
@@ -144,8 +141,8 @@ impl Drop for Device {
         tracing::debug!("Dropping device {:?}", self.handle.handle());
         // Ensure allocator is dropped before vkDestroyDevice.
         self.allocator = None;
-        //SAFETY: All objects derived from this device should be dropped
-        //before this device is dropped.
+        //SAFETY: All objects derived from this device should be dropped before
+        //this device is dropped.
         unsafe { self.handle.destroy_device(None) };
     }
 }
@@ -259,22 +256,19 @@ pub enum QueuePresentError {
 /// | `dedicated_compute` | dedicated family | shares gfx family |
 /// | `parallel` | all queues per family | one queue per family |
 ///
-/// The default (`true` for all) requests the most capable
-/// configuration. [`Device::create_compatible`] uses whatever the
-/// hardware provides and reports the achieved config via
-/// [`Device::queue_config`].
+/// The default (`true` for all) requests the most capable configuration.
+/// [`Device::create_compatible`] uses whatever the hardware provides and
+/// reports the achieved config via [`Device::queue_config`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueConfig {
-    /// Use a dedicated transfer queue family (not shared with
-    /// graphics). When `false`, the graphics/present family is
-    /// used for transfer.
+    /// Use a dedicated transfer queue family (not shared with graphics). When
+    /// `false`, the graphics/present family is used for transfer.
     pub dedicated_transfer: bool,
-    /// Use a dedicated compute queue family (not shared with
-    /// graphics). When `false`, the graphics/present family is
-    /// used for compute.
+    /// Use a dedicated compute queue family (not shared with graphics). When
+    /// `false`, the graphics/present family is used for compute.
     pub dedicated_compute: bool,
-    /// Use a dedicated present queue family (not shared with graphics).
-    /// When `false`, the graphics family will be used for present.
+    /// Use a dedicated present queue family (not shared with graphics). When
+    /// `false`, the graphics family will be used for present.
     pub dedicated_present: bool,
 }
 
@@ -306,34 +300,31 @@ pub struct DeviceConfig {
     pub dynamic_rendering: bool,
     pub synchronization2: bool,
     pub maintenance1: bool,
-    /// When `true`, enable `VK_KHR_shader_non_semantic_info` on
-    /// pre-1.3 devices that support it (core in 1.3, no-op on 1.3+).
-    /// Required when loading SPIR-V compiled with non-semantic debug
-    /// info (e.g. `shader.debug.spv`). Not a hard device filter:
-    /// if the extension is unavailable the field is silently ignored.
+    /// When `true`, enable `VK_KHR_shader_non_semantic_info` on pre-1.3 devices
+    /// that support it (core in 1.3, no-op on 1.3+). Required when loading
+    /// SPIR-V compiled with non-semantic debug info (e.g. `shader.debug.spv`).
+    /// Not a hard device filter: if the extension is unavailable the field is
+    /// silently ignored.
     pub shader_non_semantic_info: bool,
     pub queue_config: QueueConfig,
     /// When `true`, [`Device::create_compatible`] returns
-    /// [`CreateCompatibleError::QueueConfigUnsatisfied`] if any
-    /// requested axis in [`queue_config`] could not be satisfied.
-    /// When `false` (the default), the device uses the best
-    /// configuration the hardware supports.
+    /// [`CreateCompatibleError::QueueConfigUnsatisfied`] if any requested axis
+    /// in [`queue_config`] could not be satisfied. When `false` (the default),
+    /// the device uses the best configuration the hardware supports.
     pub queue_config_strict: bool,
-    /// Preferred minimum MSAA sample count for colour and depth
-    /// framebuffer attachments. Devices that support this count
-    /// score higher during selection. Defaults to `TYPE_1`
-    /// (no preference).
+    /// Preferred minimum MSAA sample count for colour and depth framebuffer
+    /// attachments. Devices that support this count score higher during
+    /// selection. Defaults to `TYPE_1` (no preference).
     pub min_sample_count: vk::SampleCountFlags,
     /// When `true`, [`Device::create_compatible`] returns
-    /// [`CreateCompatibleError::SampleCountUnsupported`] if no
-    /// device supports `min_sample_count`. When `false` (the
-    /// default), unsupported devices are still considered but
-    /// score lower.
+    /// [`CreateCompatibleError::SampleCountUnsupported`] if no device supports
+    /// `min_sample_count`. When `false` (the default), unsupported devices are
+    /// still considered but score lower.
     pub min_sample_count_strict: bool,
     /// Enable `VkPhysicalDeviceDescriptorIndexingFeatures` with
-    /// `descriptor_binding_partially_bound`. Core in Vulkan 1.2;
-    /// on older devices requires `VK_EXT_descriptor_indexing`
-    /// and its dependency `VK_KHR_maintenance3`.
+    /// `descriptor_binding_partially_bound`. Core in Vulkan 1.2; on older
+    /// devices requires `VK_EXT_descriptor_indexing` and its dependency
+    /// `VK_KHR_maintenance3`.
     pub descriptor_indexing: bool,
 }
 
@@ -343,11 +334,11 @@ impl Device {
     /// Selects the highest-priority physical device that satisfies all
     /// requirements in `config` and can present to `surf`.
     ///
-    /// The name `create_compatible` is intentional: the API does not yet
-    /// expose physical devices as a first-class concept, so callers
-    /// cannot select one themselves. This name signals that the
-    /// selection is automatic and may change in a future API revision
-    /// once physical-device enumeration is surfaced.
+    /// The name `create_compatible` is intentional: the API does not yet expose
+    /// physical devices as a first-class concept, so callers cannot select one
+    /// themselves. This name signals that the selection is automatic and may
+    /// change in a future API revision once physical-device enumeration is
+    /// surfaced.
     pub fn create_compatible<T: HasDisplayHandle + HasWindowHandle>(
         instance: &Arc<Instance>,
         surf: &Surface<T>,
@@ -371,13 +362,13 @@ impl Device {
             }
         }
 
-        // Evaluate every physical device, filtering out those that
-        // lack required extensions or a graphics+present queue, then
-        // score the survivors so we can pick the best.
+        // Evaluate every physical device, filtering out those that lack
+        // required extensions or a graphics+present queue, then score the
+        // survivors so we can pick the best.
         //
-        // Score: (dedicated_queue_count, device_type_priority)
-        // compared lexicographically — dedicated queues matter most,
-        // then device type breaks ties.
+        // Score: (dedicated_queue_count, device_type_priority) compared
+        // lexicographically — dedicated queues matter most, then device type
+        // breaks ties.
         let physical_devices = instance.fetch_raw_physical_devices()?;
         let device_type_priority = |dt: vk::PhysicalDeviceType| -> u32 {
             match dt {
@@ -399,17 +390,16 @@ impl Device {
             use_sync2_ext: bool,
             /// True when dynamic rendering must use the extension loader.
             use_dr_ext: bool,
-            /// True when VK_KHR_maintenance1 must be enabled
-            /// (pre-1.1 device).
+            /// True when VK_KHR_maintenance1 must be enabled (pre-1.1 device).
             use_maintenance1_ext: bool,
-            /// True when VK_KHR_shader_non_semantic_info should be
-            /// enabled (available on this pre-1.3 device).
+            /// True when VK_KHR_shader_non_semantic_info should be enabled
+            /// (available on this pre-1.3 device).
             enable_shader_non_semantic: bool,
-            /// True when VK_EXT_memory_budget is supported and
-            /// should be enabled.
+            /// True when VK_EXT_memory_budget is supported and should be
+            /// enabled.
             enable_memory_budget: bool,
-            /// True when `VK_EXT_descriptor_indexing` must be
-            /// enabled (pre-1.2 device).
+            /// True when `VK_EXT_descriptor_indexing` must be enabled (pre-1.2
+            /// device).
             use_descriptor_indexing_ext: bool,
         }
 
@@ -427,12 +417,11 @@ impl Device {
                 instance.get_raw_physical_device_queue_family_properties(dev)
             };
 
-            // Use the device's own reported API version so that
-            // per-device capability differences are handled correctly
-            // rather than relying on the single instance-level version.
-            // When the instance was created with vk_1_0_strict, treat
-            // every device as pre-1.3 and pre-1.1 so that the extension
-            // code paths are always exercised.
+            // Use the device's own reported API version so that per-device
+            // capability differences are handled correctly rather than relying
+            // on the single instance-level version. When the instance was
+            // created with vk_1_0_strict, treat every device as pre-1.3 and
+            // pre-1.1 so that the extension code paths are always exercised.
             let dev_api =
                 crate::instance::VkVersion::from_raw(props.api_version);
             let is_pre_1_3 = instance.strict_1_0()
@@ -445,9 +434,9 @@ impl Device {
                 || dev_api.major() < 1
                 || (dev_api.major() == 1 && dev_api.minor() < 1);
 
-            // VK_KHR_swapchain is never promoted to core; always check
-            // it when requested. Other extensions are only extensions on
-            // pre-1.3 devices.
+            // VK_KHR_swapchain is never promoted to core; always check it when
+            // requested. Other extensions are only extensions on pre-1.3
+            // devices.
             let needs_ext_check = config.swapchain || is_pre_1_3;
             let device_exts: Vec<vk::ExtensionProperties> = if needs_ext_check {
                 // SAFETY: dev was derived from instance.
@@ -483,8 +472,8 @@ impl Device {
                 continue 'dev;
             }
 
-            // VK_KHR_synchronization2: core in 1.3; required extension
-            // on older devices when requested — hard filter.
+            // VK_KHR_synchronization2: core in 1.3; required extension on older
+            // devices when requested — hard filter.
             let use_sync2_ext = if config.synchronization2 && is_pre_1_3 {
                 if has_ext(ash::khr::synchronization2::NAME) {
                     true
@@ -499,8 +488,8 @@ impl Device {
                 false
             };
 
-            // VK_KHR_maintenance1: core in 1.1; required extension
-            // on older devices when requested — hard filter.
+            // VK_KHR_maintenance1: core in 1.1; required extension on older
+            // devices when requested — hard filter.
             let use_maintenance1_ext = if config.maintenance1 && is_pre_1_1 {
                 if has_ext(ash::khr::maintenance1::NAME) {
                     true
@@ -515,15 +504,15 @@ impl Device {
                 false
             };
 
-            // VK_KHR_shader_non_semantic_info: core in 1.3; optional
-            // on older devices when requested.
+            // VK_KHR_shader_non_semantic_info: core in 1.3; optional on older
+            // devices when requested.
             let enable_shader_non_semantic = config.shader_non_semantic_info
                 && is_pre_1_3
                 && has_ext(ash::khr::shader_non_semantic_info::NAME);
 
-            // VK_EXT_descriptor_indexing: core in 1.2; required
-            // extension on older devices when requested — hard
-            // filter. Also requires VK_KHR_maintenance3.
+            // VK_EXT_descriptor_indexing: core in 1.2; required extension on
+            // older devices when requested — hard filter. Also requires
+            // VK_KHR_maintenance3.
             let use_descriptor_indexing_ext =
                 if config.descriptor_indexing && is_pre_1_2 {
                     if has_ext(ash::khr::maintenance3::NAME)
@@ -543,14 +532,13 @@ impl Device {
                     false
                 };
 
-            // VK_EXT_memory_budget: optional device extension.
-            // Enables accurate heap-usage/budget queries via
+            // VK_EXT_memory_budget: optional device extension. Enables accurate
+            // heap-usage/budget queries via
             // vkGetPhysicalDeviceMemoryProperties2.
             let enable_memory_budget = has_ext(ash::ext::memory_budget::NAME);
 
-            // VK_KHR_dynamic_rendering: core in 1.3; required extension
-            // on older devices when dynamic rendering is requested —
-            // hard filter.
+            // VK_KHR_dynamic_rendering: core in 1.3; required extension on
+            // older devices when dynamic rendering is requested — hard filter.
             let use_dr_ext = if config.dynamic_rendering && is_pre_1_3 {
                 if has_ext(ash::khr::dynamic_rendering::NAME) {
                     true
@@ -591,9 +579,9 @@ impl Device {
                     }
                 }
                 if let Ok(true) =
-                    // SAFETY: `dev` and `surf` are both derived from the
-                    // same `Instance`, so calling into the instance's
-                    // surface support query is safe here.
+                    // SAFETY: `dev` and `surf` are both derived from the same
+                    // `Instance`, so calling into the instance's surface
+                    // support query is safe here.
                     unsafe {
                         surf.supports_queue_family(dev, idx as u32)
                     }
@@ -722,9 +710,9 @@ impl Device {
         let dedicated_present_family = {
             queue_families.iter().enumerate().find_map(|(idx, qf)| {
                 if !qf.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                    // SAFETY: `dev` and `surf` are both derived from the
-                    // same `Instance`, so calling into the instance's
-                    // surface support query is safe here.
+                    // SAFETY: `dev` and `surf` are both derived from the same
+                    // `Instance`, so calling into the instance's surface
+                    // support query is safe here.
                     && let Ok(true) = unsafe {
                         surf.supports_queue_family(best.handle, idx as u32)
                     }
@@ -763,18 +751,18 @@ impl Device {
             compute_family
         );
 
-        // --- Queue count per family ---
-        // Always allocate exactly one queue per family (no parallelism).
+        // --- Queue count per family --- Always allocate exactly one queue per
+        // family (no parallelism).
         let mut queue_families: HashSet<u32> = HashSet::new();
         for &family in &[graphics_family, transfer_family, compute_family] {
             queue_families.insert(family);
         }
 
-        // --- Determine effective config and check strictness ---
-        // Each axis is checked independently: dedicated_transfer and
-        // dedicated_compute reflect whether each role got its own
-        // family; parallel reflects whether more than one queue was
-        // allocated from the graphics/present family.
+        // --- Determine effective config and check strictness --- Each axis is
+        // checked independently: dedicated_transfer and dedicated_compute
+        // reflect whether each role got its own family; parallel reflects
+        // whether more than one queue was allocated from the graphics/present
+        // family.
         let effective_config = QueueConfig {
             dedicated_transfer: transfer_family != graphics_family,
             dedicated_compute: compute_family != graphics_family,
@@ -806,33 +794,21 @@ impl Device {
                 })
                 .collect();
 
-        // Build the device extension list. A HashSet is used so
-        // that dependency extensions can be inserted freely without
-        // worrying about duplicates.
+        // Build the device extension list. A HashSet is used so that dependency
+        // extensions can be inserted freely without worrying about duplicates.
         //
-        // Extension dependency chains (device extensions only;
-        // instance extensions such as
-        // VK_KHR_get_physical_device_properties2 are omitted
+        // Extension dependency chains (device extensions only; instance
+        // extensions such as VK_KHR_get_physical_device_properties2 are omitted
         // because they cannot appear in ppEnabledExtensionNames):
         //
-        //   VK_KHR_swapchain
-        //     (no device-ext deps)
-        //   VK_KHR_shader_non_semantic_info
-        //     (no deps)
-        //   VK_EXT_memory_budget
-        //     (no device-ext deps)
-        //   VK_KHR_synchronization2
-        //     (no device-ext deps)
-        //   VK_KHR_dynamic_rendering
-        //     └── VK_KHR_depth_stencil_resolve (1.2 core)
-        //           └── VK_KHR_create_renderpass2 (1.2 core)
-        //                 ├── VK_KHR_multiview (1.1 core)
-        //                 └── VK_KHR_maintenance2 (1.1 core)
-        //   VK_KHR_maintenance1
-        //     (no deps)
-        //   VK_EXT_descriptor_indexing
-        //     └── VK_KHR_maintenance3
-        //           (no device-ext deps)
+        //   VK_KHR_swapchain (no device-ext deps)
+        //     VK_KHR_shader_non_semantic_info (no deps) VK_EXT_memory_budget
+        //   (no device-ext deps) VK_KHR_synchronization2 (no device-ext deps)
+        //     VK_KHR_dynamic_rendering └── VK_KHR_depth_stencil_resolve (1.2
+        //   core) └── VK_KHR_create_renderpass2 (1.2 core) ├── VK_KHR_multiview
+        //     (1.1 core) └── VK_KHR_maintenance2 (1.1 core) VK_KHR_maintenance1
+        //   (no deps) VK_EXT_descriptor_indexing └── VK_KHR_maintenance3 (no
+        //     device-ext deps)
         let mut mandatory_exts: HashSet<&CStr> = HashSet::new();
         if config.swapchain {
             mandatory_exts.insert(ash::khr::swapchain::NAME);
@@ -847,10 +823,9 @@ impl Device {
             mandatory_exts.insert(ash::khr::synchronization2::NAME);
         }
         if use_dr_ext {
-            // Full transitive device-extension dependency chain
-            // for VK_KHR_dynamic_rendering. Validation requires
-            // all deps in ppEnabledExtensionNames even when
-            // promoted to core.
+            // Full transitive device-extension dependency chain for
+            // VK_KHR_dynamic_rendering. Validation requires all deps in
+            // ppEnabledExtensionNames even when promoted to core.
             mandatory_exts.insert(ash::khr::maintenance2::NAME);
             mandatory_exts.insert(ash::khr::multiview::NAME);
             mandatory_exts.insert(ash::khr::create_renderpass2::NAME);
@@ -872,13 +847,12 @@ impl Device {
         let mut sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default()
                 .synchronization2(true);
-        // Enable dynamic rendering if requested (core 1.3 or via
-        // extension).
+        // Enable dynamic rendering if requested (core 1.3 or via extension).
         let mut dr_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default()
                 .dynamic_rendering(true);
-        // Enable descriptor indexing: partially-bound descriptors
-        // (core 1.2 or via VK_EXT_descriptor_indexing).
+        // Enable descriptor indexing: partially-bound descriptors (core 1.2 or
+        // via VK_EXT_descriptor_indexing).
         let mut descriptor_indexing_features =
             vk::PhysicalDeviceDescriptorIndexingFeatures::default()
                 .descriptor_binding_partially_bound(true);
@@ -887,11 +861,11 @@ impl Device {
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&ext_ptrs);
 
-        // On Vulkan < 1.1, extension feature structs must be chained
-        // through VkPhysicalDeviceFeatures2 (from
-        // VK_KHR_get_physical_device_properties2) rather than placed
-        // directly in VkDeviceCreateInfo::pNext.
-        // On 1.1+ core, they go directly on DeviceCreateInfo.
+        // On Vulkan < 1.1, extension feature structs must be chained through
+        // VkPhysicalDeviceFeatures2 (from
+        // VK_KHR_get_physical_device_properties2) rather than placed directly
+        // in VkDeviceCreateInfo::pNext. On 1.1+ core, they go directly on
+        // DeviceCreateInfo.
         let mut features2 = vk::PhysicalDeviceFeatures2::default();
         let mut use_features2 = false;
         if config.synchronization2 {
@@ -926,21 +900,21 @@ impl Device {
             device_create_info = device_create_info.push_next(&mut features2);
         }
 
-        // SAFETY: physical_device was derived from instance;
-        // device_create_info is fully initialised above.
+        // SAFETY: physical_device was derived from instance; device_create_info
+        // is fully initialised above.
         let device = unsafe {
             instance.create_ash_device(physical_device, &device_create_info)
         }
         .map_err(CreateCompatibleError::DeviceCreationFailed)?;
 
-        // Build per-family single `Arc<Mutex<vk::Queue>>` entries.
-        // Roles that share a family share the same Arc instance, so
-        // locking any role serialises on the same Mutex.
+        // Build per-family single `Arc<Mutex<vk::Queue>>` entries. Roles that
+        // share a family share the same Arc instance, so locking any role
+        // serialises on the same Mutex.
         let mut family_queues: HashMap<u32, Arc<Mutex<vk::Queue>>> =
             HashMap::new();
         for family in &queue_families {
-            // SAFETY: device was just created requesting at least one
-            // queue from this family; always fetch queue 0.
+            // SAFETY: device was just created requesting at least one queue
+            // from this family; always fetch queue 0.
             let q = unsafe { device.get_device_queue(*family, 0) };
             family_queues.insert(*family, Arc::new(Mutex::new(q)));
         }
@@ -948,25 +922,47 @@ impl Device {
         let debug_utils_device =
             instance.create_debug_utils_device_loader(&device);
 
-        // for (family, mut queue) in &mut family_queues {
-        //     debug_utils_device.as_ref().inspect(|dud| {
-        //         let queue = Arc::get_mut(&mut queue)
-        //             .expect("This Arc should not have been cloned yet")
-        //             .get_mut()
-        //             .expect("Poisoned mutex around queue before any usage");
+        for (family, queue) in &mut family_queues {
+            debug_utils_device.as_ref().inspect(|dud| {
+                let queue = Arc::get_mut(queue)
+                    .expect("This Arc should not have been cloned yet")
+                    .get_mut();
+                let mut queue_type_strs = Vec::with_capacity(4);
+                if *family == graphics_family {
+                    queue_type_strs.push("graphics");
+                }
+                if *family == present_family {
+                    queue_type_strs.push("present");
+                }
+                if *family == transfer_family {
+                    queue_type_strs.push("transfer");
+                }
+                if *family == compute_family {
+                    queue_type_strs.push("compute");
+                }
 
-        //         let object_debug_name: String = [if family = graphics_present_family].iter().collect();
-        //         // SAFETY: device was just created. Queue was just created from
-        //         // this device
-        //         unsafe {
-        //             dud.set_debug_utils_object_name(
-        //                 &DebugUtilsObjectNameInfoEXT::default()
-        //                     .object_handle(*queue)
-        //                     .object_name(queue_debug_name),
-        //             )
-        //         };
-        //     });
-        // }
+                let queue_type_str = if queue_type_strs.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    queue_type_strs.join("+")
+                };
+
+                let queue_debug_name = std::ffi::CString::new(format!(
+                    "{} Queue (family: {})",
+                    queue_type_str, family
+                ))
+                .expect("Failed to create CString for queue debug name");
+                // SAFETY: device was just created. Queue was just created from
+                // this device
+                unsafe {
+                    let _ = dud.set_debug_utils_object_name(
+                        &vk::DebugUtilsObjectNameInfoEXT::default()
+                            .object_handle(*queue)
+                            .object_name(&queue_debug_name),
+                    );
+                };
+            });
+        }
 
         let graphics_queue = family_queues[&graphics_family].clone();
         let present_queue = family_queues[&present_family].clone();
@@ -1041,11 +1037,11 @@ impl Device {
         self.physical_device
     }
 
-    /// Returns `true` if `VK_EXT_memory_budget` was enabled on this
-    /// device. When true, callers may chain
+    /// Returns `true` if `VK_EXT_memory_budget` was enabled on this device.
+    /// When true, callers may chain
     /// `vk::PhysicalDeviceMemoryBudgetPropertiesEXT` into
-    /// `vkGetPhysicalDeviceMemoryProperties2` to obtain accurate
-    /// per-heap usage and budget figures.
+    /// `vkGetPhysicalDeviceMemoryProperties2` to obtain accurate per-heap usage
+    /// and budget figures.
     #[inline]
     pub fn has_memory_budget(&self) -> bool {
         self.memory_budget
@@ -1067,15 +1063,14 @@ impl Device {
     }
 
     /// Return the first format in `candidates` that supports
-    /// `DEPTH_STENCIL_ATTACHMENT` in optimal tiling, or `None` if
-    /// none do.
+    /// `DEPTH_STENCIL_ATTACHMENT` in optimal tiling, or `None` if none do.
     pub fn find_depth_format(
         &self,
         candidates: &[vk::Format],
     ) -> Option<vk::Format> {
         candidates.iter().copied().find(|&fmt| {
-            // SAFETY: physical_device is a valid handle selected from
-            // this instance during device creation.
+            // SAFETY: physical_device is a valid handle selected from this
+            // instance during device creation.
             let props = unsafe {
                 self.parent
                     .ash_instance()
@@ -1090,8 +1085,8 @@ impl Device {
         })
     }
 
-    /// Score a memory type for a given usage; returns `None` if the
-    /// type is incompatible.  Higher scores are more preferred.
+    /// Score a memory type for a given usage; returns `None` if the type is
+    /// incompatible.  Higher scores are more preferred.
     fn score_memory_type(
         flags: vk::MemoryPropertyFlags,
         usage: MemoryUsage,
@@ -1116,10 +1111,10 @@ impl Device {
         }
     }
 
-    /// Select the best Vulkan memory type index for `requirements`
-    /// and `usage`.  Among types with equal score the lowest index
-    /// wins, matching Vulkan's convention that earlier types in the
-    /// list are more preferred within the same heap.
+    /// Select the best Vulkan memory type index for `requirements` and `usage`.
+    /// Among types with equal score the lowest index wins, matching Vulkan's
+    /// convention that earlier types in the list are more preferred within the
+    /// same heap.
     fn select_memory_type(
         &self,
         requirements: vk::MemoryRequirements,
@@ -1140,11 +1135,10 @@ impl Device {
 
     /// Allocate device memory for the given requirements.
     ///
-    /// Selects the best-matching Vulkan memory type for `usage`,
-    /// narrows `requirements.memory_type_bits` to that type, then
-    /// rounds `size` and `alignment` up to
-    /// `VkPhysicalDeviceLimits::nonCoherentAtomSize` only when the
-    /// chosen type is HOST_VISIBLE but not HOST_COHERENT.
+    /// Selects the best-matching Vulkan memory type for `usage`, narrows
+    /// `requirements.memory_type_bits` to that type, then rounds `size` and
+    /// `alignment` up to `VkPhysicalDeviceLimits::nonCoherentAtomSize` only
+    /// when the chosen type is HOST_VISIBLE but not HOST_COHERENT.
     pub fn allocate_memory(
         &self,
         name: &str,
@@ -1185,8 +1179,7 @@ impl Device {
             .allocator
             .as_ref()
             .expect("allocator is dropped only during Device::drop")
-            .lock()
-            .expect("allocator lock poisoned");
+            .lock();
         let mut allocator = allocator;
         allocator.allocate(&AllocationCreateDesc {
             name,
@@ -1205,8 +1198,7 @@ impl Device {
             .allocator
             .as_ref()
             .expect("allocator is dropped only during Device::drop")
-            .lock()
-            .expect("allocator lock poisoned");
+            .lock();
         let mut allocator = allocator;
         allocator.free(allocation)
     }
@@ -1254,82 +1246,22 @@ impl Device {
     }
 
     #[inline]
-    pub fn graphics_queue_count(&self) -> usize {
-        1
-    }
-
-    #[inline]
-    pub fn present_queue_count(&self) -> usize {
-        1
-    }
-
-    #[inline]
-    pub fn transfer_queue_count(&self) -> usize {
-        1
-    }
-
-    #[inline]
-    pub fn compute_queue_count(&self) -> usize {
-        1
-    }
-
-    #[inline]
     pub fn queue_config(&self) -> QueueConfig {
         self.queue_config
     }
 }
 
-// Swapchain functionality
+// image functionality
 impl Device {
-    /// # Safety
-    /// `create_info` must reference valid Vulkan objects derived from this
-    /// device and its parent instance. Any referenced pointers must remain
-    /// valid for the duration of the call.
+    /// Destroy a `VkSampler`.
     ///
-    /// If `create_info.old_swapchain` is non-null, that handle must be a valid
-    /// swapchain created from this device.
-    #[inline]
-    pub unsafe fn create_raw_swapchain(
-        &self,
-        create_info: &vk::SwapchainCreateInfoKHR<'_>,
-    ) -> Result<vk::SwapchainKHR, vk::Result> {
-        let swapchain_device = self
-            .swapchain_device
-            .as_ref()
-            .expect("swapchain was not enabled in DeviceConfig");
-        // SAFETY: Caller guarantees create_info validity and handle provenance.
-        unsafe { swapchain_device.create_swapchain(create_info, None) }
-    }
-
     /// # Safety
-    /// `swapchain` must be a valid swapchain handle created from this device
-    /// and not yet destroyed.
+    /// `sampler` must be a valid handle created from this device and not yet
+    /// destroyed. No in-flight GPU work may still reference `sampler`.
     #[inline]
-    pub unsafe fn get_raw_swapchain_images(
-        &self,
-        swapchain: vk::SwapchainKHR,
-    ) -> Result<Vec<vk::Image>, vk::Result> {
-        let swapchain_device = self
-            .swapchain_device
-            .as_ref()
-            .expect("swapchain was not enabled in DeviceConfig");
-        // SAFETY: Caller guarantees swapchain validity and lifetime.
-        unsafe { swapchain_device.get_swapchain_images(swapchain) }
-    }
-
-    /// # Safety
-    /// `swapchain` must be a valid handle derived from this device, and all
-    /// child resources derived from it must be destroyed first.
-    ///
-    /// No in-flight GPU work may still reference the swapchain.
-    #[inline]
-    pub unsafe fn destroy_raw_swapchain(&self, swapchain: vk::SwapchainKHR) {
-        let swapchain_device = self
-            .swapchain_device
-            .as_ref()
-            .expect("swapchain was not enabled in DeviceConfig");
-        // SAFETY: Caller guarantees swapchain provenance and drop ordering.
-        unsafe { swapchain_device.destroy_swapchain(swapchain, None) };
+    pub unsafe fn destroy_raw_sampler(&self, sampler: vk::Sampler) {
+        // SAFETY: Caller guarantees sampler provenance and drop ordering.
+        unsafe { self.handle.destroy_sampler(sampler, None) };
     }
 
     /// # Safety
@@ -1424,16 +1356,59 @@ impl Device {
         // SAFETY: Caller guarantees create_info validity.
         unsafe { self.handle.create_sampler(create_info, None) }
     }
+}
 
-    /// Destroy a `VkSampler`.
-    ///
+// Swapchain functionality
+impl Device {
     /// # Safety
-    /// `sampler` must be a valid handle created from this device and not yet
-    /// destroyed. No in-flight GPU work may still reference `sampler`.
+    /// `create_info` must reference valid Vulkan objects derived from this
+    /// device and its parent instance. Any referenced pointers must remain
+    /// valid for the duration of the call.
+    ///
+    /// If `create_info.old_swapchain` is non-null, that handle must be a valid
+    /// swapchain created from this device.
     #[inline]
-    pub unsafe fn destroy_raw_sampler(&self, sampler: vk::Sampler) {
-        // SAFETY: Caller guarantees sampler provenance and drop ordering.
-        unsafe { self.handle.destroy_sampler(sampler, None) };
+    pub unsafe fn create_raw_swapchain(
+        &self,
+        create_info: &vk::SwapchainCreateInfoKHR<'_>,
+    ) -> Result<vk::SwapchainKHR, vk::Result> {
+        let swapchain_device = self
+            .swapchain_device
+            .as_ref()
+            .expect("swapchain was not enabled in DeviceConfig");
+        // SAFETY: Caller guarantees create_info validity and handle provenance.
+        unsafe { swapchain_device.create_swapchain(create_info, None) }
+    }
+
+    /// # Safety
+    /// `swapchain` must be a valid swapchain handle created from this device
+    /// and not yet destroyed.
+    #[inline]
+    pub unsafe fn get_raw_swapchain_images(
+        &self,
+        swapchain: vk::SwapchainKHR,
+    ) -> Result<Vec<vk::Image>, vk::Result> {
+        let swapchain_device = self
+            .swapchain_device
+            .as_ref()
+            .expect("swapchain was not enabled in DeviceConfig");
+        // SAFETY: Caller guarantees swapchain validity and lifetime.
+        unsafe { swapchain_device.get_swapchain_images(swapchain) }
+    }
+
+    /// # Safety
+    /// `swapchain` must be a valid handle derived from this device, and all
+    /// child resources derived from it must be destroyed first.
+    ///
+    /// No in-flight GPU work may still reference the swapchain.
+    #[inline]
+    pub unsafe fn destroy_raw_swapchain(&self, swapchain: vk::SwapchainKHR) {
+        let swapchain_device = self
+            .swapchain_device
+            .as_ref()
+            .expect("swapchain was not enabled in DeviceConfig");
+        // SAFETY: Caller guarantees swapchain provenance and drop ordering.
+        unsafe { swapchain_device.destroy_swapchain(swapchain, None) };
     }
 
     /// Acquire the next presentable swapchain image.
@@ -1447,9 +1422,9 @@ impl Device {
     /// can resume.
     ///
     /// # Safety
-    /// `swapchain` must be a valid handle created from this device.
-    /// `semaphore` and `fence`, when not null, must be valid unsignaled handles
-    /// created from this device.
+    /// `swapchain` must be a valid handle created from this device. `semaphore`
+    /// and `fence`, when not null, must be valid unsignaled handles created
+    /// from this device.
     #[inline]
     pub unsafe fn acquire_next_swapchain_image(
         &self,
@@ -1481,8 +1456,8 @@ impl Device {
     /// # Safety
     /// All handles in `present_info` must be valid and derived from this
     /// device. Wait semaphores must be signaled. The presented image must be in
-    /// `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` and not referenced by any pending
-    /// GPU work other than this presentation.
+    /// `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` and not referenced by any pending GPU
+    /// work other than this presentation.
     #[inline]
     pub unsafe fn queue_present(
         &self,
@@ -1492,10 +1467,7 @@ impl Device {
             .swapchain_device
             .as_ref()
             .expect("swapchain was not enabled in DeviceConfig");
-        let queue = self
-            .present_queue
-            .lock()
-            .expect("present queue lock poisoned");
+        let queue = self.acquire_present_queue();
         // SAFETY: Caller guarantees all handles and synchronization
         // requirements.
         unsafe { swapchain_device.queue_present(*queue, present_info) }
@@ -1508,7 +1480,7 @@ impl Device {
     }
 }
 
-// Debug naming functionality
+// Debug naming and label functionality
 impl Device {
     /// Set a Vulkan debug name for an object owned by this device.
     ///
@@ -1545,21 +1517,22 @@ impl Device {
 
     /// Lazily set a Vulkan debug name for an object owned by this device.
     ///
-    /// The closure is only called if `VK_EXT_debug_utils` is enabled.
-    /// Returning `None` from the closure is treated as a no-op.
+    /// The closure is only called if `VK_EXT_debug_utils` is enabled. Returning
+    /// `None` from the closure is treated as a no-op.
     ///
     /// # Safety
     /// `object` must be a valid Vulkan handle created from this device (or a
     /// child object associated with this device) and must remain valid for the
     /// duration of the call.
-    pub unsafe fn set_object_name_with<H, F>(
+    pub unsafe fn set_object_name_lazy<H, F, T>(
         &self,
         object: H,
         name_provider: F,
     ) -> Result<(), NameObjectError>
     where
         H: vk::Handle,
-        F: FnOnce() -> Option<CString>,
+        F: FnOnce() -> Option<T>,
+        T: AsRef<CStr>,
     {
         if self.debug_utils_device.is_none() {
             return Ok(());
@@ -1568,7 +1541,173 @@ impl Device {
         let name = name_provider();
         // SAFETY: This method shares the same safety contract as
         // set_object_name.
-        unsafe { self.set_object_name(object, name.as_deref()) }
+        unsafe {
+            self.set_object_name(object, name.as_ref().map(|n| n.as_ref()))
+        }
+    }
+
+    /// Begin a queue label region using the passed name
+    ///
+    /// # Safety
+    /// Queue comes from this device
+    unsafe fn begin_queue_debug_label_cstr(
+        &self,
+        queue: vk::Queue,
+        label: Option<&CStr>,
+    ) {
+        if let Some(debug_utils) = self.debug_utils_device.as_ref()
+            && let Some(label) = label
+        {
+            let label_info =
+                vk::DebugUtilsLabelEXT::default().label_name(label);
+            // SAFETY: Queue came from this device. We have a debug_utils_device
+            // so by definition we can use debug utils functions
+            unsafe {
+                debug_utils.queue_begin_debug_utils_label(queue, &label_info);
+            }
+        }
+    }
+
+    pub fn debug_utils_enabled(&self) -> bool {
+        self.debug_utils_device.is_some()
+    }
+    /// End a previously began queue label region
+    ///
+    /// # Safety
+    /// We must be in a queue label on the passed Queue. Queue comes from this
+    /// device.
+    unsafe fn end_queue_debug_label(&self, queue: vk::Queue) {
+        if let Some(debug_utils) = self.debug_utils_device.as_ref() {
+            // SAFETY: Caller guarantees queue family validity. We have a
+            // debug_utils_device so by definition we can use debug utils
+            // functions
+            unsafe { debug_utils.queue_end_debug_utils_label(queue) };
+        }
+    }
+
+    /// Convenience helper to run a closure within a queue label region.
+    ///
+    /// # Safety
+    /// Queue comes from this device, label is valid UTF-8
+    unsafe fn within_queue_debug_label_cstr<R, F>(
+        &self,
+        queue: vk::Queue,
+        label: Option<&CStr>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        //
+        // SAFETY: queue comes from this device, label is valid UTF-8 per our
+        // unsafe contract
+        unsafe { self.begin_queue_debug_label_cstr(queue, label) };
+        let result = f();
+        // SAFETY: queue comes from this device. We are in a queue debug label
+        // per our safety contract
+        unsafe { self.end_queue_debug_label(queue) };
+        result
+    }
+
+    /// Begin a queue label region on the graphics queue using the passed name
+    ///
+    /// # Safety
+    /// label is valid UTF-8
+    pub unsafe fn begin_graphics_queue_debug_label_cstr(
+        &self,
+        label: Option<&CStr>,
+    ) {
+        let queue = self.graphics_queue.lock();
+        // SAFETY: queue comes from this device, label is valid UTF-8 per our
+        // unsafe contract
+        unsafe { self.begin_queue_debug_label_cstr(*queue, label) };
+    }
+
+    /// End a previously began queue label region on the graphics queue
+    ///
+    /// # Safety
+    /// We must be in a queue debug label on the graphics queue
+    pub unsafe fn end_graphics_queue_debug_label(&self) {
+        let queue = self.graphics_queue.lock();
+
+        // SAFETY: queue comes from this device. We are in a queue debug label
+        // per our safety contract
+        unsafe { self.end_queue_debug_label(*queue) };
+    }
+
+    /// Begin a queue label region on the present queue using the passed name
+    ///
+    /// # Safety
+    /// label is valid UTF-8
+    pub unsafe fn begin_present_queue_debug_label_cstr(
+        &self,
+        label: Option<&CStr>,
+    ) {
+        let queue = self.present_queue.lock();
+        // SAFETY: queue comes from this device, label is valid UTF-8 per our
+        // unsafe contract
+        unsafe { self.begin_queue_debug_label_cstr(*queue, label) };
+    }
+
+    /// End a previously began queue label region on the present queue
+    ///
+    /// # Safety
+    /// We must be in a queue debug label on the present queue
+    pub unsafe fn end_present_queue_debug_label(&self) {
+        let queue = self.present_queue.lock();
+        // SAFETY: queue comes from this device. We are in a queue debug label
+        // per our safety contract
+        unsafe { self.end_queue_debug_label(*queue) };
+    }
+
+    /// Begin a queue label region on the transfer queue using the passed name
+    ///
+    /// # Safety
+    /// label is valid UTF-8
+    pub unsafe fn begin_transfer_queue_debug_label_cstr(
+        &self,
+        label: Option<&CStr>,
+    ) {
+        let queue = self.transfer_queues.lock();
+        // SAFETY: queue comes from this device, label is valid UTF-8 per our
+        // unsafe contract
+        unsafe { self.begin_queue_debug_label_cstr(*queue, label) };
+    }
+
+    /// End a previously began queue label region on the transfer queue
+    ///
+    /// # Safety
+    /// We must be in a queue debug label on the transfer queue
+    pub unsafe fn end_transfer_queue_debug_label(&self) {
+        let queue = self.transfer_queues.lock();
+        // SAFETY: queue comes from this device. We are in a queue debug label
+        // per our safety contract
+        unsafe { self.end_queue_debug_label(*queue) };
+    }
+
+    /// Begin a queue label region on the compute queue using the passed name
+    ///
+    /// # Safety
+    /// label is valid UTF-8
+    pub unsafe fn begin_compute_queue_debug_label_cstr(
+        &self,
+        label: Option<&CStr>,
+    ) {
+        let queue = self.compute_queues.lock();
+        // SAFETY: queue comes from this device, label is valid UTF-8 per our
+        // unsafe contract
+        unsafe { self.begin_queue_debug_label_cstr(*queue, label) };
+    }
+
+    /// End a previously began queue label region on the compute queue
+    ///
+    /// # Safety
+    /// We must be in a queue debug label on the compute queue
+    pub unsafe fn end_compute_queue_debug_label(&self) {
+        let queue = self.compute_queues.lock();
+        // SAFETY: queue comes from this device. We are in a queue debug label
+        // per our safety contract
+        unsafe { self.end_queue_debug_label(*queue) };
     }
 
     /// Convenience helper to set a name from UTF-8 text.
@@ -1598,6 +1737,453 @@ impl Device {
         // set_object_name.
         unsafe { self.set_object_name(object, name.as_deref()) }
     }
+
+    /// Run a closure within a graphics queue debug label region
+    ///
+    /// # Safety
+    /// label is valid UTF-8
+    pub unsafe fn within_graphics_queue_debug_label_cstr<R, F>(
+        &self,
+        label: Option<&CStr>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let queue = self.graphics_queue.lock();
+        // SAFETY: queue comes from this device, label is valid UTF-8 per our
+        // unsafe contract
+        unsafe { self.within_queue_debug_label_cstr(*queue, label, f) }
+    }
+
+    /// Run a closure within a graphics queue debug label region (safe &str
+    /// variant)
+    pub fn within_graphics_queue_debug_label<R, F>(
+        &self,
+        label: Option<&str>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let label_cstr = label.map(|s| {
+            std::ffi::CString::new(s)
+                .expect("Label must not contain null bytes")
+        });
+        // SAFETY: label is valid UTF-8 because we got it from &str
+        unsafe {
+            self.within_graphics_queue_debug_label_cstr(
+                label_cstr.as_deref(),
+                f,
+            )
+        }
+    }
+
+    /// Run a closure within a graphics queue debug label region if debug utils
+    /// is present
+    ///
+    /// # Safety
+    /// Generated label from `label_fn` returns valid UTF-8 reference
+    pub unsafe fn within_graphics_queue_debug_label_lazy_cstr<
+        Return,
+        LabelFn,
+        InnerFn,
+        CStrRef,
+    >(
+        &self,
+        label_fn: LabelFn,
+        inner_fn: InnerFn,
+    ) -> Return
+    where
+        LabelFn: FnOnce() -> Option<CStrRef>,
+        CStrRef: AsRef<CStr>,
+        InnerFn: FnOnce() -> Return,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label = label_ref.as_ref().map(|t| t.as_ref());
+            // SAFETY: label is valid UTF-8 per our unsafe contract
+            unsafe {
+                self.within_graphics_queue_debug_label_cstr(label, inner_fn)
+            }
+        } else {
+            inner_fn()
+        }
+    }
+
+    pub fn within_graphics_queue_debug_label_lazy<
+        Return,
+        LabelFn,
+        InnerFn,
+        StrRef,
+    >(
+        &self,
+        label_fn: LabelFn,
+        inner_fn: InnerFn,
+    ) -> Return
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+        InnerFn: FnOnce() -> Return,
+    {
+        let new_fn = || {
+            let label_ref = label_fn();
+            label_ref.as_ref().map(|t| {
+                CString::new(t.as_ref())
+                    .expect("Label must not contain null bytes")
+            })
+        };
+        // SAFETY: label is valid UTF-8 because it comes from a &str
+        unsafe {
+            self.within_graphics_queue_debug_label_lazy_cstr(new_fn, inner_fn)
+        }
+    }
+
+    /// Run a closure within a present queue debug label region
+    ///
+    /// # Safety
+    /// label is valid UTF-8
+    pub unsafe fn within_present_queue_debug_label_cstr<R, F>(
+        &self,
+        label: Option<&CStr>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let queue = self.present_queue.lock();
+        // SAFETY: queue comes from this device, label is valid UTF-8 per our
+        // unsafe contract
+        unsafe { self.within_queue_debug_label_cstr(*queue, label, f) }
+    }
+
+    /// Run a closure within a present queue debug label region (safe &str
+    /// variant)
+    pub fn within_present_queue_debug_label<R, F>(
+        &self,
+        label: Option<&str>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let label_cstr = label.map(|s| {
+            std::ffi::CString::new(s)
+                .expect("Label must not contain null bytes")
+        });
+        // SAFETY: label is valid UTF-8 because we got it from &str
+        unsafe {
+            self.within_present_queue_debug_label_cstr(label_cstr.as_deref(), f)
+        }
+    }
+
+    /// Run a closure within a present queue debug label region if debug utils
+    /// is present
+    ///
+    /// # Safety
+    /// Generated label from `label_fn` returns valid UTF-8 reference
+    pub unsafe fn within_present_queue_debug_label_lazy_cstr<
+        Return,
+        LabelFn,
+        InnerFn,
+        CStrRef,
+    >(
+        &self,
+        label_fn: LabelFn,
+        inner_fn: InnerFn,
+    ) -> Return
+    where
+        LabelFn: FnOnce() -> Option<CStrRef>,
+        CStrRef: AsRef<CStr>,
+        InnerFn: FnOnce() -> Return,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label = label_ref.as_ref().map(|t| t.as_ref());
+            // SAFETY: label is valid UTF-8 per our unsafe contract
+            unsafe {
+                self.within_present_queue_debug_label_cstr(label, inner_fn)
+            }
+        } else {
+            inner_fn()
+        }
+    }
+
+    pub fn within_present_queue_debug_label_lazy<
+        Return,
+        LabelFn,
+        InnerFn,
+        StrRef,
+    >(
+        &self,
+        label_fn: LabelFn,
+        inner_fn: InnerFn,
+    ) -> Return
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+        InnerFn: FnOnce() -> Return,
+    {
+        let new_fn = || {
+            let label_ref = label_fn();
+            label_ref.as_ref().map(|t| {
+                CString::new(t.as_ref())
+                    .expect("Label must not contain null bytes")
+            })
+        };
+        // SAFETY: label is valid UTF-8 because it comes from a &str
+        unsafe {
+            self.within_present_queue_debug_label_lazy_cstr(new_fn, inner_fn)
+        }
+    }
+
+    /// Run a closure within a transfer queue debug label region
+    ///
+    /// # Safety
+    /// label is valid UTF-8
+    pub unsafe fn within_transfer_queue_debug_label_cstr<R, F>(
+        &self,
+        label: Option<&CStr>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let queue = self.transfer_queues.lock();
+        // SAFETY: queue comes from this device, label is valid UTF-8 per our
+        // unsafe contract
+        unsafe { self.within_queue_debug_label_cstr(*queue, label, f) }
+    }
+
+    /// Run a closure within a transfer queue debug label region (safe &str
+    /// variant)
+    pub fn within_transfer_queue_debug_label_str<R, F>(
+        &self,
+        label: Option<&str>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let label_cstr = label.map(|s| {
+            std::ffi::CString::new(s)
+                .expect("Label must not contain null bytes")
+        });
+        // SAFETY: label is valid UTF-8 because we got it from &str
+        unsafe {
+            self.within_transfer_queue_debug_label_cstr(
+                label_cstr.as_deref(),
+                f,
+            )
+        }
+    }
+
+    /// Run a closure within a present queue debug label region if debug utils
+    /// is present
+    ///
+    /// # Safety
+    /// Generated label from `label_fn` returns valid UTF-8 reference
+    pub unsafe fn within_transfer_queue_debug_label_lazy_cstr<
+        Return,
+        LabelFn,
+        InnerFn,
+        CStrRef,
+    >(
+        &self,
+        label_fn: LabelFn,
+        inner_fn: InnerFn,
+    ) -> Return
+    where
+        LabelFn: FnOnce() -> Option<CStrRef>,
+        CStrRef: AsRef<CStr>,
+        InnerFn: FnOnce() -> Return,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label = label_ref.as_ref().map(|t| t.as_ref());
+            // SAFETY: label is valid UTF-8 per our unsafe contract
+            unsafe {
+                self.within_transfer_queue_debug_label_cstr(label, inner_fn)
+            }
+        } else {
+            inner_fn()
+        }
+    }
+
+    pub fn within_transfer_queue_debug_label_lazy<
+        Return,
+        LabelFn,
+        InnerFn,
+        StrRef,
+    >(
+        &self,
+        label_fn: LabelFn,
+        inner_fn: InnerFn,
+    ) -> Return
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+        InnerFn: FnOnce() -> Return,
+    {
+        let new_fn = || {
+            let label_ref = label_fn();
+            label_ref.as_ref().map(|t| {
+                CString::new(t.as_ref())
+                    .expect("Label must not contain null bytes")
+            })
+        };
+        // SAFETY: label is valid UTF-8 because it comes from a &str
+        unsafe {
+            self.within_transfer_queue_debug_label_lazy_cstr(new_fn, inner_fn)
+        }
+    }
+
+    /// Run a closure within a compute queue debug label region
+    ///
+    /// # Safety
+    /// label is valid UTF-8
+    pub unsafe fn within_compute_queue_debug_label<R, F>(
+        &self,
+        label: Option<&CStr>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let queue = self.compute_queues.lock();
+        // SAFETY: queue comes from this device, label is valid UTF-8 per our
+        // unsafe contract
+        unsafe { self.within_queue_debug_label_cstr(*queue, label, f) }
+    }
+
+    /// Run a closure within a compute queue debug label region (safe &str
+    /// variant)
+    pub fn within_compute_queue_debug_label_str<R, F>(
+        &self,
+        label: Option<&str>,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let label_cstr = label.map(|s| {
+            std::ffi::CString::new(s)
+                .expect("Label must not contain null bytes")
+        });
+        // SAFETY: label is valid UTF-8 because we got it from &str
+        unsafe {
+            self.within_compute_queue_debug_label(label_cstr.as_deref(), f)
+        }
+    }
+
+    /// Run a closure within a compute queue debug label region if debug utils
+    /// is present
+    ///
+    /// # Safety
+    /// Generated label from `label_fn` returns valid UTF-8 reference
+    pub unsafe fn within_compute_queue_debug_label_lazy_cstr<
+        Return,
+        LabelFn,
+        InnerFn,
+        CStrRef,
+    >(
+        &self,
+        label_fn: LabelFn,
+        inner_fn: InnerFn,
+    ) -> Return
+    where
+        LabelFn: FnOnce() -> Option<CStrRef>,
+        CStrRef: AsRef<CStr>,
+        InnerFn: FnOnce() -> Return,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label = label_ref.as_ref().map(|t| t.as_ref());
+            // SAFETY: label is valid UTF-8 per our unsafe contract
+            unsafe { self.within_compute_queue_debug_label(label, inner_fn) }
+        } else {
+            inner_fn()
+        }
+    }
+
+    pub fn within_compute_queue_debug_label_lazy<
+        Return,
+        LabelFn,
+        InnerFn,
+        StrRef,
+    >(
+        &self,
+        label_fn: LabelFn,
+        inner_fn: InnerFn,
+    ) -> Return
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+        InnerFn: FnOnce() -> Return,
+    {
+        let new_fn = || {
+            let label_ref = label_fn();
+            label_ref.as_ref().map(|t| {
+                CString::new(t.as_ref())
+                    .expect("Label must not contain null bytes")
+            })
+        };
+        // SAFETY: label is valid UTF-8 because it comes from a &str
+        unsafe {
+            self.within_compute_queue_debug_label_lazy_cstr(new_fn, inner_fn)
+        }
+    }
+
+    // ── Command-buffer debug labels ──────────────────────────────────────
+    //
+    // Unlike queue labels (which annotate submissions on the host timeline),
+    // command-buffer labels are recorded into the command buffer and appear
+    // on the GPU timeline in tools such as RenderDoc.
+    //
+    // Only the _cstr primitives are provided here. Queue-label style safe
+    // &str / lazy wrappers for begin can be added if needed.
+
+    /// Begin a debug label region inside a command buffer.
+    ///
+    /// # Safety
+    /// `command_buffer` must be a valid handle in the recording state,
+    /// derived from this device. `label` must contain only valid UTF-8
+    /// bytes.
+    pub unsafe fn cmd_begin_debug_label_cstr(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        label: Option<&CStr>,
+    ) {
+        if let Some(debug_utils) = self.debug_utils_device.as_ref() {
+            let label_name = label.unwrap_or(c"");
+            let label_info =
+                vk::DebugUtilsLabelEXT::default().label_name(label_name);
+            // SAFETY: command_buffer is valid and in the recording state per
+            // our contract. label_name is valid UTF-8 per our contract.
+            unsafe {
+                debug_utils
+                    .cmd_begin_debug_utils_label(command_buffer, &label_info)
+            }
+        }
+    }
+
+    /// End a previously begun debug label region inside a command buffer.
+    ///
+    /// # Safety
+    /// `command_buffer` must be a valid handle in the recording state,
+    /// derived from this device. A matching `begin_cmd_debug_label_cstr`
+    /// call must have been recorded into this command buffer.
+    pub unsafe fn end_cmd_debug_label(
+        &self,
+        command_buffer: vk::CommandBuffer,
+    ) {
+        if let Some(debug_utils) = self.debug_utils_device.as_ref() {
+            // SAFETY: command_buffer is valid and in the recording state per
+            // our contract. A matching begin label was recorded per our
+            // contract.
+            unsafe { debug_utils.cmd_end_debug_utils_label(command_buffer) }
+        }
+    }
 }
 
 // Shader module functionality
@@ -1615,8 +2201,8 @@ impl Device {
     }
 
     /// # Safety
-    /// `shader_module` must be a valid handle created from this device and
-    /// not yet destroyed. All objects derived from it must be destroyed first.
+    /// `shader_module` must be a valid handle created from this device and not
+    /// yet destroyed. All objects derived from it must be destroyed first.
     #[inline]
     pub unsafe fn destroy_raw_shader_module(
         &self,
@@ -1657,8 +2243,8 @@ impl Device {
     /// Create a single graphics pipeline.
     ///
     /// On partial batch failure ash returns any successfully-created pipeline
-    /// handles alongside the error; this wrapper destroys them so callers
-    /// never receive a mix of valid and invalid handles.
+    /// handles alongside the error; this wrapper destroys them so callers never
+    /// receive a mix of valid and invalid handles.
     ///
     /// # Safety
     /// `create_info` must reference valid shader stages, a valid pipeline
@@ -1720,8 +2306,8 @@ impl Device {
     /// - `command_buffer` must be a valid handle in the recording state,
     ///   derived from this device.
     /// - `rendering_info` and all objects it references (image views, resolve
-    ///   attachments, etc.) must be valid for the duration of the call and
-    ///   the render pass.
+    ///   attachments, etc.) must be valid for the duration of the call and the
+    ///   render pass.
     /// - All referenced images must be in the layout specified in
     ///   `rendering_info`.
     #[inline]
@@ -1736,16 +2322,16 @@ impl Device {
             .expect("dynamic_rendering was not enabled in DeviceConfig");
         match dr {
             DynamicRenderingLoader::Core => {
-                // SAFETY: Caller guarantees command_buffer and
-                // rendering_info validity.
+                // SAFETY: Caller guarantees command_buffer and rendering_info
+                // validity.
                 unsafe {
                     self.handle
                         .cmd_begin_rendering(command_buffer, rendering_info)
                 };
             }
             DynamicRenderingLoader::Extension(loader) => {
-                // SAFETY: Caller guarantees command_buffer and
-                // rendering_info validity.
+                // SAFETY: Caller guarantees command_buffer and rendering_info
+                // validity.
                 unsafe {
                     loader.cmd_begin_rendering(command_buffer, rendering_info)
                 };
@@ -1770,13 +2356,13 @@ impl Device {
             .expect("dynamic_rendering was not enabled in DeviceConfig");
         match dr {
             DynamicRenderingLoader::Core => {
-                // SAFETY: Caller guarantees command_buffer validity
-                // and render pass state.
+                // SAFETY: Caller guarantees command_buffer validity and render
+                // pass state.
                 unsafe { self.handle.cmd_end_rendering(command_buffer) };
             }
             DynamicRenderingLoader::Extension(loader) => {
-                // SAFETY: Caller guarantees command_buffer validity
-                // and render pass state.
+                // SAFETY: Caller guarantees command_buffer validity and render
+                // pass state.
                 unsafe { loader.cmd_end_rendering(command_buffer) };
             }
         }
@@ -1785,8 +2371,81 @@ impl Device {
 
 // Synchronization2
 impl Device {
-    /// Submit work to the graphics/present queue using the
-    /// synchronization2 API.
+    /// Internal helper to submit to a queue using the synchronization2 API with
+    /// an explicit raw fence handle.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled. `fence`, when not null,
+    /// must be an unsignaled fence created from this device.
+    unsafe fn queue_submit2_raw_fence(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), QueueSubmitError> {
+        let sync2 = self
+            .synchronization2
+            .as_ref()
+            .expect("synchronization2 was not enabled in DeviceConfig");
+        match sync2 {
+            Synchronization2Loader::Core => {
+                // SAFETY: `queue` was obtained from this device and remains
+                // valid while this call executes. `submits` and `fence` refer
+                // to resources created for this device; calling the raw
+                // `queue_submit2` function pointer is safe because the
+                // Synchronization2 loader was initialized during device
+                // creation and provides a valid entrypoint.
+                unsafe { self.handle.queue_submit2(queue, submits, fence) }
+            }
+            Synchronization2Loader::Extension(loader) => {
+                // SAFETY: `loader` contains a valid function pointer for
+                // `queue_submit2` loaded when the device was created. `queue`,
+                // `submits`, and `fence` are valid and derived from this
+                // device, so invoking the extension entrypoint is safe.
+                unsafe { loader.queue_submit2(queue, submits, fence) }
+            }
+        }
+        .map_err(QueueSubmitError::SubmissionFailed)
+    }
+
+    /// Internal helper to submit to a queue using the synchronization2 API with
+    /// an optional safe fence reference.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled.
+    unsafe fn _queue_submit2(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<Fence>,
+    ) -> Result<(), QueueSubmitError> {
+        if fence
+            .as_ref()
+            .map(|f| f.parent().raw_device() != self.raw_device())
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            // SAFETY: All handles in submits are valid and derived from this
+            // device by our own safety contract. Command buffers are in the
+            // executable state by our own safety contract. Wait semaphores are
+            // signaled by our own safety contract. raw_fence is known to have
+            // been derived from this device and is in the unsignaled state.
+            unsafe { self.queue_submit2_raw_fence(queue, submits, raw_fence) }
+        }
+    }
+    /// Submit work to the graphics/present queue using the synchronization2
+    /// API.
     ///
     /// # Safety
     /// All handles in `submits` must be valid and derived from this device.
@@ -1799,27 +2458,13 @@ impl Device {
         submits: &[vk::SubmitInfo2<'_>],
         fence: vk::Fence,
     ) -> Result<(), QueueSubmitError> {
-        let queue = self
-            .graphics_queue
-            .lock()
-            .expect("graphics queue lock poisoned");
-        let sync2 = self
-            .synchronization2
-            .as_ref()
-            .expect("synchronization2 was not enabled in DeviceConfig");
-        match sync2 {
-            // SAFETY: Caller guarantees all handle validity and
-            // synchronization state.
-            Synchronization2Loader::Core => unsafe {
-                self.handle.queue_submit2(*queue, submits, fence)
-            },
-            // SAFETY: Caller guarantees all handle validity and
-            // synchronization state.
-            Synchronization2Loader::Extension(loader) => unsafe {
-                loader.queue_submit2(*queue, submits, fence)
-            },
-        }
-        .map_err(QueueSubmitError::SubmissionFailed)
+        let queue = self.graphics_queue.lock();
+        // Safety: `queue` was obtained from this device and remains valid while
+        // this call executes. `submits` and `fence` refer to resources created
+        // for this device; calling the raw `queue_submit2` function pointer is
+        // safe because the Synchronization2 loader was initialized during
+        // device creation and provides a valid entrypoint.
+        unsafe { self.queue_submit2_raw_fence(*queue, submits, fence) }
     }
 
     /// Submit work to the graphics/present queue using the synchronization2
@@ -1838,7 +2483,7 @@ impl Device {
             Err(QueueSubmitError::FenceNotReady)
         } else if fence
             .as_ref()
-            .map(|f| f.parent().raw_device() != self.raw_device())
+            .map(|f| self.is_fence_mismatched(f))
             .unwrap_or(false)
         {
             Err(QueueSubmitError::MismatchedObjects)
@@ -1847,19 +2492,17 @@ impl Device {
                 .as_ref()
                 .map(|f| f.raw_fence())
                 .unwrap_or(vk::Fence::null());
-            // SAFETY: All handles in submits are valid and derived from
-            // this device by our own safety contract. Command buffers
-            // are in the executable state by our own safety contract.
-            // Wait semaphores are signaled by our own safety contract.
-            // raw_fence is known to have been derived from this device
-            // and is in the unsignaled state.
+            // SAFETY: All handles in submits are valid and derived from this
+            // device by our own safety contract. Command buffers are in the
+            // executable state by our own safety contract. Wait semaphores are
+            // signaled by our own safety contract. raw_fence is known to have
+            // been derived from this device and is in the unsignaled state.
             unsafe {
                 self.graphics_queue_submit2_raw_fence(submits, raw_fence)
             }?;
 
             if let Some(f) = fence {
-                // SAFETY: This fence has just been submitted to the
-                // queue via
+                // SAFETY: This fence has just been submitted to the queue via
                 // Self::graphics_present_queue_submit2_raw_fence.
                 _ = unsafe { f.mark_submitted() }
             }
@@ -1881,33 +2524,17 @@ impl Device {
         submits: &[vk::SubmitInfo2<'_>],
         fence: vk::Fence,
     ) -> Result<(), QueueSubmitError> {
-        let queue = self
-            .transfer_queues
-            .lock()
-            .expect("transfer queue lock poisoned");
-        let sync2 = self
-            .synchronization2
-            .as_ref()
-            .expect("synchronization2 was not enabled in DeviceConfig");
-        match sync2 {
-            Synchronization2Loader::Core => {
-                // SAFETY: `queue` was obtained from this device and remains
-                // valid while this call executes. `submits` and `fence` refer
-                // to resources created for this device; calling the raw
-                // `queue_submit2` function pointer is safe because the
-                // Synchronization2 loader was initialized during device
-                // creation and provides a valid entrypoint.
-                unsafe { self.handle.queue_submit2(*queue, submits, fence) }
-            }
-            Synchronization2Loader::Extension(loader) => {
-                // SAFETY: `loader` contains a valid function pointer for
-                // `queue_submit2` loaded when the device was created. `queue`,
-                // `submits`, and `fence` are valid and derived from this
-                // device, so invoking the extension entrypoint is safe.
-                unsafe { loader.queue_submit2(*queue, submits, fence) }
-            }
-        }
-        .map_err(QueueSubmitError::SubmissionFailed)
+        let queue = self.transfer_queues.lock();
+        // Safety: `queue` was obtained from this device and remains valid while
+        // this call executes. `submits` and `fence` refer to resources created
+        // for this device; calling the raw `queue_submit2` function pointer is
+        // safe because the Synchronization2 loader was initialized during
+        // device creation and provides a valid entrypoint.
+        unsafe { self.queue_submit2_raw_fence(*queue, submits, fence) }
+    }
+
+    fn is_fence_mismatched(&self, fence: &sync::Fence) -> bool {
+        fence.parent().raw_device() != self.raw_device()
     }
 
     /// Submit work to the transfer queue using the synchronization2 API.
@@ -1925,7 +2552,7 @@ impl Device {
             Err(QueueSubmitError::FenceNotReady)
         } else if fence
             .as_ref()
-            .map(|f| f.parent().raw_device() != self.raw_device())
+            .map(|f| self.is_fence_mismatched(f))
             .unwrap_or(false)
         {
             Err(QueueSubmitError::MismatchedObjects)
@@ -1934,23 +2561,712 @@ impl Device {
                 .as_ref()
                 .map(|f| f.raw_fence())
                 .unwrap_or(vk::Fence::null());
-            // SAFETY: All handles in submits are valid and derived from
-            // this device by our own safety contract. Command buffers
-            // are in the executable state by our own safety contract.
-            // Wait semaphores are signaled by our own safety contract.
-            // raw_fence is known to have been derived from this device
-            // and is in the unsignaled state.
+            // SAFETY: All handles in submits are valid and derived from this
+            // device by our own safety contract. Command buffers are in the
+            // executable state by our own safety contract. Wait semaphores are
+            // signaled by our own safety contract. raw_fence is known to have
+            // been derived from this device and is in the unsignaled state.
             unsafe {
                 self.transfer_queue_submit2_raw_fence(submits, raw_fence)
             }?;
 
             if let Some(f) = fence {
-                // SAFETY: This fence has just been submitted to the
-                // queue via Self::transfer_queue_submit2_raw_fence.
+                // SAFETY: This fence has just been submitted to the queue via
+                // Self::transfer_queue_submit2_raw_fence.
                 _ = unsafe { f.mark_submitted() }
             }
 
             Ok(())
+        }
+    }
+
+    /// Submit work to the compute queue using the synchronization2 API.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled. `fence`, when not null,
+    /// must be an unsignaled fence created from this device.
+    #[inline]
+    pub unsafe fn compute_queue_submit2_raw_fence(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), QueueSubmitError> {
+        let queue = self.compute_queues.lock();
+        // SAFETY: `queue` was obtained from this device and remains valid while
+        // this call executes. `submits` and `fence` refer to resources created
+        // for this device; calling the raw `queue_submit2` function pointer is
+        // safe because the Synchronization2 loader was initialized during
+        // device creation and provides a valid entrypoint.
+        unsafe { self.queue_submit2_raw_fence(*queue, submits, fence) }
+    }
+
+    /// Submit work to the compute queue using the synchronization2 API.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled.
+    pub unsafe fn compute_queue_submit2(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| self.is_fence_mismatched(f))
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            // SAFETY: All handles in submits are valid and derived from this
+            // device by our own safety contract. Command buffers are in the
+            // executable state by our own safety contract. Wait semaphores are
+            // signaled by our own safety contract. raw_fence is known to have
+            // been derived from this device and is in the unsignaled state.
+            unsafe {
+                self.compute_queue_submit2_raw_fence(submits, raw_fence)
+            }?;
+
+            if let Some(f) = fence {
+                // SAFETY: This fence has just been submitted to the queue via
+                // Self::compute_queue_submit2_raw_fence.
+                _ = unsafe { f.mark_submitted() }
+            }
+
+            Ok(())
+        }
+    }
+
+    // Synchronization2 — labeled submissions
+    //
+    // Each public submit2 function has three string variants that follow the
+    // same convention used by the queue debug-label functions:
+    //
+    //   _labeled_cstr   – unsafe, takes Option<&CStr> (caller guarantees UTF-8)
+    //   _labeled        – safe, takes Option<&str>
+    //   _labeled_lazy   – safe, takes FnOnce() -> Option<StrRef: AsRef<str>>;
+    //                     the label closure is only called when debug utils is
+    //                     enabled, so costly label construction is free in
+    //                     release builds.
+    //
+    // Both the raw-fence tier and the safe-Fence tier get all three variants,
+    // for each of the three queues (graphics, transfer, compute).
+
+    /// Submit work to `queue`, wrapping it in a debug-label region.
+    ///
+    /// Locks the queue, begins the label, submits, then ends the label.
+    /// Using the existing `within_*_queue_debug_label_cstr` helpers here
+    /// would deadlock because they also take the queue lock.
+    ///
+    /// # Safety
+    /// Same as [`Self::queue_submit2_raw_fence`]. `label` must contain only
+    /// valid UTF-8 bytes (it is passed directly to
+    /// `begin_queue_debug_label_cstr`).
+    unsafe fn queue_submit2_raw_fence_labeled_cstr(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        // SAFETY: queue is derived from this device; label is valid UTF-8 per
+        // our safety contract.
+        unsafe { self.begin_queue_debug_label_cstr(queue, label) };
+        // SAFETY: All submit safety requirements are delegated from our
+        // own safety contract. queue is derived from this device.
+        let result =
+            unsafe { self.queue_submit2_raw_fence(queue, submits, fence) };
+        // SAFETY: queue is derived from this device. We opened a label region
+        // with begin_queue_debug_label_cstr above.
+        unsafe { self.end_queue_debug_label(queue) };
+        result
+    }
+
+    // ── Graphics queue — labeled ─────────────────────────────────────────
+
+    /// Submit work to the graphics queue, wrapped in a debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled. `fence`, when not
+    /// null, must be an unsignaled fence created from this device.
+    /// `label` must contain only valid UTF-8 bytes.
+    pub unsafe fn graphics_queue_submit2_raw_fence_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        let queue = self.graphics_queue.lock();
+        // SAFETY: queue is derived from this device. submits, fence, and
+        // label satisfy our safety contract.
+        unsafe {
+            self.queue_submit2_raw_fence_labeled_cstr(
+                *queue, submits, fence, label,
+            )
+        }
+    }
+
+    /// Submit work to the graphics queue, wrapped in a debug-label region
+    /// (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled. `fence`, when not
+    /// null, must be an unsignaled fence created from this device.
+    pub unsafe fn graphics_queue_submit2_raw_fence_labeled(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr was built from a &str, so it is valid UTF-8.
+        unsafe {
+            self.graphics_queue_submit2_raw_fence_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the graphics queue, wrapped in a debug-label region
+    /// (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled; in release
+    /// builds without the extension the closure is never invoked.
+    pub fn graphics_queue_submit2_raw_fence_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8 (built from &str).
+            // All submit safety requirements are on the caller.
+            unsafe {
+                self.graphics_queue_submit2_raw_fence_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.graphics_queue_submit2_raw_fence(submits, fence) }
+        }
+    }
+
+    /// Submit work to the graphics queue using the synchronization2 API,
+    /// wrapped in a debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled. `label` must
+    /// contain only valid UTF-8 bytes.
+    pub unsafe fn graphics_queue_submit2_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| self.is_fence_mismatched(f))
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            let queue = self.graphics_queue.lock();
+            // SAFETY: All submit safety requirements satisfied by our
+            // contract. label is valid UTF-8 per our contract.
+            unsafe {
+                self.queue_submit2_raw_fence_labeled_cstr(
+                    *queue, submits, raw_fence, label,
+                )
+            }?;
+            if let Some(f) = fence {
+                // SAFETY: This fence was just submitted to the graphics queue.
+                _ = unsafe { f.mark_submitted() }
+            }
+            Ok(())
+        }
+    }
+
+    /// Submit work to the graphics queue using the synchronization2 API,
+    /// wrapped in a debug-label region (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled.
+    pub unsafe fn graphics_queue_submit2_labeled(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr is valid UTF-8 (built from &str). Other safety
+        // requirements are propagated from caller.
+        unsafe {
+            self.graphics_queue_submit2_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the graphics queue using the synchronization2 API,
+    /// wrapped in a debug-label region (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled.
+    pub fn graphics_queue_submit2_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8. All submit safety
+            // requirements are on the caller.
+            unsafe {
+                self.graphics_queue_submit2_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.graphics_queue_submit2(submits, fence) }
+        }
+    }
+
+    // ── Transfer queue — labeled ─────────────────────────────────────────
+
+    /// Submit work to the transfer queue, wrapped in a debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled. `fence`, when not
+    /// null, must be an unsignaled fence created from this device.
+    /// `label` must contain only valid UTF-8 bytes.
+    pub unsafe fn transfer_queue_submit2_raw_fence_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        let queue = self.transfer_queues.lock();
+        // SAFETY: queue is derived from this device. submits, fence, and
+        // label satisfy our safety contract.
+        unsafe {
+            self.queue_submit2_raw_fence_labeled_cstr(
+                *queue, submits, fence, label,
+            )
+        }
+    }
+
+    /// Submit work to the transfer queue, wrapped in a debug-label region
+    /// (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled. `fence`, when not
+    /// null, must be an unsignaled fence created from this device.
+    pub unsafe fn transfer_queue_submit2_raw_fence_labeled(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr is valid UTF-8 (built from &str).
+        unsafe {
+            self.transfer_queue_submit2_raw_fence_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the transfer queue, wrapped in a debug-label region
+    /// (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled.
+    pub fn transfer_queue_submit2_raw_fence_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8. Submit safety requirements
+            // are on the caller.
+            unsafe {
+                self.transfer_queue_submit2_raw_fence_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.transfer_queue_submit2_raw_fence(submits, fence) }
+        }
+    }
+
+    /// Submit work to the transfer queue using the synchronization2 API,
+    /// wrapped in a debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled. `label` must
+    /// contain only valid UTF-8 bytes.
+    pub unsafe fn transfer_queue_submit2_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| self.is_fence_mismatched(f))
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            let queue = self.transfer_queues.lock();
+            // SAFETY: All submit safety requirements satisfied by our
+            // contract. label is valid UTF-8 per our contract.
+            unsafe {
+                self.queue_submit2_raw_fence_labeled_cstr(
+                    *queue, submits, raw_fence, label,
+                )
+            }?;
+            if let Some(f) = fence {
+                // SAFETY: This fence was just submitted to the transfer queue.
+                _ = unsafe { f.mark_submitted() }
+            }
+            Ok(())
+        }
+    }
+
+    /// Submit work to the transfer queue using the synchronization2 API,
+    /// wrapped in a debug-label region (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled.
+    pub unsafe fn transfer_queue_submit2_labeled(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr is valid UTF-8. Other safety requirements
+        // propagated from caller.
+        unsafe {
+            self.transfer_queue_submit2_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the transfer queue using the synchronization2 API,
+    /// wrapped in a debug-label region (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled.
+    pub fn transfer_queue_submit2_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8. All submit safety
+            // requirements are on the caller.
+            unsafe {
+                self.transfer_queue_submit2_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.transfer_queue_submit2(submits, fence) }
+        }
+    }
+
+    // ── Compute queue — labeled ──────────────────────────────────────────
+
+    /// Submit work to the compute queue, wrapped in a debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled. `fence`, when not
+    /// null, must be an unsignaled fence created from this device.
+    /// `label` must contain only valid UTF-8 bytes.
+    pub unsafe fn compute_queue_submit2_raw_fence_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        let queue = self.compute_queues.lock();
+        // SAFETY: queue is derived from this device. submits, fence, and
+        // label satisfy our safety contract.
+        unsafe {
+            self.queue_submit2_raw_fence_labeled_cstr(
+                *queue, submits, fence, label,
+            )
+        }
+    }
+
+    /// Submit work to the compute queue, wrapped in a debug-label region
+    /// (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled. `fence`, when not
+    /// null, must be an unsignaled fence created from this device.
+    pub unsafe fn compute_queue_submit2_raw_fence_labeled(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr is valid UTF-8 (built from &str).
+        unsafe {
+            self.compute_queue_submit2_raw_fence_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the compute queue, wrapped in a debug-label region
+    /// (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled.
+    pub fn compute_queue_submit2_raw_fence_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8. Submit safety requirements
+            // are on the caller.
+            unsafe {
+                self.compute_queue_submit2_raw_fence_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.compute_queue_submit2_raw_fence(submits, fence) }
+        }
+    }
+
+    /// Submit work to the compute queue using the synchronization2 API,
+    /// wrapped in a debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled. `label` must
+    /// contain only valid UTF-8 bytes.
+    pub unsafe fn compute_queue_submit2_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| self.is_fence_mismatched(f))
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            let queue = self.compute_queues.lock();
+            // SAFETY: All submit safety requirements satisfied by our
+            // contract. label is valid UTF-8 per our contract.
+            unsafe {
+                self.queue_submit2_raw_fence_labeled_cstr(
+                    *queue, submits, raw_fence, label,
+                )
+            }?;
+            if let Some(f) = fence {
+                // SAFETY: This fence was just submitted to the compute queue.
+                _ = unsafe { f.mark_submitted() }
+            }
+            Ok(())
+        }
+    }
+
+    /// Submit work to the compute queue using the synchronization2 API,
+    /// wrapped in a debug-label region (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must
+    /// be signaled. Signal semaphores must be unsignaled.
+    pub unsafe fn compute_queue_submit2_labeled(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr is valid UTF-8. Other safety requirements
+        // propagated from caller.
+        unsafe {
+            self.compute_queue_submit2_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the compute queue using the synchronization2 API,
+    /// wrapped in a debug-label region (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled.
+    pub fn compute_queue_submit2_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: Option<&mut sync::Fence>,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8. All submit safety
+            // requirements are on the caller.
+            unsafe {
+                self.compute_queue_submit2_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.compute_queue_submit2(submits, fence) }
         }
     }
 
@@ -1970,17 +3286,17 @@ impl Device {
             .synchronization2
             .as_ref()
             .expect("synchronization2 was not enabled in DeviceConfig");
-        // SAFETY: Caller guarantees command_buffer and
-        // dependency_info validity.
+        // SAFETY: Caller guarantees command_buffer and dependency_info
+        // validity.
         match sync2 {
-            // SAFETY: Caller guarantees command_buffer and
-            // dependency_info validity.
+            // SAFETY: Caller guarantees command_buffer and dependency_info
+            // validity.
             Synchronization2Loader::Core => unsafe {
                 self.handle
                     .cmd_pipeline_barrier2(command_buffer, dependency_info)
             },
-            // SAFETY: Caller guarantees command_buffer and
-            // dependency_info validity.
+            // SAFETY: Caller guarantees command_buffer and dependency_info
+            // validity.
             Synchronization2Loader::Extension(loader) => unsafe {
                 loader.cmd_pipeline_barrier2(command_buffer, dependency_info)
             },
@@ -2017,9 +3333,9 @@ impl Device {
     /// Bind vertex buffers for subsequent draw commands.
     ///
     /// # Safety
-    /// `command_buffer` must be in the recording state. `buffers` and
-    /// `offsets` must have equal length. All buffers must be valid handles
-    /// created from this device.
+    /// `command_buffer` must be in the recording state. `buffers` and `offsets`
+    /// must have equal length. All buffers must be valid handles created from
+    /// this device.
     #[inline]
     pub unsafe fn cmd_bind_vertex_buffers(
         &self,
@@ -2028,8 +3344,8 @@ impl Device {
         buffers: &[vk::Buffer],
         offsets: &[vk::DeviceSize],
     ) {
-        // SAFETY: Caller guarantees command_buffer state and
-        // buffer/offset validity.
+        // SAFETY: Caller guarantees command_buffer state and buffer/offset
+        // validity.
         unsafe {
             self.handle.cmd_bind_vertex_buffers(
                 command_buffer,
@@ -2069,8 +3385,8 @@ impl Device {
     /// Record a buffer-to-image copy.
     ///
     /// # Safety
-    /// `command_buffer` must be in the recording state. `src_buffer` must be
-    /// a valid `TRANSFER_SRC` buffer. `dst_image` must be a valid image in
+    /// `command_buffer` must be in the recording state. `src_buffer` must be a
+    /// valid `TRANSFER_SRC` buffer. `dst_image` must be a valid image in
     /// `dst_image_layout`. Regions must be valid and within bounds.
     #[inline]
     pub unsafe fn cmd_copy_buffer_to_image(
@@ -2081,8 +3397,8 @@ impl Device {
         dst_image_layout: vk::ImageLayout,
         regions: &[vk::BufferImageCopy],
     ) {
-        // SAFETY: Caller guarantees command buffer state, handle
-        // provenance, and region validity.
+        // SAFETY: Caller guarantees command buffer state, handle provenance,
+        // and region validity.
         unsafe {
             self.handle.cmd_copy_buffer_to_image(
                 command_buffer,
@@ -2105,8 +3421,8 @@ impl Device {
         command_buffer: vk::CommandBuffer,
         viewports: &[vk::Viewport],
     ) {
-        // SAFETY: Caller guarantees command_buffer state and pipeline
-        // dynamic state.
+        // SAFETY: Caller guarantees command_buffer state and pipeline dynamic
+        // state.
         unsafe { self.handle.cmd_set_viewport(command_buffer, 0, viewports) }
     }
 
@@ -2121,8 +3437,8 @@ impl Device {
         command_buffer: vk::CommandBuffer,
         scissors: &[vk::Rect2D],
     ) {
-        // SAFETY: Caller guarantees command_buffer state and pipeline
-        // dynamic state.
+        // SAFETY: Caller guarantees command_buffer state and pipeline dynamic
+        // state.
         unsafe { self.handle.cmd_set_scissor(command_buffer, 0, scissors) }
     }
 
@@ -2157,8 +3473,8 @@ impl Device {
     ///
     /// # Safety
     /// `command_buffer` must be in the recording state. `buffer` must be a
-    /// valid index buffer created from this device, bound with
-    /// `INDEX_BUFFER` usage.
+    /// valid index buffer created from this device, bound with `INDEX_BUFFER`
+    /// usage.
     #[inline]
     pub unsafe fn cmd_bind_index_buffer(
         &self,
@@ -2167,8 +3483,7 @@ impl Device {
         offset: vk::DeviceSize,
         index_type: vk::IndexType,
     ) {
-        // SAFETY: Caller guarantees command_buffer state and
-        // buffer validity.
+        // SAFETY: Caller guarantees command_buffer state and buffer validity.
         unsafe {
             self.handle.cmd_bind_index_buffer(
                 command_buffer,
@@ -2182,9 +3497,9 @@ impl Device {
     /// Record an indexed draw call.
     ///
     /// # Safety
-    /// `command_buffer` must be in the recording state inside an active
-    /// render pass, with a compatible graphics pipeline bound, all
-    /// required dynamic state set, and a valid index buffer bound.
+    /// `command_buffer` must be in the recording state inside an active render
+    /// pass, with a compatible graphics pipeline bound, all required dynamic
+    /// state set, and a valid index buffer bound.
     #[inline]
     pub unsafe fn cmd_draw_indexed(
         &self,
@@ -2195,8 +3510,8 @@ impl Device {
         vertex_offset: i32,
         first_instance: u32,
     ) {
-        // SAFETY: Caller guarantees render pass, pipeline, and
-        // index buffer state validity.
+        // SAFETY: Caller guarantees render pass, pipeline, and index buffer
+        // state validity.
         unsafe {
             self.handle.cmd_draw_indexed(
                 command_buffer,
@@ -2210,17 +3525,76 @@ impl Device {
     }
 }
 
+// Queue Acquisition
+impl Device {
+    fn acquire_queue(
+        wrapped_queue: &Arc<Mutex<vk::Queue>>,
+    ) -> MutexGuard<'_, vk::Queue> {
+        wrapped_queue.lock()
+    }
+
+    fn acquire_graphics_queue(&self) -> MutexGuard<'_, vk::Queue> {
+        Self::acquire_queue(&self.graphics_queue)
+    }
+
+    fn acquire_present_queue(&self) -> MutexGuard<'_, vk::Queue> {
+        Self::acquire_queue(&self.present_queue)
+    }
+
+    fn acquire_transfer_queue(&self) -> MutexGuard<'_, vk::Queue> {
+        Self::acquire_queue(&self.transfer_queues)
+    }
+
+    fn acquire_compute_queue(&self) -> MutexGuard<'_, vk::Queue> {
+        Self::acquire_queue(&self.compute_queues)
+    }
+}
+
 // Queue submission (VK 1.0 core)
 impl Device {
-    /// Submit work to the graphics/present queue using the core
-    /// Vulkan 1.0 `vkQueueSubmit` API.
+    /// Internal helper to submit to a queue using the core Vulkan 1.0 API with
+    /// an explicit raw fence handle.
     ///
     /// # Safety
-    /// All handles in `submits` must be valid and derived from this
-    /// device. Command buffers must be in the executable state. Wait
-    /// semaphores must be signaled. Signal semaphores must be
-    /// unsignaled. `fence`, when `Some`, must be in the ready state
-    /// (unsignaled, not pending).
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled. `fence`, when not null,
+    /// must be an unsignaled fence created from this device.
+    unsafe fn queue_submit_raw_fence(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), QueueSubmitError> {
+        // SAFETY: Caller guarantees all handle validity and state.
+        unsafe { self.handle.queue_submit(queue, submits, fence) }
+            .map_err(QueueSubmitError::SubmissionFailed)
+    }
+
+    /// Internal helper to submit to the graphics queue using the core Vulkan
+    /// 1.0 API with a raw fence
+    ///
+    /// # Safety
+    /// Same as graphics_queue_submit, but we must also ensure the fence is from
+    /// this device and valid
+    pub unsafe fn graphics_queue_submit_raw_fence(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), QueueSubmitError> {
+        let queue = self.acquire_graphics_queue();
+        // SAFETY: Caller guarantees all handle validity and state. Queue is
+        // locked
+        unsafe { self.queue_submit_raw_fence(*queue, submits, fence) }
+    }
+    /// Submit work to the graphics/present queue using the core Vulkan 1.0
+    /// `vkQueueSubmit` API.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled. `fence`, when `Some`,
+    /// must be in the ready state (unsignaled, not pending).
     pub unsafe fn graphics_queue_submit(
         &self,
         submits: &[vk::SubmitInfo<'_>],
@@ -2230,7 +3604,7 @@ impl Device {
             Err(QueueSubmitError::FenceNotReady)
         } else if fence
             .as_ref()
-            .map(|f| f.parent().raw_device() != self.raw_device())
+            .map(|f| self.is_fence_mismatched(f))
             .unwrap_or(false)
         {
             Err(QueueSubmitError::MismatchedObjects)
@@ -2239,13 +3613,10 @@ impl Device {
                 .as_ref()
                 .map(|f| f.raw_fence())
                 .unwrap_or(vk::Fence::null());
-            let queue = self
-                .graphics_queue
-                .lock()
-                .expect("graphics queue lock poisoned");
             // SAFETY: Caller guarantees all handle validity and state.
-            unsafe { self.handle.queue_submit(*queue, submits, raw_fence) }
-                .map_err(QueueSubmitError::SubmissionFailed)?;
+            unsafe {
+                self.graphics_queue_submit_raw_fence(submits, raw_fence)
+            }?;
             if let Some(f) = fence {
                 // SAFETY: fence was just submitted above.
                 _ = unsafe { f.mark_submitted() };
@@ -2255,14 +3626,30 @@ impl Device {
     }
 
     /// Submit work to the transfer queue using the core Vulkan 1.0
+    /// `vkQueueSubmit` API with a raw fence handle.
+    ///
+    /// # Safety
+    /// Same as `graphics_queue_submit_raw_fence` but targets the transfer
+    /// queue.
+    pub unsafe fn transfer_queue_submit_raw_fence(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), QueueSubmitError> {
+        let queue = self.acquire_transfer_queue();
+        // SAFETY: Caller guarantees all handle validity and state. Queue is
+        // locked for the duration of this call.
+        unsafe { self.queue_submit_raw_fence(*queue, submits, fence) }
+    }
+
+    /// Submit work to the transfer queue using the core Vulkan 1.0
     /// `vkQueueSubmit` API.
     ///
     /// # Safety
-    /// All handles in `submits` must be valid and derived from this
-    /// device. Command buffers must be in the executable state. Wait
-    /// semaphores must be signaled. Signal semaphores must be
-    /// unsignaled. `fence`, when `Some`, must be in the ready state
-    /// (unsignaled, not pending).
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled. `fence`, when `Some`,
+    /// must be in the ready state (unsignaled, not pending).
     pub unsafe fn transfer_queue_submit(
         &self,
         submits: &[vk::SubmitInfo<'_>],
@@ -2272,7 +3659,7 @@ impl Device {
             Err(QueueSubmitError::FenceNotReady)
         } else if fence
             .as_ref()
-            .map(|f| f.parent().raw_device() != self.raw_device())
+            .map(|f| self.is_fence_mismatched(f))
             .unwrap_or(false)
         {
             Err(QueueSubmitError::MismatchedObjects)
@@ -2281,18 +3668,686 @@ impl Device {
                 .as_ref()
                 .map(|f| f.raw_fence())
                 .unwrap_or(vk::Fence::null());
-            let queue = self
-                .transfer_queues
-                .lock()
-                .expect("transfer queue lock poisoned");
             // SAFETY: Caller guarantees all handle validity and state.
-            unsafe { self.handle.queue_submit(*queue, submits, raw_fence) }
-                .map_err(QueueSubmitError::SubmissionFailed)?;
+            unsafe {
+                self.transfer_queue_submit_raw_fence(submits, raw_fence)
+            }?;
             if let Some(f) = fence {
                 // SAFETY: fence was just submitted above.
                 _ = unsafe { f.mark_submitted() };
             }
             Ok(())
+        }
+    }
+
+    /// Submit work to the compute queue using the core Vulkan 1.0
+    /// `vkQueueSubmit` API with a raw fence handle.
+    ///
+    /// # Safety
+    /// Same as `graphics_queue_submit_raw_fence` but targets the compute queue.
+    pub unsafe fn compute_queue_submit_raw_fence(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), QueueSubmitError> {
+        let queue = self.acquire_compute_queue();
+        // SAFETY: Caller guarantees all handle validity and state. Queue is
+        // locked for the duration of this call.
+        unsafe { self.queue_submit_raw_fence(*queue, submits, fence) }
+    }
+
+    /// Submit work to the compute queue using the core Vulkan 1.0
+    /// `vkQueueSubmit` API.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this device.
+    /// Command buffers must be in the executable state. Wait semaphores must be
+    /// signaled. Signal semaphores must be unsignaled. `fence`, when `Some`,
+    /// must be in the ready state (unsignaled, not pending).
+    pub unsafe fn compute_queue_submit(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| self.is_fence_mismatched(f))
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            // SAFETY: Caller guarantees all handle validity and state.
+            unsafe { self.compute_queue_submit_raw_fence(submits, raw_fence) }?;
+            if let Some(f) = fence {
+                // SAFETY: fence was just submitted above.
+                _ = unsafe { f.mark_submitted() };
+            }
+            Ok(())
+        }
+    }
+
+    // VK 1.0 — labeled submissions
+    //
+    // Mirrors the sync2 labeled-submission set but uses `SubmitInfo` and
+    // `queue_submit`. All three string variants (CStr, &str, lazy &str)
+    // are provided for every queue × tier combination.
+
+    /// Begin a debug label, submit (VK 1.0), end the label on `queue`.
+    ///
+    /// # Safety
+    /// Same as [`Self::queue_submit_raw_fence`]. `label` must be valid
+    /// UTF-8.
+    unsafe fn queue_submit_raw_fence_labeled_cstr(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        // SAFETY: queue is derived from this device; label is valid UTF-8
+        // per our safety contract.
+        unsafe { self.begin_queue_debug_label_cstr(queue, label) };
+        // SAFETY: All submit safety requirements are delegated from our
+        // own safety contract. queue is derived from this device.
+        let result =
+            unsafe { self.queue_submit_raw_fence(queue, submits, fence) };
+        // SAFETY: queue is derived from this device. We opened a label
+        // region with begin_queue_debug_label_cstr above.
+        unsafe { self.end_queue_debug_label(queue) };
+        result
+    }
+
+    // ── Graphics queue — VK 1.0 labeled ─────────────────────────────────
+
+    /// Submit work to the graphics queue (VK 1.0), wrapped in a
+    /// debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    /// `fence`, when not null, must be an unsignaled fence created from
+    /// this device. `label` must contain only valid UTF-8 bytes.
+    pub unsafe fn graphics_queue_submit_raw_fence_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        let queue = self.acquire_graphics_queue();
+        // SAFETY: queue is derived from this device. submits, fence, and
+        // label satisfy our safety contract.
+        unsafe {
+            self.queue_submit_raw_fence_labeled_cstr(
+                *queue, submits, fence, label,
+            )
+        }
+    }
+
+    /// Submit work to the graphics queue (VK 1.0), wrapped in a
+    /// debug-label region (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    /// `fence`, when not null, must be an unsignaled fence created from
+    /// this device.
+    pub unsafe fn graphics_queue_submit_raw_fence_labeled(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr is valid UTF-8 (built from &str).
+        unsafe {
+            self.graphics_queue_submit_raw_fence_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the graphics queue (VK 1.0), wrapped in a
+    /// debug-label region (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled.
+    pub fn graphics_queue_submit_raw_fence_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8. Submit safety requirements
+            // are on the caller.
+            unsafe {
+                self.graphics_queue_submit_raw_fence_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.graphics_queue_submit_raw_fence(submits, fence) }
+        }
+    }
+
+    /// Submit work to the graphics queue (VK 1.0), wrapped in a
+    /// debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    /// `label` must contain only valid UTF-8 bytes.
+    pub unsafe fn graphics_queue_submit_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| self.is_fence_mismatched(f))
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            let queue = self.acquire_graphics_queue();
+            // SAFETY: All submit safety requirements satisfied by our
+            // contract. label is valid UTF-8 per our contract.
+            unsafe {
+                self.queue_submit_raw_fence_labeled_cstr(
+                    *queue, submits, raw_fence, label,
+                )
+            }?;
+            if let Some(f) = fence {
+                // SAFETY: This fence was just submitted to the graphics
+                // queue.
+                _ = unsafe { f.mark_submitted() };
+            }
+            Ok(())
+        }
+    }
+
+    /// Submit work to the graphics queue (VK 1.0), wrapped in a
+    /// debug-label region (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    pub unsafe fn graphics_queue_submit_labeled(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr is valid UTF-8. Other safety requirements
+        // propagated from caller.
+        unsafe {
+            self.graphics_queue_submit_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the graphics queue (VK 1.0), wrapped in a
+    /// debug-label region (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled.
+    pub fn graphics_queue_submit_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8. All submit safety
+            // requirements are on the caller.
+            unsafe {
+                self.graphics_queue_submit_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.graphics_queue_submit(submits, fence) }
+        }
+    }
+
+    // ── Transfer queue — VK 1.0 labeled ─────────────────────────────────
+
+    /// Submit work to the transfer queue (VK 1.0), wrapped in a
+    /// debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    /// `fence`, when not null, must be an unsignaled fence created from
+    /// this device. `label` must contain only valid UTF-8 bytes.
+    pub unsafe fn transfer_queue_submit_raw_fence_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        let queue = self.acquire_transfer_queue();
+        // SAFETY: queue is derived from this device. submits, fence, and
+        // label satisfy our safety contract.
+        unsafe {
+            self.queue_submit_raw_fence_labeled_cstr(
+                *queue, submits, fence, label,
+            )
+        }
+    }
+
+    /// Submit work to the transfer queue (VK 1.0), wrapped in a
+    /// debug-label region (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    /// `fence`, when not null, must be an unsignaled fence created from
+    /// this device.
+    pub unsafe fn transfer_queue_submit_raw_fence_labeled(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr is valid UTF-8 (built from &str).
+        unsafe {
+            self.transfer_queue_submit_raw_fence_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the transfer queue (VK 1.0), wrapped in a
+    /// debug-label region (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled.
+    pub fn transfer_queue_submit_raw_fence_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8. Submit safety requirements
+            // are on the caller.
+            unsafe {
+                self.transfer_queue_submit_raw_fence_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.transfer_queue_submit_raw_fence(submits, fence) }
+        }
+    }
+
+    /// Submit work to the transfer queue (VK 1.0), wrapped in a
+    /// debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    /// `label` must contain only valid UTF-8 bytes.
+    pub unsafe fn transfer_queue_submit_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| self.is_fence_mismatched(f))
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            let queue = self.acquire_transfer_queue();
+            // SAFETY: All submit safety requirements satisfied by our
+            // contract. label is valid UTF-8 per our contract.
+            unsafe {
+                self.queue_submit_raw_fence_labeled_cstr(
+                    *queue, submits, raw_fence, label,
+                )
+            }?;
+            if let Some(f) = fence {
+                // SAFETY: This fence was just submitted to the transfer
+                // queue.
+                _ = unsafe { f.mark_submitted() };
+            }
+            Ok(())
+        }
+    }
+
+    /// Submit work to the transfer queue (VK 1.0), wrapped in a
+    /// debug-label region (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    pub unsafe fn transfer_queue_submit_labeled(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr is valid UTF-8. Other safety requirements
+        // propagated from caller.
+        unsafe {
+            self.transfer_queue_submit_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the transfer queue (VK 1.0), wrapped in a
+    /// debug-label region (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled.
+    pub fn transfer_queue_submit_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8. All submit safety
+            // requirements are on the caller.
+            unsafe {
+                self.transfer_queue_submit_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.transfer_queue_submit(submits, fence) }
+        }
+    }
+
+    // ── Compute queue — VK 1.0 labeled ──────────────────────────────────
+
+    /// Submit work to the compute queue (VK 1.0), wrapped in a
+    /// debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    /// `fence`, when not null, must be an unsignaled fence created from
+    /// this device. `label` must contain only valid UTF-8 bytes.
+    pub unsafe fn compute_queue_submit_raw_fence_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        let queue = self.acquire_compute_queue();
+        // SAFETY: queue is derived from this device. submits, fence, and
+        // label satisfy our safety contract.
+        unsafe {
+            self.queue_submit_raw_fence_labeled_cstr(
+                *queue, submits, fence, label,
+            )
+        }
+    }
+
+    /// Submit work to the compute queue (VK 1.0), wrapped in a
+    /// debug-label region (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    /// `fence`, when not null, must be an unsignaled fence created from
+    /// this device.
+    pub unsafe fn compute_queue_submit_raw_fence_labeled(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr is valid UTF-8 (built from &str).
+        unsafe {
+            self.compute_queue_submit_raw_fence_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the compute queue (VK 1.0), wrapped in a
+    /// debug-label region (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled.
+    pub fn compute_queue_submit_raw_fence_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8. Submit safety requirements
+            // are on the caller.
+            unsafe {
+                self.compute_queue_submit_raw_fence_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.compute_queue_submit_raw_fence(submits, fence) }
+        }
+    }
+
+    /// Submit work to the compute queue (VK 1.0), wrapped in a
+    /// debug-label region.
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    /// `label` must contain only valid UTF-8 bytes.
+    pub unsafe fn compute_queue_submit_labeled_cstr(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+        label: Option<&CStr>,
+    ) -> Result<(), QueueSubmitError> {
+        if !fence.as_ref().map(|f| f.is_ready()).unwrap_or(true) {
+            Err(QueueSubmitError::FenceNotReady)
+        } else if fence
+            .as_ref()
+            .map(|f| self.is_fence_mismatched(f))
+            .unwrap_or(false)
+        {
+            Err(QueueSubmitError::MismatchedObjects)
+        } else {
+            let raw_fence = fence
+                .as_ref()
+                .map(|f| f.raw_fence())
+                .unwrap_or(vk::Fence::null());
+            let queue = self.acquire_compute_queue();
+            // SAFETY: All submit safety requirements satisfied by our
+            // contract. label is valid UTF-8 per our contract.
+            unsafe {
+                self.queue_submit_raw_fence_labeled_cstr(
+                    *queue, submits, raw_fence, label,
+                )
+            }?;
+            if let Some(f) = fence {
+                // SAFETY: This fence was just submitted to the compute
+                // queue.
+                _ = unsafe { f.mark_submitted() };
+            }
+            Ok(())
+        }
+    }
+
+    /// Submit work to the compute queue (VK 1.0), wrapped in a
+    /// debug-label region (safe `&str` variant).
+    ///
+    /// # Safety
+    /// All handles in `submits` must be valid and derived from this
+    /// device. Command buffers must be in the executable state. Wait
+    /// semaphores must be signaled. Signal semaphores must be unsignaled.
+    pub unsafe fn compute_queue_submit_labeled(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+        label: Option<&str>,
+    ) -> Result<(), QueueSubmitError> {
+        let label_cstr = label.map(|s| {
+            CString::new(s).expect("Label must not contain null bytes")
+        });
+        // SAFETY: label_cstr is valid UTF-8. Other safety requirements
+        // propagated from caller.
+        unsafe {
+            self.compute_queue_submit_labeled_cstr(
+                submits,
+                fence,
+                label_cstr.as_deref(),
+            )
+        }
+    }
+
+    /// Submit work to the compute queue (VK 1.0), wrapped in a
+    /// debug-label region (lazy `&str` variant).
+    ///
+    /// `label_fn` is only called when debug utils is enabled.
+    pub fn compute_queue_submit_labeled_lazy<LabelFn, StrRef>(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: Option<&mut crate::sync::Fence>,
+        label_fn: LabelFn,
+    ) -> Result<(), QueueSubmitError>
+    where
+        LabelFn: FnOnce() -> Option<StrRef>,
+        StrRef: AsRef<str>,
+    {
+        if self.debug_utils_device.is_some() {
+            let label_ref = label_fn();
+            let label_cstr = label_ref.as_ref().map(|s| {
+                CString::new(s.as_ref())
+                    .expect("Label must not contain null bytes")
+            });
+            // SAFETY: label_cstr is valid UTF-8. All submit safety
+            // requirements are on the caller.
+            unsafe {
+                self.compute_queue_submit_labeled_cstr(
+                    submits,
+                    fence,
+                    label_cstr.as_deref(),
+                )
+            }
+        } else {
+            // SAFETY: propagated from caller.
+            unsafe { self.compute_queue_submit(submits, fence) }
         }
     }
 }
@@ -2302,12 +4357,12 @@ impl Device {
     /// Record an old-style pipeline barrier (`vkCmdPipelineBarrier`).
     ///
     /// # Safety
-    /// `command_buffer` must be in the recording state. All handles
-    /// and image layouts in the barrier arrays must be valid and
-    /// consistent with the command buffer's current state.
+    /// `command_buffer` must be in the recording state. All handles and image
+    /// layouts in the barrier arrays must be valid and consistent with the
+    /// command buffer's current state.
     // Allow extra arguments: this signature mirrors the Vulkan
-    // `vkCmdPipelineBarrier` parameter groups and is kept in sync
-    // with the raw API for clarity.
+    // `vkCmdPipelineBarrier` parameter groups and is kept in sync with the raw
+    // API for clarity.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub unsafe fn cmd_pipeline_barrier(
@@ -2320,8 +4375,7 @@ impl Device {
         buffer_memory_barriers: &[vk::BufferMemoryBarrier<'_>],
         image_memory_barriers: &[vk::ImageMemoryBarrier<'_>],
     ) {
-        // SAFETY: Caller guarantees command_buffer state and
-        // barrier validity.
+        // SAFETY: Caller guarantees command_buffer state and barrier validity.
         unsafe {
             self.handle.cmd_pipeline_barrier(
                 command_buffer,
@@ -2338,11 +4392,10 @@ impl Device {
     /// Begin a render pass (`vkCmdBeginRenderPass`).
     ///
     /// # Safety
-    /// `command_buffer` must be in the recording state. All objects
-    /// referenced by `render_pass_begin` must be valid and derived
-    /// from this device. The framebuffer's attachments must be in
-    /// the layouts declared in the render pass attachment
-    /// descriptions, or `UNDEFINED` when `initial_layout` is
+    /// `command_buffer` must be in the recording state. All objects referenced
+    /// by `render_pass_begin` must be valid and derived from this device. The
+    /// framebuffer's attachments must be in the layouts declared in the render
+    /// pass attachment descriptions, or `UNDEFINED` when `initial_layout` is
     /// `UNDEFINED`.
     #[inline]
     pub unsafe fn cmd_begin_render_pass(
@@ -2351,8 +4404,8 @@ impl Device {
         render_pass_begin: &vk::RenderPassBeginInfo<'_>,
         contents: vk::SubpassContents,
     ) {
-        // SAFETY: Caller guarantees command_buffer state and
-        // render_pass_begin validity.
+        // SAFETY: Caller guarantees command_buffer state and render_pass_begin
+        // validity.
         unsafe {
             self.handle.cmd_begin_render_pass(
                 command_buffer,
@@ -2365,9 +4418,8 @@ impl Device {
     /// End the current render pass (`vkCmdEndRenderPass`).
     ///
     /// # Safety
-    /// `command_buffer` must be in the recording state inside a
-    /// render pass begun with
-    /// [`cmd_begin_render_pass`](Self::cmd_begin_render_pass).
+    /// `command_buffer` must be in the recording state inside a render pass
+    /// begun with [`cmd_begin_render_pass`](Self::cmd_begin_render_pass).
     #[inline]
     pub unsafe fn cmd_end_render_pass(
         &self,
@@ -2381,9 +4433,9 @@ impl Device {
 // Buffer and memory functionality
 impl Device {
     /// # Safety
-    /// `create_info` must be valid and reference only objects derived from
-    /// this device. All referenced pointers must remain valid for the
-    /// duration of the call.
+    /// `create_info` must be valid and reference only objects derived from this
+    /// device. All referenced pointers must remain valid for the duration of
+    /// the call.
     #[inline]
     pub unsafe fn create_raw_buffer(
         &self,
@@ -2416,8 +4468,8 @@ impl Device {
     }
 
     /// # Safety
-    /// `allocate_info` must be valid and describe a memory type index
-    /// supported by this device.
+    /// `allocate_info` must be valid and describe a memory type index supported
+    /// by this device.
     #[inline]
     pub unsafe fn allocate_raw_memory(
         &self,
@@ -2498,8 +4550,8 @@ impl Device {
         &self,
         create_info: &vk::CommandPoolCreateInfo<'_>,
     ) -> Result<vk::CommandPool, vk::Result> {
-        // SAFETY: Caller guarantees create_info validity and queue
-        // family provenance.
+        // SAFETY: Caller guarantees create_info validity and queue family
+        // provenance.
         unsafe { self.handle.create_command_pool(create_info, None) }
     }
 
@@ -2522,8 +4574,8 @@ impl Device {
         pool: vk::CommandPool,
         flags: vk::CommandPoolResetFlags,
     ) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees pool provenance and command
-        // buffer idle state.
+        // SAFETY: Caller guarantees pool provenance and command buffer idle
+        // state.
         unsafe { self.handle.reset_command_pool(pool, flags) }
     }
 
@@ -2540,17 +4592,17 @@ impl Device {
     }
 
     /// # Safety
-    /// `command_buffer` must be in the initial or executable state and must
-    /// not be pending execution. All pointers in `begin_info` must remain
-    /// valid for the duration of the call.
+    /// `command_buffer` must be in the initial or executable state and must not
+    /// be pending execution. All pointers in `begin_info` must remain valid for
+    /// the duration of the call.
     #[inline]
     pub unsafe fn begin_raw_command_buffer(
         &self,
         command_buffer: vk::CommandBuffer,
         begin_info: &vk::CommandBufferBeginInfo<'_>,
     ) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees command_buffer state and
-        // begin_info validity.
+        // SAFETY: Caller guarantees command_buffer state and begin_info
+        // validity.
         unsafe { self.handle.begin_command_buffer(command_buffer, begin_info) }
     }
 
@@ -2567,16 +4619,15 @@ impl Device {
 
     /// # Safety
     /// `command_buffer` must not be pending execution on the GPU. The pool it
-    /// was allocated from must have been created with
-    /// `RESET_COMMAND_BUFFER`.
+    /// was allocated from must have been created with `RESET_COMMAND_BUFFER`.
     #[inline]
     pub unsafe fn reset_raw_command_buffer(
         &self,
         command_buffer: vk::CommandBuffer,
         flags: vk::CommandBufferResetFlags,
     ) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees command_buffer is not pending
-        // and pool flag is set.
+        // SAFETY: Caller guarantees command_buffer is not pending and pool flag
+        // is set.
         unsafe { self.handle.reset_command_buffer(command_buffer, flags) }
     }
 
@@ -2650,8 +4701,8 @@ impl Device {
         &self,
         fences: &[vk::Fence],
     ) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees fence handle validity and
-        // non-pending state.
+        // SAFETY: Caller guarantees fence handle validity and non-pending
+        // state.
         unsafe { self.handle.reset_fences(fences) }
     }
 
@@ -2696,8 +4747,8 @@ impl Device {
 // Descriptor set functionality
 impl Device {
     /// # Safety
-    /// `create_info` must be valid and reference only objects
-    /// derived from this device.
+    /// `create_info` must be valid and reference only objects derived from this
+    /// device.
     #[inline]
     pub unsafe fn create_raw_descriptor_set_layout(
         &self,
@@ -2708,9 +4759,8 @@ impl Device {
     }
 
     /// # Safety
-    /// `layout` must be a valid handle created from this device
-    /// and not yet destroyed. No descriptor pool that used this
-    /// layout may still exist.
+    /// `layout` must be a valid handle created from this device and not yet
+    /// destroyed. No descriptor pool that used this layout may still exist.
     #[inline]
     pub unsafe fn destroy_raw_descriptor_set_layout(
         &self,
@@ -2721,8 +4771,8 @@ impl Device {
     }
 
     /// # Safety
-    /// `create_info` must be valid and reference only objects
-    /// derived from this device.
+    /// `create_info` must be valid and reference only objects derived from this
+    /// device.
     #[inline]
     pub unsafe fn create_raw_descriptor_pool(
         &self,
@@ -2733,9 +4783,9 @@ impl Device {
     }
 
     /// # Safety
-    /// `pool` must be a valid handle created from this device and
-    /// not yet destroyed. All descriptor sets allocated from it
-    /// must not be referenced by any pending GPU work.
+    /// `pool` must be a valid handle created from this device and not yet
+    /// destroyed. All descriptor sets allocated from it must not be referenced
+    /// by any pending GPU work.
     #[inline]
     pub unsafe fn destroy_raw_descriptor_pool(&self, pool: vk::DescriptorPool) {
         // SAFETY: Caller guarantees pool provenance and ordering.
@@ -2743,9 +4793,9 @@ impl Device {
     }
 
     /// # Safety
-    /// `alloc_info.descriptor_pool` must be a valid pool created
-    /// from this device with sufficient capacity. All layouts in
-    /// `alloc_info` must be valid handles derived from this device.
+    /// `alloc_info.descriptor_pool` must be a valid pool created from this
+    /// device with sufficient capacity. All layouts in `alloc_info` must be
+    /// valid handles derived from this device.
     #[inline]
     pub unsafe fn allocate_raw_descriptor_sets(
         &self,
@@ -2758,11 +4808,10 @@ impl Device {
     /// Write or copy descriptor set updates.
     ///
     /// # Safety
-    /// All handles in `descriptor_writes` and `descriptor_copies`
-    /// must be valid and derived from this device. Buffer and image
-    /// references in `descriptor_writes` must remain valid for as
-    /// long as the descriptor set is bound in a submitted command
-    /// buffer.
+    /// All handles in `descriptor_writes` and `descriptor_copies` must be valid
+    /// and derived from this device. Buffer and image references in
+    /// `descriptor_writes` must remain valid for as long as the descriptor set
+    /// is bound in a submitted command buffer.
     #[inline]
     pub unsafe fn update_raw_descriptor_sets(
         &self,
@@ -2781,10 +4830,10 @@ impl Device {
     /// # Safety
     /// - `command_buffer` must be in the recording state.
     /// - `layout` must be compatible with the pipeline to be used.
-    /// - All handles in `descriptor_sets` must be valid and derived
-    ///   from this device.
-    /// - `dynamic_offsets` must match the number of dynamic
-    ///   descriptors in the bound sets.
+    /// - All handles in `descriptor_sets` must be valid and derived from this
+    ///   device.
+    /// - `dynamic_offsets` must match the number of dynamic descriptors in the
+    ///   bound sets.
     #[inline]
     pub unsafe fn cmd_bind_descriptor_sets(
         &self,
@@ -2794,8 +4843,8 @@ impl Device {
         descriptor_sets: &[vk::DescriptorSet],
         dynamic_offsets: &[u32],
     ) {
-        // SAFETY: Caller guarantees command buffer state, layout
-        // compatibility, and descriptor set validity.
+        // SAFETY: Caller guarantees command buffer state, layout compatibility,
+        // and descriptor set validity.
         unsafe {
             self.handle.cmd_bind_descriptor_sets(
                 command_buffer,
@@ -2812,10 +4861,10 @@ impl Device {
     ///
     /// # Safety
     /// - `command_buffer` must be in the recording state.
-    /// - `layout` must be compatible with the pipeline that will be
-    ///   used for drawing.
-    /// - `stage_flags` and `offset` must match a push constant range
-    ///   declared in `layout`.
+    /// - `layout` must be compatible with the pipeline that will be used for
+    ///   drawing.
+    /// - `stage_flags` and `offset` must match a push constant range declared
+    ///   in `layout`.
     /// - `values` length must not exceed the range size.
     #[inline]
     pub unsafe fn cmd_push_constants(
@@ -2826,8 +4875,8 @@ impl Device {
         offset: u32,
         values: &[u8],
     ) {
-        // SAFETY: Caller guarantees recording state, layout
-        // compatibility, stage_flags match, and range bounds.
+        // SAFETY: Caller guarantees recording state, layout compatibility,
+        // stage_flags match, and range bounds.
         unsafe {
             self.handle.cmd_push_constants(
                 command_buffer,

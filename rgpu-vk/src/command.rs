@@ -856,6 +856,70 @@ impl ResettableCommandBuffer {
         }
     }
 
+    /// Begin a debug label region on this command buffer.
+    ///
+    /// No-op when `VK_EXT_debug_utils` is not enabled.
+    ///
+    /// # Safety
+    /// The buffer must be in the
+    /// [`Recording`](CommandBufferState::Recording) state. Every call must
+    /// be matched by a corresponding [`end_debug_label`](Self::end_debug_label)
+    /// before the buffer is submitted.
+    pub unsafe fn begin_debug_label(&mut self, label: &str) {
+        use std::ffi::CString;
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
+        // SAFETY: Caller guarantees recording state. CString::new only
+        // fails on interior NUL bytes; a label from &str has none.
+        let c_label = CString::new(label).unwrap_or_default();
+        // SAFETY: handle is valid and in the recording state. c_label is
+        // valid UTF-8 (derived from &str).
+        unsafe {
+            self.parent
+                .cmd_begin_debug_label_cstr(self.handle, Some(&c_label))
+        }
+    }
+
+    /// Lazily begin a debug label region on this command buffer, invoking the provided closure to construct the label string only if `VK_EXT_debug_utils` is
+    /// enabled and the command buffer is in the recording state.
+    ///
+    /// No-op when `VK_EXT_debug_utils` is not enabled.
+    ///
+    /// # Safety
+    /// The buffer must be in the
+    /// [`Recording`](CommandBufferState::Recording) state. Every call must
+    /// be matched by a corresponding [`end_debug_label`](Self::end_debug_label)
+    /// before the buffer is submitted.
+    pub unsafe fn begin_debug_label_lazy<LabelFn, StringRef>(
+        &mut self,
+        f: LabelFn,
+    ) where
+        LabelFn: FnOnce() -> StringRef,
+        StringRef: AsRef<str>,
+    {
+        assert!(self.state == CommandBufferState::Recording);
+
+        if self.parent.debug_utils_enabled() {
+            let label = f();
+            // SAFETY: Valid UTF8, we are in the recording state
+            unsafe { self.begin_debug_label(label.as_ref()) };
+        }
+    }
+
+    /// End the most recently begun debug label region on this command buffer.
+    ///
+    /// No-op when `VK_EXT_debug_utils` is not enabled.
+    ///
+    /// # Safety
+    /// The buffer must be in the
+    /// [`Recording`](CommandBufferState::Recording) state. A matching
+    /// [`begin_debug_label`](Self::begin_debug_label) must have been
+    /// recorded previously.
+    pub unsafe fn end_debug_label(&mut self) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
+        // SAFETY: Caller guarantees recording state and a matching begin.
+        unsafe { self.parent.end_cmd_debug_label(self.handle) }
+    }
+
     #[inline]
     pub fn raw(&self) -> vk::CommandBuffer {
         self.handle

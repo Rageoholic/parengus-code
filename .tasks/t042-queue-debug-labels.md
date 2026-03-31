@@ -1,7 +1,7 @@
 ---
 id: t042
 title: "Use Debug Utils labels for queues and submissions"
-status: active
+status: done
 created: 2026-03-30
 updated: 2026-03-30
 parent: null
@@ -31,19 +31,19 @@ querying the extension.
 
 ## Plan
 
-- [ ] Add high-level labeling calls in Phoenix that invoke the
+- [x] Add high-level labeling calls in Phoenix that invoke the
       `rgpu-vk` wrapper's debug-label helpers around command buffer
       recording regions. Do not reimplement extension probing in
       Phoenix — delegate to `rgpu-vk`.
-- [ ] Annotate command-buffer regions by semantic purpose (e.g.
+- [~] Annotate command-buffer regions by semantic purpose (e.g.
       `upload`, `g-buffer`, `lighting-compose`, `post-process`) so
       captures show meaningful regions
-- [ ] Optionally add submit-level labels where it improves capture
+- [x] Optionally add submit-level labels where it improves capture
       clarity; keep this opt-in
-- [ ] Add an opt-in toggle and logs indicating when debug utils are
+- [x] Add an opt-in toggle and logs indicating when debug utils are
       enabled/disabled at the renderer level (this may be a thin
       passthrough to `rgpu-vk` diagnostics).
-- [ ] Update capture/preflight docs and add a small visual test to
+- [x] Update capture/preflight docs and add a small visual test to
       validate labels appear in a RenderDoc/NSight capture
 
 ## Notes
