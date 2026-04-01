@@ -14,9 +14,12 @@ use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use parengus_tracing::{TracingLogLevel, init_default};
 use rgpu_vk::{
-    ash::vk::{self},
+    ash::vk::{self, BufferImageCopy},
     buffer::{DeviceLocalBuffer, HostVisibleBuffer},
-    command::{ResettableCommandBuffer, ResettableCommandPool},
+    command::{
+        self, DebugLabel, DebugLabelType, LazyDebugLabelReturn,
+        ResettableCommandBuffer, ResettableCommandPool,
+    },
     descriptor::{
         DescriptorBindingDesc, DescriptorPool, DescriptorSet,
         DescriptorSetLayout,
@@ -143,7 +146,7 @@ fn look_at_rh(
     //   col 0 = [ r.x,        u.x,        -f.x,       0 ]
     //   col 1 = [ r.y,        u.y,        -f.y,       0 ]
     //   col 2 = [ r.z,        u.z,        -f.z,       0 ]
-    //   col 3 = [ -dot(r,eye), -dot(u,eye), dot(f,eye), 1 ]
+   //   col 3 = [ -dot(r,eye), -dot(u,eye), dot(f,eye), 1 ]
     Mat4::from_col_arrays(
         [
         [r.x,         u.x,         -f.x,        0.0,],
@@ -1158,6 +1161,14 @@ impl AppRunner {
         // MSAA image (when present) are valid.
         unsafe { frame_cmd.pipeline_barrier2(&dep_info) };
 
+        // SAFETY: We remember to close this, we're recording
+        unsafe {
+            frame_cmd.begin_debug_label(DebugLabel {
+                name: "Main Draw Pass",
+                ty: DebugLabelType::GraphicsPass,
+            })
+        };
+
         // Begin dynamic rendering with a clear.
         let color_clear = vk::ClearValue {
             color: vk::ClearColorValue {
@@ -1306,6 +1317,9 @@ impl AppRunner {
         // SAFETY: inside a dynamic render pass.
         unsafe { frame_cmd.end_rendering() };
 
+        // SAFETY: currently in a debug label
+        unsafe { frame_cmd.end_debug_label() };
+
         // Transition: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
         // Transfer: Graphics -> Present
         let to_present = image_barrier2()
@@ -1352,9 +1366,10 @@ impl AppRunner {
         // unsignaled; fence is unsignaled (just reset above); cmd is in the
         // executable state.
         if let Err(e) = unsafe {
-            state.device.graphics_queue_submit2(
+            state.device.graphics_queue_submit2_labeled(
                 std::slice::from_ref(&submit),
                 Some(&mut frame_objs.in_flight_fence),
+                Some("Frame render"),
             )
         } {
             return DrawFrameOutcome::Fatal(format!(
@@ -1761,6 +1776,9 @@ impl AppRunner {
         let mut upload_cmd = upload_command_pool.allocate_command_buffer()?;
         upload_cmd.begin()?;
 
+        let tex_capacity = tex_load_infos.len();
+        let mut used_staging_buffers = Vec::with_capacity(tex_capacity + 2);
+
         let win_size = win.inner_size();
         let debug_counters = DebugCounters::new();
         let swapchain = if win_size.width == 0 || win_size.height == 0 {
@@ -2027,6 +2045,14 @@ impl AppRunner {
             .expect("allocated exactly one material set");
         material_descriptor_set.set_name(&device, Some("material set"));
 
+        // SAFETY: We are recording
+        unsafe {
+            upload_cmd.begin_debug_label(DebugLabel {
+                name: "initial buffer data upload",
+                ty: command::DebugLabelType::BufferUpload,
+            })
+        };
+
         // Create one staging buffer + Texture per unique albedo, then
         // record all copies into the shared upload command buffer.
         //
@@ -2036,16 +2062,28 @@ impl AppRunner {
             vertex_buffer
                 .record_upload_from(&mut upload_cmd, &staging_vertex_buffer)
         }?;
+        used_staging_buffers.push(staging_vertex_buffer);
         // SAFETY: same as vertex buffer copy above.
         unsafe {
             index_buffer
                 .record_upload_from(&mut upload_cmd, &staging_index_buffer)
         }?;
+        used_staging_buffers.push(staging_index_buffer);
 
-        let mut tex_stagings: Vec<HostVisibleBuffer> = Vec::new();
-        let mut textures: Vec<Texture> = Vec::new();
+        // SAFETY: We are recording
+        unsafe { upload_cmd.end_debug_label() };
+
+        struct UploadImageCommand<'a> {
+            texture: Texture,
+            regions: Vec<BufferImageCopy>,
+            name: &'a str,
+            buffer: HostVisibleBuffer,
+        }
+        let mut image_upload_commands = Vec::with_capacity(tex_capacity);
 
         for tli in &tex_load_infos {
+            let name = &tli.name;
+
             let mut staging = HostVisibleBuffer::new(
                 &device,
                 tli.total_bytes as vk::DeviceSize,
@@ -2065,23 +2103,6 @@ impl AppRunner {
                     | vk::ImageUsageFlags::SAMPLED,
                 Some(tli.name.as_str()),
             )?;
-            // Transition: UNDEFINED → TRANSFER_DST_OPTIMAL.
-            let to_xfer = texture
-                .whole_image_barrier2()
-                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-            // SAFETY: recording state; texture valid.
-            unsafe {
-                upload_cmd.pipeline_barrier2_by_barriers(
-                    &[],
-                    &[],
-                    std::slice::from_ref(&to_xfer),
-                )
-            };
             // Copy all mip levels from staging into the texture.
             let mut regions = Vec::with_capacity(tli.mip_data.len());
             for (level, (_data, off)) in tli.mip_data.iter().enumerate() {
@@ -2099,49 +2120,97 @@ impl AppRunner {
                     extent,
                 ));
             }
-            // SAFETY: regions reference valid mip levels; staging and
-            // texture remain alive until fence wait below.
-            unsafe {
-                upload_cmd.copy_buffer_to_image(
-                    staging.raw_buffer(),
-                    texture.raw_image(),
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &regions,
-                )
-            };
-            // Release / transition to SHADER_READ_ONLY.
-            let to_shader = texture
-                .whole_image_barrier2()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(if dedicated_transfer {
-                    vk::PipelineStageFlags2::BOTTOM_OF_PIPE
-                } else {
-                    vk::PipelineStageFlags2::FRAGMENT_SHADER
-                })
-                .dst_access_mask(if dedicated_transfer {
-                    vk::AccessFlags2::NONE
-                } else {
-                    vk::AccessFlags2::SHADER_READ
-                })
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(if dedicated_transfer {
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL
-                } else {
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                })
-                .src_queue_family_index(transfer_queue_family)
-                .dst_queue_family_index(graphics_queue_family);
-            // SAFETY: recording state and handles valid.
-            unsafe {
-                upload_cmd.pipeline_barrier2_by_barriers(
-                    &[],
-                    &[],
-                    std::slice::from_ref(&to_shader),
-                )
-            };
-            tex_stagings.push(staging);
-            textures.push(texture);
+
+            image_upload_commands.push(UploadImageCommand {
+                texture,
+                buffer: staging,
+                regions,
+                name,
+            });
+        }
+
+        let texture_pre_upload_barriers: Vec<_> = image_upload_commands
+            .iter()
+            .map(|c| {
+                // Transition: UNDEFINED → TRANSFER_DST_OPTIMAL.
+                c.texture
+                    .whole_image_barrier2()
+                    .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            })
+            .collect();
+        // SAFETY: All barriers are valid
+        unsafe {
+            upload_cmd.pipeline_barrier2_by_barriers(
+                &[],
+                &[],
+                &texture_pre_upload_barriers,
+            );
+        }
+        let textures: Vec<_> = image_upload_commands
+            .into_iter()
+            .map(|cmd| {
+                //SAFETY: upload_cmd is recording; cmd.buffer and cmd.texture are valid and remain alive for the duration of this block.
+                unsafe {
+                    upload_cmd.begin_debug_label_lazy(|| {
+                        LazyDebugLabelReturn {
+                            name_ref: format!("upload {}", cmd.name),
+                            ty: DebugLabelType::ImageUpload,
+                        }
+                    });
+                    upload_cmd.copy_buffer_to_image(
+                        cmd.buffer.raw_buffer(),
+                        cmd.texture.raw_image(),
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &cmd.regions,
+                    );
+                    upload_cmd.end_debug_label();
+                }
+
+                used_staging_buffers.push(cmd.buffer);
+
+                cmd.texture
+            })
+            .collect();
+        let texture_post_upload_barriers: Vec<_> = textures
+            .iter()
+            .map(|t| {
+                // Release / transition to SHADER_READ_ONLY.
+                t.whole_image_barrier2()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(if dedicated_transfer {
+                        vk::PipelineStageFlags2::BOTTOM_OF_PIPE
+                    } else {
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER
+                    })
+                    .dst_access_mask(if dedicated_transfer {
+                        vk::AccessFlags2::NONE
+                    } else {
+                        vk::AccessFlags2::SHADER_READ
+                    })
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(if dedicated_transfer {
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                    } else {
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    })
+                    .src_queue_family_index(transfer_queue_family)
+                    .dst_queue_family_index(graphics_queue_family)
+            })
+            .collect();
+
+        // Safety: Valid barriers
+        unsafe {
+            upload_cmd.pipeline_barrier2_by_barriers(
+                &[],
+                &[],
+                &texture_post_upload_barriers,
+            );
         }
 
         let mut buffer_barriers = Vec::new();
@@ -2266,9 +2335,10 @@ impl AppRunner {
             // state. transfer_semaphore_submit is valid because it signals
             // after the last transfer completes and is created on this device
             unsafe {
-                device.transfer_queue_submit2(
+                device.transfer_queue_submit2_labeled(
                     std::slice::from_ref(&transfer_submit),
                     None,
+                    Some("Upload: transfer"),
                 )?
             }
             let (graphics_cb, _graphics_pool) = opt_graphics_upload.as_ref().expect(
@@ -2295,9 +2365,10 @@ impl AppRunner {
             // valid because it waits at the vertex input stage, the first stage
             // where we can possibly use the resources it guards
             unsafe {
-                device.graphics_queue_submit2(
+                device.graphics_queue_submit2_labeled(
                     std::slice::from_ref(&graphics_submit),
                     Some(&mut upload_fence),
+                    Some("Upload: ownership transfer"),
                 )?
             }
         } else {
@@ -2313,9 +2384,10 @@ impl AppRunner {
             // transfer_cb_submit is valid. transfer_cb_submit is valid because
             // the command buffer was made on this device for the transfer queue
             unsafe {
-                device.transfer_queue_submit2(
+                device.transfer_queue_submit2_labeled(
                     std::slice::from_ref(&transfer_submit),
                     Some(&mut upload_fence),
+                    Some("Upload"),
                 )?;
             }
         }

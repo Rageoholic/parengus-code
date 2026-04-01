@@ -13,8 +13,9 @@
 //! the synchronisation constraints this imposes.
 
 use ash::vk;
+use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::device::Device;
@@ -446,7 +447,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         // SAFETY: `handle` is a valid swapchain created from
         // `parent_device`.
         let name_result = unsafe {
-            parent_device.set_object_name_with(handle, || {
+            parent_device.set_object_name_lazy(handle, || {
                 std::ffi::CString::new(lazy_name.as_deref()?.as_str()).ok()
             })
         };
@@ -467,7 +468,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
             // SAFETY: image is a valid swapchain image owned by
             // parent_device.
             let name_result = unsafe {
-                parent_device.set_object_name_with(image, || {
+                parent_device.set_object_name_lazy(image, || {
                     let name = lazy_name.as_deref()?;
                     std::ffi::CString::new(format!(
                         "{name} Image {}",
@@ -509,7 +510,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
                         // SAFETY: image_view is valid and created
                         // from parent_device.
                         let name_result = unsafe {
-                            parent_device.set_object_name_with(
+                            parent_device.set_object_name_lazy(
                                 image_view,
                                 || {
                                     let name = lazy_name.as_deref()?;
@@ -784,10 +785,7 @@ impl<T: HasDisplayHandle + HasWindowHandle> Swapchain<T> {
         semaphore: vk::Semaphore,
         fence: vk::Fence,
     ) -> Result<(u32, bool), vk::Result> {
-        let _guard = self
-            .acquire_lock
-            .lock()
-            .expect("swapchain acquire lock poisoned");
+        let _guard = self.acquire_lock.lock();
         // SAFETY: Caller guarantees semaphore and fence validity. self.handle
         // is valid for the lifetime of this Swapchain.
         unsafe {

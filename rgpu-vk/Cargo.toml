@@ -10,6 +10,7 @@ keywords = ["vulkan", "graphics", "gpu", "rendering", "ash"]
 categories = ["rendering::graphics-api"]
 
 [dependencies]
+parking_lot = "0.12"
 ash = "0.38"
 ash-window = "0.13"
 bytemuck = "1.25.0"

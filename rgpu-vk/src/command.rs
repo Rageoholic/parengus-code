@@ -96,6 +96,74 @@ impl Drop for CommandPoolShared {
 }
 
 // ---------------------------------------------------------------------------
+// public helper types for debug utils labels
+// ---------------------------------------------------------------------------
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug)]
+pub enum DebugLabelType {
+    GraphicsPass,
+    ComputePass,
+    GraphicsSubpass,
+    ComputeSubpass,
+    ImageCopy,
+    BufferCopy,
+    ImageUpload,
+    BufferUpload,
+    ImageDownload,
+    BufferDownload,
+    Other,
+}
+type DebugUtilColor = [f32; 4];
+
+// NOTE: I haven't tested these colors on light screens. I probably don't
+// actually care but if someone else thinks the values are off, feel free to
+// tweak the saturation and I'll check if it works.
+const COLOR_GREEN: DebugUtilColor = [0.0, 1.0, 0.0, 1.0];
+const COLOR_BLUE: DebugUtilColor = [0.0, 0.0, 1.0, 1.0];
+const COLOR_CYAN: DebugUtilColor = [0.0, 1.0, 1.0, 1.0];
+const COLOR_MAGENTA: DebugUtilColor = [0.9, 0.0, 0.9, 1.0];
+pub const COLOR_YELLOW_DARK: DebugUtilColor = [0.502, 0.400, 0.000, 1.0];
+pub const COLOR_YELLOW_MEDIUM: DebugUtilColor = [0.800, 0.722, 0.000, 1.0];
+pub const COLOR_YELLOW_LIGHT: DebugUtilColor = [1.000, 0.878, 0.200, 1.0];
+const COLOR_GREY: DebugUtilColor = [0.7, 0.7, 0.7, 1.0];
+
+impl DebugLabelType {
+    fn to_color(self) -> [f32; 4] {
+        match self {
+            DebugLabelType::GraphicsPass => COLOR_GREEN,
+            DebugLabelType::ComputePass => COLOR_CYAN,
+            DebugLabelType::GraphicsSubpass => COLOR_BLUE,
+            DebugLabelType::ComputeSubpass => COLOR_MAGENTA,
+            DebugLabelType::Other => COLOR_GREY,
+            // These operations are yellow because they're ideally not going to
+            // show up if we optimize well. Darkness is tied to the "heaviness"
+            // of the implied sync with CPU. GPU to GPU copies don't really
+            // involve the CPU so they're fine. Uploads require data to be given
+            // to the GPU so we did the sync beforehand. Downloads imply the CPU
+            // needs to do something with the data. Probably mostly for
+            // screenshots and the like so they should be very rare.
+            DebugLabelType::ImageUpload => COLOR_YELLOW_MEDIUM,
+            DebugLabelType::BufferUpload => COLOR_YELLOW_MEDIUM,
+            DebugLabelType::ImageCopy => COLOR_YELLOW_LIGHT,
+            DebugLabelType::BufferCopy => COLOR_YELLOW_LIGHT,
+            DebugLabelType::ImageDownload => COLOR_YELLOW_DARK,
+            DebugLabelType::BufferDownload => COLOR_YELLOW_DARK,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DebugLabel<'a> {
+    pub name: &'a str,
+    pub ty: DebugLabelType,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct LazyDebugLabelReturn<NameRef: AsRef<str>> {
+    pub name_ref: NameRef,
+    pub ty: DebugLabelType,
+}
+// ---------------------------------------------------------------------------
 // ResettableCommandPool
 // ---------------------------------------------------------------------------
 
@@ -854,6 +922,78 @@ impl ResettableCommandBuffer {
                 bytes,
             )
         }
+    }
+
+    /// Begin a debug label region on this command buffer.
+    ///
+    /// No-op when `VK_EXT_debug_utils` is not enabled.
+    ///
+    /// # Safety
+    /// The buffer must be in the
+    /// [`Recording`](CommandBufferState::Recording) state. Every call must
+    /// be matched by a corresponding [`end_debug_label`](Self::end_debug_label)
+    /// before the buffer is submitted.
+    pub unsafe fn begin_debug_label(&mut self, label: DebugLabel) {
+        use std::ffi::CString;
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
+        // SAFETY: Caller guarantees recording state. CString::new only
+        // fails on interior NUL bytes; a label from &str has none.
+        let c_label = CString::new(label.name).unwrap_or_default();
+        // SAFETY: handle is valid and in the recording state. c_label is
+        // valid UTF-8 (derived from &str).
+        unsafe {
+            self.parent.cmd_begin_debug_label_cstr(
+                self.handle,
+                Some(&c_label),
+                label.ty.to_color(),
+            )
+        }
+    }
+
+    /// Lazily begin a debug label region on this command buffer, invoking the provided closure to construct the label string only if `VK_EXT_debug_utils` is
+    /// enabled and the command buffer is in the recording state.
+    ///
+    /// No-op when `VK_EXT_debug_utils` is not enabled.
+    ///
+    /// # Safety
+    /// The buffer must be in the
+    /// [`Recording`](CommandBufferState::Recording) state. Every call must
+    /// be matched by a corresponding [`end_debug_label`](Self::end_debug_label)
+    /// before the buffer is submitted.
+    pub unsafe fn begin_debug_label_lazy<LabelFn, StringRef>(
+        &mut self,
+        f: LabelFn,
+    ) where
+        LabelFn: FnOnce() -> LazyDebugLabelReturn<StringRef>,
+        StringRef: AsRef<str>,
+    {
+        assert!(self.state == CommandBufferState::Recording);
+
+        if self.parent.debug_utils_enabled() {
+            let label = f();
+            // SAFETY: Valid UTF8, we are in the recording state
+            unsafe {
+                self.begin_debug_label(DebugLabel {
+                    name: label.name_ref.as_ref(),
+                    ty: label.ty,
+                })
+            };
+        }
+    }
+
+    /// End the most recently begun debug label region on this command buffer.
+    ///
+    /// No-op when `VK_EXT_debug_utils` is not enabled.
+    ///
+    /// # Safety
+    /// The buffer must be in the
+    /// [`Recording`](CommandBufferState::Recording) state. A matching
+    /// [`begin_debug_label`](Self::begin_debug_label) must have been
+    /// recorded previously.
+    pub unsafe fn end_debug_label(&mut self) {
+        debug_assert_eq!(self.state, CommandBufferState::Recording);
+        // SAFETY: Caller guarantees recording state and a matching begin.
+        unsafe { self.parent.end_cmd_debug_label(self.handle) }
     }
 
     #[inline]
