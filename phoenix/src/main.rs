@@ -16,7 +16,10 @@ use parengus_tracing::{TracingLogLevel, init_default};
 use rgpu_vk::{
     ash::vk::{self, BufferImageCopy},
     buffer::{DeviceLocalBuffer, HostVisibleBuffer},
-    command::{ResettableCommandBuffer, ResettableCommandPool},
+    command::{
+        self, DebugLabel, DebugLabelType, LazyDebugLabelReturn,
+        ResettableCommandBuffer, ResettableCommandPool,
+    },
     descriptor::{
         DescriptorBindingDesc, DescriptorPool, DescriptorSet,
         DescriptorSetLayout,
@@ -1158,6 +1161,14 @@ impl AppRunner {
         // MSAA image (when present) are valid.
         unsafe { frame_cmd.pipeline_barrier2(&dep_info) };
 
+        // SAFETY: We remember to close this, we're recording
+        unsafe {
+            frame_cmd.begin_debug_label(DebugLabel {
+                name: "Main Draw Pass",
+                ty: DebugLabelType::GraphicsPass,
+            })
+        };
+
         // Begin dynamic rendering with a clear.
         let color_clear = vk::ClearValue {
             color: vk::ClearColorValue {
@@ -1305,6 +1316,9 @@ impl AppRunner {
 
         // SAFETY: inside a dynamic render pass.
         unsafe { frame_cmd.end_rendering() };
+
+        // SAFETY: currently in a debug label
+        unsafe { frame_cmd.end_debug_label() };
 
         // Transition: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
         // Transfer: Graphics -> Present
@@ -2032,7 +2046,12 @@ impl AppRunner {
         material_descriptor_set.set_name(&device, Some("material set"));
 
         // SAFETY: We are recording
-        unsafe { upload_cmd.begin_debug_label("initial buffer data upload") };
+        unsafe {
+            upload_cmd.begin_debug_label(DebugLabel {
+                name: "initial buffer data upload",
+                ty: command::DebugLabelType::BufferUpload,
+            })
+        };
 
         // Create one staging buffer + Texture per unique albedo, then
         // record all copies into the shared upload command buffer.
@@ -2138,7 +2157,10 @@ impl AppRunner {
                 //SAFETY: upload_cmd is recording; cmd.buffer and cmd.texture are valid and remain alive for the duration of this block.
                 unsafe {
                     upload_cmd.begin_debug_label_lazy(|| {
-                        format!("upload {}", cmd.name)
+                        LazyDebugLabelReturn {
+                            name_ref: format!("upload {}", cmd.name),
+                            ty: DebugLabelType::ImageUpload,
+                        }
                     });
                     upload_cmd.copy_buffer_to_image(
                         cmd.buffer.raw_buffer(),

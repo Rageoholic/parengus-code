@@ -260,6 +260,7 @@ pub enum QueuePresentError {
 /// [`Device::create_compatible`] uses whatever the hardware provides and
 /// reports the achieved config via [`Device::queue_config`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+
 pub struct QueueConfig {
     /// Use a dedicated transfer queue family (not shared with graphics). When
     /// `false`, the graphics/present family is used for transfer.
@@ -844,18 +845,46 @@ impl Device {
             mandatory_exts.iter().map(|e| e.as_ptr()).collect();
 
         // Enable synchronization2 (core 1.3 or via extension).
-        let mut sync2_features =
-            vk::PhysicalDeviceSynchronization2Features::default()
-                .synchronization2(true);
+        let mut sync2_features = vk::PhysicalDeviceSynchronization2Features {
+            synchronization2: vk::TRUE,
+            ..Default::default()
+        };
         // Enable dynamic rendering if requested (core 1.3 or via extension).
-        let mut dr_features =
-            vk::PhysicalDeviceDynamicRenderingFeatures::default()
-                .dynamic_rendering(true);
+        let mut dr_features = vk::PhysicalDeviceDynamicRenderingFeatures {
+            dynamic_rendering: vk::TRUE,
+            ..Default::default()
+        };
+
         // Enable descriptor indexing: partially-bound descriptors (core 1.2 or
         // via VK_EXT_descriptor_indexing).
         let mut descriptor_indexing_features =
-            vk::PhysicalDeviceDescriptorIndexingFeatures::default()
-                .descriptor_binding_partially_bound(true);
+            vk::PhysicalDeviceDescriptorIndexingFeatures {
+                shader_input_attachment_array_dynamic_indexing: vk::TRUE,
+                shader_uniform_texel_buffer_array_dynamic_indexing: vk::TRUE,
+                shader_storage_texel_buffer_array_dynamic_indexing: vk::TRUE,
+                shader_uniform_buffer_array_non_uniform_indexing: vk::TRUE,
+                shader_sampled_image_array_non_uniform_indexing: vk::TRUE,
+                shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
+                shader_storage_image_array_non_uniform_indexing: vk::TRUE,
+                shader_input_attachment_array_non_uniform_indexing: vk::TRUE,
+                shader_uniform_texel_buffer_array_non_uniform_indexing:
+                    vk::TRUE,
+                shader_storage_texel_buffer_array_non_uniform_indexing:
+                    vk::TRUE,
+                descriptor_binding_uniform_buffer_update_after_bind: vk::TRUE,
+                descriptor_binding_sampled_image_update_after_bind: vk::TRUE,
+                descriptor_binding_storage_image_update_after_bind: vk::TRUE,
+                descriptor_binding_storage_buffer_update_after_bind: vk::TRUE,
+                descriptor_binding_uniform_texel_buffer_update_after_bind:
+                    vk::TRUE,
+                descriptor_binding_storage_texel_buffer_update_after_bind:
+                    vk::TRUE,
+                descriptor_binding_update_unused_while_pending: vk::TRUE,
+                descriptor_binding_partially_bound: vk::TRUE,
+                descriptor_binding_variable_descriptor_count: vk::TRUE,
+                runtime_descriptor_array: vk::TRUE,
+                ..Default::default()
+            };
 
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
@@ -2153,11 +2182,13 @@ impl Device {
         &self,
         command_buffer: vk::CommandBuffer,
         label: Option<&CStr>,
+        color: [f32; 4],
     ) {
         if let Some(debug_utils) = self.debug_utils_device.as_ref() {
             let label_name = label.unwrap_or(c"");
-            let label_info =
-                vk::DebugUtilsLabelEXT::default().label_name(label_name);
+            let label_info = vk::DebugUtilsLabelEXT::default()
+                .label_name(label_name)
+                .color(color);
             // SAFETY: command_buffer is valid and in the recording state per
             // our contract. label_name is valid UTF-8 per our contract.
             unsafe {

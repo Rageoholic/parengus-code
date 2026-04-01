@@ -74,6 +74,26 @@ Include:
 
 ---
 
+## Extension Feature struct
+
+Because we are targeting 1.0 + extensions as our vulkan target, adding a feature
+on the device will require filling out a per extension Features struct. This
+works even for the core versions of those features despite that not being
+documented well by the vulkan docs. Honestly this might be a "it's not
+technically specified but everyone relies on it so no one is willing to break
+it" type of thing. Policy is we fill out all these structs explicitly except for
+`s_type`, `p_next`, and `_marker`. If you are editing with rust-analyzer and an
+editor that supports code completions, you can "cheat" a bit here. Use Rust
+analyzer to generate todos of all the members, then fill out all the ones that
+are not the explicitly excluded ones. Verify you don't get compile errors, then
+delete the explicitly excluded members and add `..Default::default()` to the
+bottom of the struct. These structs can never change definition so this is
+correct even if it's vaguely annoying. In the future we might decide to have
+mirrored structs without default but this is the current solution to do this
+"correctly"
+
+---
+
 ## Pull Requests
 
 ### Title
