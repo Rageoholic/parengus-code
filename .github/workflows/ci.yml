@@ -20,19 +20,15 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v6
-      - name: Check for code changes
+      - uses: dorny/paths-filter@v3
         id: filter
-        run: |
-          git fetch origin ${{ github.base_ref }} --depth=1
-          CHANGED=$(git diff --name-only \
-            origin/${{ github.base_ref }}...HEAD)
-          echo "$CHANGED"
-          if echo "$CHANGED" | grep -qvE \
-            '^(docs/|\.tasks/|[^/]*\.md$)'; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"
-          fi
+        with:
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!**.md'
+              - '!.tasks/**'
 
   fmt:
     name: Rustfmt
