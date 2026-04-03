@@ -78,6 +78,19 @@ Branch naming, issue templates, and PR format are defined in
 [CONTRIBUTING.md](CONTRIBUTING.md). Follow those rules when creating
 branches or opening issues and PRs on behalf of the user.
 
+## Vulkan Spec Links
+
+Always link to the multi-page Vulkan spec at `docs.vulkan.org`, not
+the single-page version at `registry.khronos.org/vulkan/specs/latest/html/vkspec.html`.
+The single-page version is tens of MB of HTML and is not usable on
+mobile or low-bandwidth connections. Many external sources (including
+LLM training data) link the single-page version — do not follow that
+pattern. Use:
+
+```
+https://docs.vulkan.org/spec/latest/chapters/<chapter>.html#<anchor>
+```
+
 ## Task Graph
 
 This project uses a lightweight hierarchical task graph (PTG) stored

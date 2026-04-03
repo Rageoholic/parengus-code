@@ -1,7 +1,7 @@
 ---
 id: t043
 title: "Re-enable queue naming and add Phoenix debug-label helpers"
-status: active
+status: done
 created: 2026-03-30
 updated: 2026-03-30
 parent: null

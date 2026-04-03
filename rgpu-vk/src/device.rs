@@ -329,6 +329,92 @@ pub struct DeviceConfig {
     pub descriptor_indexing: bool,
 }
 
+/// Returns `true` if the physical device supports all synchronization2
+/// sub-features. Destructures the struct exhaustively (excluding `s_type`,
+/// `p_next`, and `_marker`) so the compiler catches any future field
+/// additions.
+fn sync2_fully_supported(
+    f: vk::PhysicalDeviceSynchronization2Features<'_>,
+) -> bool {
+    let vk::PhysicalDeviceSynchronization2Features {
+        s_type: _,
+        p_next: _,
+        synchronization2,
+        _marker: _,
+    } = f;
+    synchronization2 == vk::TRUE
+}
+
+/// Returns `true` if the physical device supports all dynamic rendering
+/// sub-features. Destructures the struct exhaustively (excluding `s_type`,
+/// `p_next`, and `_marker`) so the compiler catches any future field
+/// additions.
+fn dynamic_rendering_fully_supported(
+    f: vk::PhysicalDeviceDynamicRenderingFeatures<'_>,
+) -> bool {
+    let vk::PhysicalDeviceDynamicRenderingFeatures {
+        s_type: _,
+        p_next: _,
+        dynamic_rendering,
+        _marker: _,
+    } = f;
+    dynamic_rendering == vk::TRUE
+}
+
+/// Returns `true` if the physical device supports all descriptor indexing
+/// sub-features. Destructures the struct exhaustively (excluding `s_type`,
+/// `p_next`, and `_marker`) so the compiler catches any future field
+/// additions.
+fn descriptor_indexing_fully_supported(
+    f: vk::PhysicalDeviceDescriptorIndexingFeatures<'_>,
+) -> bool {
+    let vk::PhysicalDeviceDescriptorIndexingFeatures {
+        s_type: _,
+        p_next: _,
+        shader_input_attachment_array_dynamic_indexing,
+        shader_uniform_texel_buffer_array_dynamic_indexing,
+        shader_storage_texel_buffer_array_dynamic_indexing,
+        shader_uniform_buffer_array_non_uniform_indexing,
+        shader_sampled_image_array_non_uniform_indexing,
+        shader_storage_buffer_array_non_uniform_indexing,
+        shader_storage_image_array_non_uniform_indexing,
+        shader_input_attachment_array_non_uniform_indexing,
+        shader_uniform_texel_buffer_array_non_uniform_indexing,
+        shader_storage_texel_buffer_array_non_uniform_indexing,
+        descriptor_binding_uniform_buffer_update_after_bind,
+        descriptor_binding_sampled_image_update_after_bind,
+        descriptor_binding_storage_image_update_after_bind,
+        descriptor_binding_storage_buffer_update_after_bind,
+        descriptor_binding_uniform_texel_buffer_update_after_bind,
+        descriptor_binding_storage_texel_buffer_update_after_bind,
+        descriptor_binding_update_unused_while_pending,
+        descriptor_binding_partially_bound,
+        descriptor_binding_variable_descriptor_count,
+        runtime_descriptor_array,
+        _marker: _,
+    } = f;
+    shader_input_attachment_array_dynamic_indexing == vk::TRUE
+        && shader_uniform_texel_buffer_array_dynamic_indexing == vk::TRUE
+        && shader_storage_texel_buffer_array_dynamic_indexing == vk::TRUE
+        && shader_uniform_buffer_array_non_uniform_indexing == vk::TRUE
+        && shader_sampled_image_array_non_uniform_indexing == vk::TRUE
+        && shader_storage_buffer_array_non_uniform_indexing == vk::TRUE
+        && shader_storage_image_array_non_uniform_indexing == vk::TRUE
+        && shader_input_attachment_array_non_uniform_indexing == vk::TRUE
+        && shader_uniform_texel_buffer_array_non_uniform_indexing == vk::TRUE
+        && shader_storage_texel_buffer_array_non_uniform_indexing == vk::TRUE
+        && descriptor_binding_uniform_buffer_update_after_bind == vk::TRUE
+        && descriptor_binding_sampled_image_update_after_bind == vk::TRUE
+        && descriptor_binding_storage_image_update_after_bind == vk::TRUE
+        && descriptor_binding_storage_buffer_update_after_bind == vk::TRUE
+        && descriptor_binding_uniform_texel_buffer_update_after_bind == vk::TRUE
+        && descriptor_binding_storage_texel_buffer_update_after_bind == vk::TRUE
+        && descriptor_binding_update_unused_while_pending == vk::TRUE
+        && descriptor_binding_partially_bound == vk::TRUE
+        && descriptor_binding_variable_descriptor_count == vk::TRUE
+        && runtime_descriptor_array == vk::TRUE
+}
+
 impl Device {
     /// Create a logical device compatible with `surf`.
     ///
@@ -355,6 +441,9 @@ impl Device {
             }
             if config.dynamic_rendering {
                 needs_features2.push("dynamic_rendering");
+            }
+            if config.descriptor_indexing {
+                needs_features2.push("descriptor_indexing");
             }
             if !needs_features2.is_empty() {
                 return Err(CreateCompatibleError::PhysDevFeatures2Required(
@@ -630,6 +719,51 @@ impl Device {
                 continue 'dev;
             }
 
+            // Feature sub-field check. Query and verify that every
+            // sub-feature within each requested feature group is supported.
+            // Workaround until we expose finer-grained feature selection
+            // (t044): require all sub-features rather than checking
+            // individually.
+            if config.synchronization2
+                || config.dynamic_rendering
+                || config.descriptor_indexing
+            {
+                let mut q_sync2 =
+                    vk::PhysicalDeviceSynchronization2Features::default();
+                let mut q_dr =
+                    vk::PhysicalDeviceDynamicRenderingFeatures::default();
+                let mut q_di =
+                    vk::PhysicalDeviceDescriptorIndexingFeatures::default();
+                let mut q = vk::PhysicalDeviceFeatures2::default();
+                if config.synchronization2 {
+                    q = q.push_next(&mut q_sync2);
+                }
+                if config.dynamic_rendering {
+                    q = q.push_next(&mut q_dr);
+                }
+                if config.descriptor_indexing {
+                    q = q.push_next(&mut q_di);
+                }
+                // SAFETY: dev was derived from instance; all structs in the
+                // pNext chain are valid and properly initialised above.
+                unsafe {
+                    instance.get_physical_device_features2(dev, &mut q);
+                }
+                let supported = (!config.synchronization2
+                    || sync2_fully_supported(q_sync2))
+                    && (!config.dynamic_rendering
+                        || dynamic_rendering_fully_supported(q_dr))
+                    && (!config.descriptor_indexing
+                        || descriptor_indexing_fully_supported(q_di));
+                if !supported {
+                    tracing::debug!(
+                        "Skipping {:?}: missing required feature sub-fields",
+                        props.device_name_as_c_str().unwrap_or(c"unknown"),
+                    );
+                    continue 'dev;
+                }
+            }
+
             let score = (
                 dedicated_score,
                 device_type_priority(props.device_type),
@@ -844,47 +978,39 @@ impl Device {
         let ext_ptrs: Vec<*const i8> =
             mandatory_exts.iter().map(|e| e.as_ptr()).collect();
 
-        // Enable synchronization2 (core 1.3 or via extension).
-        let mut sync2_features = vk::PhysicalDeviceSynchronization2Features {
-            synchronization2: vk::TRUE,
-            ..Default::default()
-        };
-        // Enable dynamic rendering if requested (core 1.3 or via extension).
-        let mut dr_features = vk::PhysicalDeviceDynamicRenderingFeatures {
-            dynamic_rendering: vk::TRUE,
-            ..Default::default()
-        };
-
-        // Enable descriptor indexing: partially-bound descriptors (core 1.2 or
-        // via VK_EXT_descriptor_indexing).
+        // Query which features are actually supported by this physical device,
+        // then pass the reported values directly to DeviceCreateInfo. The
+        // guard above ensures phys_dev_features2 is available whenever any
+        // of these flags is set in config.
+        let mut sync2_features =
+            vk::PhysicalDeviceSynchronization2Features::default();
+        let mut dr_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default();
         let mut descriptor_indexing_features =
-            vk::PhysicalDeviceDescriptorIndexingFeatures {
-                shader_input_attachment_array_dynamic_indexing: vk::TRUE,
-                shader_uniform_texel_buffer_array_dynamic_indexing: vk::TRUE,
-                shader_storage_texel_buffer_array_dynamic_indexing: vk::TRUE,
-                shader_uniform_buffer_array_non_uniform_indexing: vk::TRUE,
-                shader_sampled_image_array_non_uniform_indexing: vk::TRUE,
-                shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
-                shader_storage_image_array_non_uniform_indexing: vk::TRUE,
-                shader_input_attachment_array_non_uniform_indexing: vk::TRUE,
-                shader_uniform_texel_buffer_array_non_uniform_indexing:
-                    vk::TRUE,
-                shader_storage_texel_buffer_array_non_uniform_indexing:
-                    vk::TRUE,
-                descriptor_binding_uniform_buffer_update_after_bind: vk::TRUE,
-                descriptor_binding_sampled_image_update_after_bind: vk::TRUE,
-                descriptor_binding_storage_image_update_after_bind: vk::TRUE,
-                descriptor_binding_storage_buffer_update_after_bind: vk::TRUE,
-                descriptor_binding_uniform_texel_buffer_update_after_bind:
-                    vk::TRUE,
-                descriptor_binding_storage_texel_buffer_update_after_bind:
-                    vk::TRUE,
-                descriptor_binding_update_unused_while_pending: vk::TRUE,
-                descriptor_binding_partially_bound: vk::TRUE,
-                descriptor_binding_variable_descriptor_count: vk::TRUE,
-                runtime_descriptor_array: vk::TRUE,
-                ..Default::default()
-            };
+            vk::PhysicalDeviceDescriptorIndexingFeatures::default();
+
+        if config.synchronization2
+            || config.dynamic_rendering
+            || config.descriptor_indexing
+        {
+            let mut query = vk::PhysicalDeviceFeatures2::default();
+            if config.synchronization2 {
+                query = query.push_next(&mut sync2_features);
+            }
+            if config.dynamic_rendering {
+                query = query.push_next(&mut dr_features);
+            }
+            if config.descriptor_indexing {
+                query = query.push_next(&mut descriptor_indexing_features);
+            }
+            // SAFETY: physical_device was selected from this instance;
+            // all structs in the pNext chain are valid and properly
+            // initialised above.
+            unsafe {
+                instance
+                    .get_physical_device_features2(physical_device, &mut query);
+            }
+        }
 
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)

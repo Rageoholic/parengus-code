@@ -1,7 +1,7 @@
 ---
 id: t041
 title: "Single staging buffer with linear allocator"
-status: active
+status: future
 created: 2026-03-30
 updated: 2026-03-30
 parent: null
