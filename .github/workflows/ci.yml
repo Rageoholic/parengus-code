@@ -20,26 +20,15 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v6
-      - name: Check for code changes
+      - uses: dorny/paths-filter@v3
         id: filter
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE_REF="${{ github.base_ref }}"
-            git fetch origin "$BASE_REF" --depth=1
-            CHANGED=$(git diff --name-only \
-              "origin/$BASE_REF...HEAD")
-          else
-            BEFORE="${{ github.event.before }}"
-            git fetch origin "$BEFORE" --depth=1
-            CHANGED=$(git diff --name-only "$BEFORE...HEAD")
-          fi
-          echo "$CHANGED"
-          if echo "$CHANGED" | grep -qvE \
-            '^(docs/|\.tasks/|[^/]*\.md$)'; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"
-          fi
+        with:
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!**.md'
+              - '!.tasks/**'
 
   fmt:
     name: Rustfmt
