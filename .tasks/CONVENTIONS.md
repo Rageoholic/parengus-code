@@ -66,6 +66,8 @@ status: planned
 #   planned  - will be done, not started
 #   active   - currently in progress
 #   blocked  - cannot proceed; see blocked_by
+#   future   - improvement deferred until later; needed eventually
+#              but not blocking anything important right now
 #   done     - completed
 #   dropped  - cancelled, will not be done
 created: 2026-03-14
@@ -128,7 +130,10 @@ session that touches tasks.
 Its frontmatter contains `next_id`. Its body contains:
 1. A one-paragraph system summary with a link to this file.
 2. An active-task tree (indented list showing hierarchy).
-3. A table of all tasks (ID, title, status, area, issue).
+3. Separate task tables grouped by status, in this order:
+   **Active → Planned → Future → Idea → Done → Dropped**
+   Each group has its own `### Status` heading and table. Omit a
+   group entirely if it has no tasks.
 
 The AI regenerates the index (does not diff it) whenever tasks are
 created, updated, or closed. **If the index and a task file disagree,

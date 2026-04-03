@@ -1,4 +1,4 @@
-next_id: t044
+next_id: t045
 ---
 
 # Task Graph Index
@@ -16,57 +16,81 @@ and AI interaction conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 ## Active Tree
 
 - t003 Implement PBR shading [active]
-  - t024 Material plumbing and SSBO infrastructure [active]
-  - t035 Directional lighting [planned, blocked by t024]
+  - t035 Directional lighting [planned]
 - t001 Parengus Shader IR (PSIR) [planned, blocked by t033, t035]
 
 ---
 
-## All Tasks
+### Active
 
-| ID   | Title                               | Status    | Area     | Notes                    |
-|------|-------------------------------------|-----------|----------|--------------------------|
-| t001 | Parengus Shader IR (PSIR)           | planned   | psir     |                          |
-| t002 | xtask: smart rebuild-required check | planned   | infra    |                          |
-| t003 | Implement PBR shading               | active    | phoenix  |                          |
-| t004 | Implement TUI                       | planned   | phoenix  |                          |
-| t005 | Import renderer task graph          | completed | renderer | import of external graph |
-| t006 | RenderGraph / Executor split        | planned   | renderer |                          |
-| t007 | Frames-in-flight infrastructure     | planned   | renderer |                          |
-| t008 | RenderGraph compile phase           | planned   | renderer |                          |
-| t009 | Executor resource management        | planned   | renderer |                          |
-| t010 | Explicit rendergraph dependencies   | planned   | renderer |                          |
-| t011 | Resource granularity                | planned   | renderer |                          |
-| t012 | Upload system                       | planned   | renderer |                          |
-| t013 | Draw submission model               | planned   | renderer |                          |
-| t014 | Descriptor model                    | planned   | renderer |                          |
-| t015 | Shader binding model                | planned   | renderer |                          |
-| t016 | Material system                     | planned   | renderer |                          |
-| t017 | Deferred decisions (notes)          | planned   | renderer |                          |
-| t018 | Future features (notes)             | planned   | renderer |                          |
-| t019 | Resource state tracker              | planned   | renderer |                          |
-| t020 | Generate Slang compiler metadata    | planned   | pipeline |                          |
-| t021 | Emit SPIR-V 1.0 from PSIR emitter   | planned   | psir     |                          |
-| t022 | Implement LearnOpenGL-style Blinn-Phong renderer | dropped | phoenix | pivoted to PBR directly |
-| t023 | Blinn-Phong shader path            | dropped   | phoenix  | child of t022 |
-| t024 | Material plumbing and SSBO infrastructure | active | phoenix | child of t003 |
-| t025 | Blinn-Phong lighting uniforms      | dropped   | phoenix  | child of t022 |
-| t026 | Blinn-Phong visual validation      | dropped   | phoenix  | child of t022 |
-| t027 | Import DamagedHelmet test asset    | done      | phoenix  | child of t022 |
-| t028 | Enable asset bake caching          | done      | pipeline | avoid recompressing unchanged assets |
-| t029 | UI system with text rendering and buttons | planned | phoenix |                 |
-| t030 | Font import pipeline (TTF → SDF atlas) | planned | pipeline | child of t029 |
-| t031 | Text rendering system (SSBO-indexed quads) | planned | phoenix | child of t029; widgets are follow-up |
-| t032 | Observable/event system                    | planned | phoenix |               |
-| t033 | UI widget system                           | planned | phoenix | child of t029 |
-| t034 | Error dialog / fatal message display       | planned | infra   |               |
-| t035 | Directional lighting                       | planned | phoenix | child of t003 |
-| t036 | Custom Vulkan memory allocator             | idea    | rgpu-vk | explicitly deferred |
-| t037 | Harden state machine transitions with replace_with | planned | infra   |
-| t038 | Separate samplers from textures (sampler table) | active  | renderer | cleanup: sampler table and grouping |
-| t039 | Per-frame descriptor & command pools           | active  | renderer | cleanup: per-frame pools for descriptors/commands |
-| t040 | Optional device features (anisotropic optional) | active  | renderer | cleanup: optional device feature handling |
-| t041 | Single staging buffer with linear allocator     | active  | phoenix  | staging buffer & upload linear allocator |
-| t042 | Use Debug Utils labels for queues and submissions | done  | renderer | label queues/submissions for captures |
-| t043 | Re-enable queue naming and add Phoenix debug-label helpers | active | renderer | re-enable queue names; add Phoenix helper stubs |
-               |
+| ID   | Title                                                      | Area     | Notes                                           |
+|------|------------------------------------------------------------|----------|-------------------------------------------------|
+| t003 | Implement PBR shading                                      | phoenix  |                                                 |
+
+### Planned
+
+| ID   | Title                                                      | Area     | Notes                                         |
+|------|------------------------------------------------------------|----------|-----------------------------------------------|
+| t001 | Parengus Shader IR (PSIR)                                  | psir     |                                               |
+| t002 | xtask: smart rebuild-required check                        | infra    |                                               |
+| t004 | Implement TUI                                              | phoenix  |                                               |
+| t006 | RenderGraph / Executor split                               | renderer |                                               |
+| t007 | Frames-in-flight infrastructure                            | renderer |                                               |
+| t008 | RenderGraph compile phase                                  | renderer |                                               |
+| t009 | Executor resource management                               | renderer |                                               |
+| t010 | Explicit rendergraph dependencies                          | renderer |                                               |
+| t011 | Resource granularity                                       | renderer |                                               |
+| t012 | Upload system                                              | renderer |                                               |
+| t013 | Draw submission model                                      | renderer |                                               |
+| t014 | Descriptor model                                           | renderer |                                               |
+| t015 | Shader binding model                                       | renderer |                                               |
+| t016 | Material system                                            | renderer |                                               |
+| t017 | Deferred decisions (notes)                                 | renderer |                                               |
+| t018 | Future features (notes)                                    | renderer |                                               |
+| t019 | Resource state tracker                                     | renderer |                                               |
+| t021 | Emit SPIR-V 1.0 from PSIR emitter                          | psir     |                                               |
+| t029 | UI system with text rendering and buttons                  | phoenix  |                                               |
+| t030 | Font import pipeline (TTF → SDF atlas)                     | pipeline | child of t029                                 |
+| t031 | Text rendering system (SSBO-indexed quads)                 | phoenix  | child of t029; widgets are follow-up          |
+| t032 | Observable/event system                                    | phoenix  |                                               |
+| t033 | UI widget system                                           | phoenix  | child of t029                                 |
+| t034 | Error dialog / fatal message display                       | infra    |                                               |
+| t035 | Directional lighting                                       | phoenix  | child of t003                                 |
+| t037 | Harden state machine transitions with replace_with         | infra    |                                               |
+| t038 | Separate samplers from textures (sampler table)            | renderer | cleanup: sampler table and grouping           |
+
+### Future
+
+| ID   | Title                                                      | Area     | Notes                                           |
+|------|------------------------------------------------------------|----------|-------------------------------------------------|
+| t039 | Per-frame descriptor & command pools                       | renderer | cleanup: per-frame pools for descriptors/commands |
+| t040 | Optional device features (anisotropic optional)            | renderer | cleanup: optional device feature handling       |
+| t041 | Single staging buffer with linear allocator                | phoenix  | staging buffer & upload linear allocator        |
+| t044 | Design granular subfeature exposure in DeviceConfig        | rgpu-vk  | follow-up to query-first feature fix            |
+
+### Idea
+
+| ID   | Title                                                      | Area     | Notes                                         |
+|------|------------------------------------------------------------|----------|-----------------------------------------------|
+| t036 | Custom Vulkan memory allocator                             | rgpu-vk  | explicitly deferred                           |
+
+### Done
+
+| ID   | Title                                                      | Area     | Notes                                         |
+|------|------------------------------------------------------------|----------|-----------------------------------------------|
+| t005 | Import renderer task graph                                 | renderer | import of external graph                      |
+| t024 | Material plumbing and SSBO infrastructure                  | phoenix  | child of t003                                 |
+| t027 | Import DamagedHelmet test asset                            | phoenix  | child of t022                                 |
+| t028 | Enable asset bake caching                                  | pipeline | avoid recompressing unchanged assets          |
+| t042 | Use Debug Utils labels for queues and submissions          | renderer | label queues/submissions for captures         |
+| t043 | Re-enable queue naming and add Phoenix debug-label helpers | renderer | re-enable queue names; add Phoenix helper stubs |
+
+### Dropped
+
+| ID   | Title                                                      | Area     | Notes                                         |
+|------|------------------------------------------------------------|----------|-----------------------------------------------|
+| t020 | Generate Slang compiler metadata                           | pipeline |                                               |
+| t022 | Implement LearnOpenGL-style Blinn-Phong renderer           | phoenix  | pivoted to PBR directly                       |
+| t023 | Blinn-Phong shader path                                    | phoenix  | child of t022                                 |
+| t025 | Blinn-Phong lighting uniforms                              | phoenix  | child of t022                                 |
+| t026 | Blinn-Phong visual validation                              | phoenix  | child of t022                                 |

@@ -1,7 +1,7 @@
 ---
 id: t002
 title: "xtask: smart rebuild-required check"
-status: planned
+status: complete
 created: 2026-03-14
 updated: 2026-03-14
 parent: null

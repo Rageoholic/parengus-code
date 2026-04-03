@@ -1,7 +1,7 @@
 ---
 id: t024
 title: "Material plumbing and SSBO infrastructure"
-status: active
+status: done
 created: 2026-03-24
 updated: 2026-03-29
 parent: t003

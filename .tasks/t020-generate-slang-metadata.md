@@ -1,7 +1,7 @@
 ---
 id: t020
 title: "Generate Slang compiler metadata and import"
-status: planned
+status: dropped
 created: 2026-03-20
 updated: 2026-03-20
 parent: null

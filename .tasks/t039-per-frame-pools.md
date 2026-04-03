@@ -1,7 +1,7 @@
 ---
 id: t039
 title: "Per-frame descriptor & command pools"
-status: active
+status: future
 created: 2026-03-30
 updated: 2026-03-30
 parent: null

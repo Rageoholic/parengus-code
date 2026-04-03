@@ -1,7 +1,7 @@
 ---
 id: t040
 title: "Optional device features and anisotropic sampling"
-status: active
+status: future
 created: 2026-03-30
 updated: 2026-03-30
 parent: null
