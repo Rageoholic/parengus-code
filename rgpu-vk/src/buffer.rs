@@ -21,8 +21,10 @@ use ash::vk;
 use bytemuck::Pod;
 use thiserror::Error;
 
-use crate::command::ResettableCommandBuffer;
-use crate::device::{AllocateMemoryError, Allocation, Device, MemoryUsage};
+use crate::command::{Recordable, Recorder};
+use crate::device::{
+    AllocateMemoryError, Allocation, Device, MemoryUsage, SupportsTransfer,
+};
 
 /// Trait for types that expose a raw `VkBuffer` handle.
 ///
@@ -446,15 +448,15 @@ impl DeviceLocalBuffer {
     ///   execution of the recorded copy has completed.
     /// - `src` must be created with `TRANSFER_SRC` usage and `self` with
     ///   `TRANSFER_DST` usage.
-    pub unsafe fn record_upload_from(
+    pub unsafe fn record_upload_from<Q, B>(
         &mut self,
-        command_buffer: &mut ResettableCommandBuffer,
+        recorder: &mut Recorder<'_, Q, B>,
         src: &HostVisibleBuffer,
-    ) -> Result<(), UploadBufferError> {
-        debug_assert_eq!(
-            command_buffer.state(),
-            crate::command::CommandBufferState::Recording
-        );
+    ) -> Result<(), UploadBufferError>
+    where
+        Q: SupportsTransfer,
+        B: Recordable<Q>,
+    {
         let copy_size = src.size();
         if copy_size > self.size() {
             return Err(UploadBufferError::SourceTooLarge {
@@ -464,31 +466,35 @@ impl DeviceLocalBuffer {
         }
         // SAFETY: preconditions carry through; offset 0 is in-bounds.
         unsafe {
-            self.record_upload_region_from(command_buffer, src, 0, 0, copy_size)
+            self.record_upload_region_from(recorder, src, 0, 0, copy_size)
         }
     }
 
     /// Record an upload of a byte range from the source buffer into this
-    /// device-local buffer. Returns [`UploadBufferError::RegionOutOfBounds`] if
-    /// any region extends past the end of its buffer.
+    /// device-local buffer. Returns
+    /// [`UploadBufferError::RegionOutOfBounds`] if any region extends
+    /// past the end of its buffer.
     ///
-    /// The caller is responsible for begin/end/submit and any CPU/GPU
-    /// synchronization.
+    /// The caller is responsible for submitting the recorder's command
+    /// buffer and any CPU/GPU synchronization.
     ///
     /// # Safety
-    /// - `command_buffer` must be in the recording state.
     /// - The caller must ensure `src` and `self` remain alive until GPU
     ///   execution of the recorded copy has completed.
-    /// - `src` must be created with `TRANSFER_SRC` usage and `self` with
-    ///   `TRANSFER_DST` usage.
-    pub unsafe fn record_upload_region_from(
+    /// - `src` must be created with `TRANSFER_SRC` usage and `self`
+    ///   with `TRANSFER_DST` usage.
+    pub unsafe fn record_upload_region_from<Q, B>(
         &mut self,
-        command_buffer: &mut ResettableCommandBuffer,
+        recorder: &mut Recorder<'_, Q, B>,
         src: &HostVisibleBuffer,
         src_offset: vk::DeviceSize,
         dst_offset: vk::DeviceSize,
         copy_size: vk::DeviceSize,
-    ) -> Result<(), UploadBufferError> {
+    ) -> Result<(), UploadBufferError>
+    where
+        Q: SupportsTransfer,
+        B: Recordable<Q>,
+    {
         if src_offset.saturating_add(copy_size) > src.size()
             || dst_offset.saturating_add(copy_size) > self.size()
         {
@@ -501,16 +507,14 @@ impl DeviceLocalBuffer {
             });
         }
 
-        let raw_cmd = command_buffer.raw();
         let copy_region = vk::BufferCopy::default()
             .src_offset(src_offset)
             .dst_offset(dst_offset)
             .size(copy_size);
-        // SAFETY: caller guarantees recording state; buffers and
-        // region are valid and in-bounds.
+        // SAFETY: caller guarantees active recording session; buffers
+        // and region are valid and in-bounds.
         unsafe {
-            self.parent().cmd_copy_buffer(
-                raw_cmd,
+            recorder.copy_buffer(
                 src.raw_buffer(),
                 self.raw_buffer(),
                 std::slice::from_ref(&copy_region),

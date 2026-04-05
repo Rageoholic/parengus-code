@@ -1,4 +1,4 @@
-next_id: t045
+next_id: t047
 ---
 
 # Task Graph Index
@@ -84,6 +84,7 @@ and AI interaction conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 | t028 | Enable asset bake caching                                  | pipeline | avoid recompressing unchanged assets          |
 | t042 | Use Debug Utils labels for queues and submissions          | renderer | label queues/submissions for captures         |
 | t043 | Re-enable queue naming and add Phoenix debug-label helpers | renderer | re-enable queue names; add Phoenix helper stubs |
+| t045 | TransientCommandPool and RecordableCommandBuffer trait     | rgpu-vk  |                                                 |
 
 ### Dropped
 

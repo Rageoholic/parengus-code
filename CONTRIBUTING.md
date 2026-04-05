@@ -88,68 +88,12 @@ https://docs.vulkan.org/spec/latest/chapters/<chapter>.html#<anchor>
 
 ---
 
-## Extension Feature structs
+## Crate-specific guidance
 
-Because we target Vulkan 1.0 + extensions, enabling optional device features
-requires filling out a per-extension `VkPhysicalDevice*Features` struct. When a
-feature is promoted to core, the extension struct becomes a type alias for the
-core struct, so the same code works on both old and new drivers — using the
-extension struct on a 1.3 device is valid and intended by the spec, not a
-workaround. See the Vulkan spec: [Extending Vulkan §
-Promotion](https://docs.vulkan.org/spec/latest/chapters/extensions.html#extendingvulkan-compatibility-promotion)
-
-**Policy: query first, then pass the result to `DeviceCreateInfo`.**
-
-Before creating the logical device, call `get_physical_device_features2` with
-the feature struct(s) you care about chained into a `VkPhysicalDeviceFeatures2`.
-The driver fills in which sub-features are actually supported. Pass those
-same structs — unchanged — to `DeviceCreateInfo`. Never hard-code `VK_TRUE`;
-enabling a feature the physical device does not report is invalid and will
-trigger validation errors.
-
-```rust
-// Correct pattern
-let mut my_features =
-    vk::PhysicalDeviceMyFeatures::default(); // all zeros
-let mut query = vk::PhysicalDeviceFeatures2::default()
-    .push_next(&mut my_features);
-// fills my_features with what the device actually supports
-unsafe { instance.get_physical_device_features2(phys_dev, &mut query) };
-// pass the filled struct to device creation — do NOT set fields to TRUE
-device_create_info = device_create_info.push_next(&mut my_features);
-```
-
-**Checking feature support: exhaustive destructure.**
-
-When writing a helper that validates whether all sub-features in a group are
-supported, destructure the struct and explicitly bind every boolean field.
-Use `_` only for `s_type`, `p_next`, and `_marker`. This gives compile-time
-proof that no field was accidentally skipped:
-
-```rust
-fn my_feature_fully_supported(
-    f: vk::PhysicalDeviceMyFeatures<'_>,
-) -> bool {
-    let vk::PhysicalDeviceMyFeatures {
-        s_type: _,
-        p_next: _,
-        feature_a,
-        feature_b,
-        // ... every other boolean field named explicitly ...
-        _marker: _,
-    } = f;
-    feature_a == vk::TRUE && feature_b == vk::TRUE // && ...
-}
-```
-
-Do not use `..` to swallow unhandled fields — it defeats the point.
-These structs are frozen by the Vulkan spec, so the exhaustive list is
-a one-time cost that buys permanent safety.
-
-The current design enables whatever the physical device reports and
-requires all sub-features to be present (see the `*_fully_supported`
-helpers in `device.rs`). Finer-grained per-sub-feature control is
-tracked in t044.
+Crate-specific development guidance (coding conventions, architecture,
+verification, and per-crate feature checks) is documented in each
+crate's `README.md`. Read the README for the crate you're working on
+before contributing or making changes.
 
 ---
 
