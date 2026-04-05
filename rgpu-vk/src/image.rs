@@ -8,12 +8,11 @@
 use std::sync::Arc;
 
 use ash::vk;
-use gpu_allocator::{AllocationError, vulkan::Allocation};
 use thiserror::Error;
 
 use crate::buffer::HostVisibleBuffer;
 use crate::command::ResettableCommandBuffer;
-use crate::device::{Device, MemoryUsage};
+use crate::device::{Allocation, AllocateMemoryError, Device, MemoryUsage};
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -21,14 +20,8 @@ use crate::device::{Device, MemoryUsage};
 
 #[derive(Debug, Error)]
 pub(crate) enum CreateImageError {
-    #[error("Vulkan error creating image: {0}")]
-    CreateImage(vk::Result),
-
     #[error("GPU allocator error allocating memory: {0}")]
-    AllocateMemory(AllocationError),
-
-    #[error("Vulkan error binding image memory: {0}")]
-    BindMemory(vk::Result),
+    AllocateMemory(AllocateMemoryError),
 }
 
 #[derive(Debug, Error)]
@@ -53,14 +46,8 @@ pub enum RecordCopyFromError {
 /// Error returned by [`Texture::new`].
 #[derive(Debug, Error)]
 pub enum CreateTextureError {
-    #[error("Vulkan error creating image: {0}")]
-    CreateImage(vk::Result),
-
     #[error("GPU allocator error allocating memory: {0}")]
-    AllocateMemory(AllocationError),
-
-    #[error("Vulkan error binding image memory: {0}")]
-    BindMemory(vk::Result),
+    AllocateMemory(AllocateMemoryError),
 
     #[error("Vulkan error creating image view: {0}")]
     CreateView(vk::Result),
@@ -69,9 +56,7 @@ pub enum CreateTextureError {
 impl From<CreateImageError> for CreateTextureError {
     fn from(e: CreateImageError) -> Self {
         match e {
-            CreateImageError::CreateImage(r) => Self::CreateImage(r),
             CreateImageError::AllocateMemory(e) => Self::AllocateMemory(e),
-            CreateImageError::BindMemory(r) => Self::BindMemory(r),
         }
     }
 }
@@ -305,41 +290,18 @@ impl AllocatedImage {
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
         // SAFETY: create_info is fully initialised and has no borrowed data.
-        let handle = unsafe { device.create_raw_image(&create_info) }
-            .map_err(CreateImageError::CreateImage)?;
+        let (handle, allocation) = unsafe {
+            device.create_raw_image_allocated(
+                &create_info,
+                MemoryUsage::GpuOnly,
+            )
+        }
+        .map_err(CreateImageError::AllocateMemory)?;
 
         // SAFETY: handle is a valid image created from device.
         let name_result = unsafe { device.set_object_name_str(handle, name) };
         if let Err(e) = name_result {
             tracing::warn!("Failed to name image {:?}: {e}", handle);
-        }
-
-        // SAFETY: handle is a valid image created from this device.
-        let reqs = unsafe { device.get_raw_image_memory_requirements(handle) };
-        let allocation_name = name.unwrap_or("image");
-        let allocation = device
-            .allocate_memory(allocation_name, reqs, MemoryUsage::GpuOnly, false)
-            .map_err(|e| {
-                // SAFETY: handle was created from this device and is not
-                // bound to memory yet.
-                unsafe { device.destroy_raw_image(handle) };
-                CreateImageError::AllocateMemory(e)
-            })?;
-
-        // SAFETY: handle and allocation memory are valid and belong to
-        // this device.
-        let bind_result = unsafe {
-            device.bind_raw_image_memory(
-                handle,
-                allocation.memory(),
-                allocation.offset(),
-            )
-        };
-        if let Err(e) = bind_result {
-            let _ = device.free_memory(allocation);
-            // SAFETY: handle is valid and owned by this scope.
-            unsafe { device.destroy_raw_image(handle) };
-            return Err(CreateImageError::BindMemory(e));
         }
 
         Ok(Self {
@@ -356,14 +318,13 @@ impl AllocatedImage {
 impl Drop for AllocatedImage {
     fn drop(&mut self) {
         tracing::debug!("Dropping image {:?}", self.handle);
-        // SAFETY: handle was created from parent and is owned by this
-        // wrapper.
-        unsafe { self.parent.destroy_raw_image(self.handle) };
-
-        if let Some(allocation) = self.allocation.take()
-            && let Err(e) = self.parent.free_memory(allocation)
-        {
-            tracing::error!("Failed to free GPU image allocation: {e}");
+        if let Some(mut allocation) = self.allocation.take() {
+            // SAFETY: image and allocation were created together by
+            // create_raw_image_allocated and are no longer in use.
+            unsafe {
+                self.parent
+                    .destroy_raw_image_allocated(self.handle, &mut allocation);
+            }
         }
     }
 }

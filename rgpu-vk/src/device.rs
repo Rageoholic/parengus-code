@@ -1,9 +1,9 @@
 //! Logical device wrapper ([`Device`]).
 //!
 //! `Device` wraps a `VkDevice` and centralises all per-device state: a
-//! `gpu-allocator` allocator (behind a `Mutex`), extension loaders for
-//! swapchain, dynamic rendering, synchronization2, and debug utils, plus queues
-//! for graphics/present, transfer, and compute roles.
+//! VMA allocator, extension loaders for swapchain, dynamic rendering,
+//! synchronization2, and debug utils, plus queues for graphics/present,
+//! transfer, and compute roles.
 //!
 //! # Queue model
 //!
@@ -42,16 +42,11 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use ash::vk::{self};
-use gpu_allocator::{
-    AllocationError, MemoryLocation,
-    vulkan::{
-        Allocation, AllocationCreateDesc, AllocationScheme, Allocator,
-        AllocatorCreateDesc,
-    },
-};
+use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
+use vk_mem::AllocatorCreateInfo as VmaAllocatorCreateInfo;
+use vk_mem::{Alloc, AllocationCreateFlags, AllocationCreateInfo, Allocator};
 
 use crate::sync::{self, Fence};
 use crate::{
@@ -83,16 +78,29 @@ pub enum MemoryUsage {
     /// GPU-only storage. Highest bandwidth; not CPU-mappable.
     GpuOnly,
     /// CPU-writable, GPU-readable. For staging buffers and per-frame uploads.
-    CpuToGpu,
+    Upload,
+    /// CPU-writable, GPU-readable. For bound buffers the CPU wants to write to
+    HostVisibleBind,
     /// GPU-writable, CPU-readable. For readback.
-    GpuToCpu,
+    Download,
+    /// For the weird buffers that both the CPU and GPU need to write to.
+    /// Probably an incredibly niche case but it's the one missing case ignoring
+    /// lazy
+    UpDown,
+}
+
+impl MemoryUsage {
+    /// Determine if the current memory usage type requires
+    pub fn is_host_visible(&self) -> bool {
+        !matches!(self, Self::GpuOnly)
+    }
 }
 
 /// A logical Vulkan device and its associated per-device state.
 ///
-/// Wraps an `ash::Device`, a `gpu-allocator` allocator (behind a `Mutex`),
-/// extension loaders for swapchain / dynamic rendering / synchronization2 /
-/// debug utils, and the graphics+present queue.
+/// Wraps an `ash::Device`, a VMA allocator, extension loaders for swapchain /
+/// dynamic rendering / synchronization2 / debug utils, and the
+/// graphics+present queue.
 ///
 /// Constructed via [`Device::create_compatible`], which selects the best
 /// physical device by priority (discrete > integrated). Raw Vulkan operations
@@ -100,7 +108,7 @@ pub enum MemoryUsage {
 #[allow(dead_code)]
 pub struct Device {
     parent: Arc<Instance>,
-    allocator: Option<Mutex<Allocator>>,
+    allocator: Option<Allocator>,
     handle: ash::Device,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     properties: vk::PhysicalDeviceProperties,
@@ -205,7 +213,7 @@ pub enum CreateCompatibleError {
     PhysDevFeatures2Required(String),
 
     #[error("Failed to create GPU allocator: {0}")]
-    AllocatorCreation(AllocationError),
+    AllocatorCreation(vk::Result),
 
     #[error(
         "No suitable device supports the requested sample count \
@@ -295,6 +303,33 @@ impl std::fmt::Display for QueueConfig {
     }
 }
 
+/// Opaque handle to a VMA memory allocation.
+///
+/// Created by [`Device::create_raw_buffer_allocated`] or
+/// [`Device::create_raw_image_allocated`]. Must be destroyed alongside the
+/// buffer or image it was created with.
+pub(crate) struct Allocation(vk_mem::Allocation);
+
+impl Allocation {
+    /// Returns the mapped pointer for host-visible allocations, or `None`
+    /// if the allocation is not persistently mapped.
+    pub(crate) fn mapped_ptr(
+        &self,
+        device: &Device,
+    ) -> Option<std::ptr::NonNull<std::ffi::c_void>> {
+        let allocator = device
+            .allocator
+            .as_ref()
+            .expect("allocator is dropped only during Device::drop");
+        let info = allocator.get_allocation_info(&self.0);
+        std::ptr::NonNull::new(info.mapped_data)
+    }
+}
+
+/// Error returned when VMA fails to create a buffer or image with memory.
+#[derive(Debug, Error)]
+#[error("allocation failed: {0}")]
+pub struct AllocateMemoryError(pub vk::Result);
 #[derive(Debug, Default)]
 pub struct DeviceConfig {
     pub swapchain: bool,
@@ -1124,19 +1159,21 @@ impl Device {
         let transfer_queues = family_queues[&transfer_family].clone();
         let compute_queues = family_queues[&compute_family].clone();
 
-        let allocator = Allocator::new(&AllocatorCreateDesc {
-            instance: instance.ash_instance().clone(),
-            device: device.clone(),
-            physical_device,
-            debug_settings: Default::default(),
-            buffer_device_address: false,
-            allocation_sizes: Default::default(),
-        })
+        // SAFETY: instance, device, and physical_device are valid for the
+        // lifetime of the allocator, which is owned by Device and dropped
+        // before vkDestroyDevice (see Device::drop).
+        let allocator = unsafe {
+            Allocator::new(VmaAllocatorCreateInfo::new(
+                instance.ash_instance(),
+                &device,
+                physical_device,
+            ))
+        }
         .map_err(CreateCompatibleError::AllocatorCreation)?;
 
         Ok(Self {
             parent: instance.clone(),
-            allocator: Some(Mutex::new(allocator)),
+            allocator: Some(allocator),
             memory_properties,
             properties: best.props,
             swapchain_device: if config.swapchain {
@@ -1213,10 +1250,6 @@ impl Device {
     }
 
     #[inline]
-    pub fn non_coherent_atom_size(&self) -> vk::DeviceSize {
-        self.properties.limits.non_coherent_atom_size
-    }
-
     /// Return the first format in `candidates` that supports
     /// `DEPTH_STENCIL_ATTACHMENT` in optimal tiling, or `None` if none do.
     pub fn find_depth_format(
@@ -1240,122 +1273,140 @@ impl Device {
         })
     }
 
-    /// Score a memory type for a given usage; returns `None` if the type is
-    /// incompatible.  Higher scores are more preferred.
-    fn score_memory_type(
-        flags: vk::MemoryPropertyFlags,
-        usage: MemoryUsage,
-    ) -> Option<u32> {
-        use vk::MemoryPropertyFlags as F;
-        let device_local = flags.contains(F::DEVICE_LOCAL);
-        let host_visible = flags.contains(F::HOST_VISIBLE);
-        let host_cached = flags.contains(F::HOST_CACHED);
+    fn alloc_create_info(usage: MemoryUsage) -> AllocationCreateInfo {
+        use vk_mem::MemoryUsage as VmaUsage;
         match usage {
-            MemoryUsage::GpuOnly => {
-                // Prefer pure VRAM; penalise HOST_VISIBLE (unified).
-                device_local.then_some(if host_visible { 1 } else { 2 })
-            }
-            MemoryUsage::CpuToGpu => {
-                // Prefer DEVICE_LOCAL (ReBAR / unified memory).
-                host_visible.then_some(if device_local { 2 } else { 1 })
-            }
-            MemoryUsage::GpuToCpu => {
-                // Prefer HOST_CACHED for efficient CPU reads.
-                host_visible.then_some(if host_cached { 2 } else { 1 })
-            }
+            MemoryUsage::GpuOnly => AllocationCreateInfo {
+                usage: VmaUsage::AutoPreferDevice,
+                ..Default::default()
+            },
+            MemoryUsage::Upload => AllocationCreateInfo {
+                usage: VmaUsage::Auto,
+                flags: AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                    | AllocationCreateFlags::MAPPED,
+                ..Default::default()
+            },
+            MemoryUsage::HostVisibleBind => AllocationCreateInfo {
+                usage: VmaUsage::Auto,
+                flags: AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                    | AllocationCreateFlags::MAPPED,
+                preferred_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                ..Default::default()
+            },
+            MemoryUsage::Download => AllocationCreateInfo {
+                usage: VmaUsage::Auto,
+                flags: AllocationCreateFlags::HOST_ACCESS_RANDOM
+                    | AllocationCreateFlags::MAPPED,
+                ..Default::default()
+            },
+            MemoryUsage::UpDown => AllocationCreateInfo {
+                usage: VmaUsage::Auto,
+                flags: AllocationCreateFlags::HOST_ACCESS_RANDOM
+                    | AllocationCreateFlags::MAPPED,
+                ..Default::default()
+            },
         }
     }
 
-    /// Select the best Vulkan memory type index for `requirements` and `usage`.
-    /// Among types with equal score the lowest index wins, matching Vulkan's
-    /// convention that earlier types in the list are more preferred within the
-    /// same heap.
-    fn select_memory_type(
-        &self,
-        requirements: vk::MemoryRequirements,
-        usage: MemoryUsage,
-    ) -> Option<u32> {
-        self.memory_properties.memory_types
-            [..self.memory_properties.memory_type_count as usize]
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| requirements.memory_type_bits & (1 << i) != 0)
-            .filter_map(|(i, ty)| {
-                Self::score_memory_type(ty.property_flags, usage)
-                    .map(|s| (i as u32, s))
-            })
-            .max_by(|(i1, s1), (i2, s2)| s1.cmp(s2).then(i2.cmp(i1)))
-            .map(|(i, _)| i)
-    }
-
-    /// Allocate device memory for the given requirements.
+    /// Create a `VkBuffer` and bind it to a VMA allocation in one call.
     ///
-    /// Selects the best-matching Vulkan memory type for `usage`, narrows
-    /// `requirements.memory_type_bits` to that type, then rounds `size` and
-    /// `alignment` up to `VkPhysicalDeviceLimits::nonCoherentAtomSize` only
-    /// when the chosen type is HOST_VISIBLE but not HOST_COHERENT.
-    pub fn allocate_memory(
+    /// Returns `(buffer, allocation)`. The allocation's mapped pointer is
+    /// available via [`Allocation::mapped_ptr`] for host-visible usages.
+    ///
+    /// # Safety
+    /// `buffer_info` must be valid. The returned buffer and allocation must
+    /// be destroyed together via [`destroy_raw_buffer_allocated`].
+    pub(crate) unsafe fn create_raw_buffer_allocated(
         &self,
-        name: &str,
-        requirements: vk::MemoryRequirements,
+        buffer_info: &vk::BufferCreateInfo<'_>,
         usage: MemoryUsage,
-        linear: bool,
-    ) -> Result<Allocation, AllocationError> {
-        let atom = self.properties.limits.non_coherent_atom_size;
-        let requirements =
-            if let Some(idx) = self.select_memory_type(requirements, usage) {
-                use vk::MemoryPropertyFlags as F;
-                let flags = self.memory_properties.memory_types[idx as usize]
-                    .property_flags;
-                let non_coherent_visible = flags.contains(F::HOST_VISIBLE)
-                    && !flags.contains(F::HOST_COHERENT);
-                let (size, alignment) = if non_coherent_visible {
-                    (
-                        requirements.size.div_ceil(atom) * atom,
-                        requirements.alignment.max(atom),
-                    )
-                } else {
-                    (requirements.size, requirements.alignment)
-                };
-                vk::MemoryRequirements {
-                    size,
-                    alignment,
-                    memory_type_bits: 1 << idx,
-                }
-            } else {
-                requirements
-            };
-        let location = match usage {
-            MemoryUsage::GpuOnly => MemoryLocation::GpuOnly,
-            MemoryUsage::CpuToGpu => MemoryLocation::CpuToGpu,
-            MemoryUsage::GpuToCpu => MemoryLocation::GpuToCpu,
-        };
+    ) -> Result<(vk::Buffer, Allocation), AllocateMemoryError> {
+        let alloc_info = Self::alloc_create_info(usage);
         let allocator = self
             .allocator
             .as_ref()
-            .expect("allocator is dropped only during Device::drop")
-            .lock();
-        let mut allocator = allocator;
-        allocator.allocate(&AllocationCreateDesc {
-            name,
-            requirements,
-            location,
-            linear,
-            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
-        })
+            .expect("allocator is dropped only during Device::drop");
+        // SAFETY: buffer_info is valid per caller contract; allocator is live.
+        unsafe { allocator.create_buffer(buffer_info, &alloc_info) }
+            .map(|(buf, a)| (buf, Allocation(a)))
+            .map_err(AllocateMemoryError)
     }
 
-    pub fn free_memory(
+    /// Destroy a buffer and free its VMA allocation.
+    ///
+    /// # Safety
+    /// `buffer` and `allocation` must have been created together by
+    /// [`create_raw_buffer_allocated`] on this device, and must not be in
+    /// use by the GPU.
+    pub(crate) unsafe fn destroy_raw_buffer_allocated(
         &self,
-        allocation: Allocation,
-    ) -> Result<(), AllocationError> {
+        buffer: vk::Buffer,
+        allocation: &mut Allocation,
+    ) {
         let allocator = self
             .allocator
             .as_ref()
-            .expect("allocator is dropped only during Device::drop")
-            .lock();
-        let mut allocator = allocator;
-        allocator.free(allocation)
+            .expect("allocator is dropped only during Device::drop");
+        // SAFETY: Caller guarantees buffer and allocation validity.
+        unsafe { allocator.destroy_buffer(buffer, &mut allocation.0) };
+    }
+
+    /// Create a `VkImage` and bind it to a VMA allocation in one call.
+    ///
+    /// # Safety
+    /// `image_info` must be valid. The returned image and allocation must
+    /// be destroyed together via [`destroy_raw_image_allocated`].
+    pub(crate) unsafe fn create_raw_image_allocated(
+        &self,
+        image_info: &vk::ImageCreateInfo<'_>,
+        usage: MemoryUsage,
+    ) -> Result<(vk::Image, Allocation), AllocateMemoryError> {
+        let alloc_info = Self::alloc_create_info(usage);
+        let allocator = self
+            .allocator
+            .as_ref()
+            .expect("allocator is dropped only during Device::drop");
+        // SAFETY: image_info is valid per caller contract; allocator is live.
+        unsafe { allocator.create_image(image_info, &alloc_info) }
+            .map(|(img, a)| (img, Allocation(a)))
+            .map_err(AllocateMemoryError)
+    }
+
+    /// Destroy an image and free its VMA allocation.
+    ///
+    /// # Safety
+    /// `image` and `allocation` must have been created together by
+    /// [`create_raw_image_allocated`] on this device, and must not be in
+    /// use by the GPU.
+    pub(crate) unsafe fn destroy_raw_image_allocated(
+        &self,
+        image: vk::Image,
+        allocation: &mut Allocation,
+    ) {
+        let allocator = self
+            .allocator
+            .as_ref()
+            .expect("allocator is dropped only during Device::drop");
+        // SAFETY: Caller guarantees image and allocation validity.
+        unsafe { allocator.destroy_image(image, &mut allocation.0) };
+    }
+
+    /// Flush a range of a host-visible allocation.
+    ///
+    /// Delegates to VMA, which handles non-coherent atom alignment
+    /// internally. Pass `vk::WHOLE_SIZE` for `size` to flush the
+    /// entire allocation.
+    pub(crate) fn flush_allocation(
+        &self,
+        allocation: &Allocation,
+        offset: vk::DeviceSize,
+        size: vk::DeviceSize,
+    ) -> Result<(), vk::Result> {
+        let allocator = self
+            .allocator
+            .as_ref()
+            .expect("allocator is dropped only during Device::drop");
+        allocator.flush_allocation(&allocation.0, offset, size)
     }
 
     #[inline]
@@ -1466,36 +1517,6 @@ impl Device {
     pub unsafe fn destroy_raw_image(&self, image: vk::Image) {
         // SAFETY: Caller guarantees image provenance and drop ordering.
         unsafe { self.handle.destroy_image(image, None) };
-    }
-
-    /// Query memory requirements for an image.
-    ///
-    /// # Safety
-    /// `image` must be a valid handle created from this device.
-    #[inline]
-    pub unsafe fn get_raw_image_memory_requirements(
-        &self,
-        image: vk::Image,
-    ) -> vk::MemoryRequirements {
-        // SAFETY: Caller guarantees image validity.
-        unsafe { self.handle.get_image_memory_requirements(image) }
-    }
-
-    /// Bind device memory to an image.
-    ///
-    /// # Safety
-    /// `image` and `memory` must both be valid handles created from this
-    /// device. `offset` must satisfy alignment/size requirements from
-    /// `vkGetImageMemoryRequirements`.
-    #[inline]
-    pub unsafe fn bind_raw_image_memory(
-        &self,
-        image: vk::Image,
-        memory: vk::DeviceMemory,
-        offset: vk::DeviceSize,
-    ) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees image, memory, and offset validity.
-        unsafe { self.handle.bind_image_memory(image, memory, offset) }
     }
 
     /// Create a `VkSampler`.
@@ -4189,91 +4210,6 @@ impl Device {
     pub unsafe fn destroy_raw_buffer(&self, buffer: vk::Buffer) {
         // SAFETY: Caller guarantees buffer provenance and drop ordering.
         unsafe { self.handle.destroy_buffer(buffer, None) };
-    }
-
-    /// Query memory requirements for a buffer.
-    ///
-    /// # Safety
-    /// `buffer` must be a valid handle created from this device.
-    #[inline]
-    pub unsafe fn get_raw_buffer_memory_requirements(
-        &self,
-        buffer: vk::Buffer,
-    ) -> vk::MemoryRequirements {
-        // SAFETY: Caller guarantees buffer validity.
-        unsafe { self.handle.get_buffer_memory_requirements(buffer) }
-    }
-
-    /// # Safety
-    /// `allocate_info` must be valid and describe a memory type index supported
-    /// by this device.
-    #[inline]
-    pub unsafe fn allocate_raw_memory(
-        &self,
-        allocate_info: &vk::MemoryAllocateInfo<'_>,
-    ) -> Result<vk::DeviceMemory, vk::Result> {
-        // SAFETY: Caller guarantees allocation info validity.
-        unsafe { self.handle.allocate_memory(allocate_info, None) }
-    }
-
-    /// # Safety
-    /// `memory` must be a valid handle created from this device and not yet
-    /// freed. No object may still be bound to `memory` at free time.
-    #[inline]
-    pub unsafe fn free_raw_memory(&self, memory: vk::DeviceMemory) {
-        // SAFETY: Caller guarantees memory provenance and drop ordering.
-        unsafe { self.handle.free_memory(memory, None) };
-    }
-
-    /// # Safety
-    /// `buffer` and `memory` must both be valid handles created from this
-    /// device. `offset` must satisfy alignment/size requirements from
-    /// `vkGetBufferMemoryRequirements`.
-    #[inline]
-    pub unsafe fn bind_raw_buffer_memory(
-        &self,
-        buffer: vk::Buffer,
-        memory: vk::DeviceMemory,
-        offset: vk::DeviceSize,
-    ) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees handle validity and offset constraints.
-        unsafe { self.handle.bind_buffer_memory(buffer, memory, offset) }
-    }
-
-    /// # Safety
-    /// `memory` must be a valid allocation from this device. The mapped range
-    /// (`offset`, `size`) must be within the allocation and obey host access
-    /// synchronization requirements.
-    #[inline]
-    pub unsafe fn map_raw_memory(
-        &self,
-        memory: vk::DeviceMemory,
-        offset: vk::DeviceSize,
-        size: vk::DeviceSize,
-        flags: vk::MemoryMapFlags,
-    ) -> Result<*mut std::ffi::c_void, vk::Result> {
-        // SAFETY: Caller guarantees mapping preconditions.
-        unsafe { self.handle.map_memory(memory, offset, size, flags) }
-    }
-
-    /// # Safety
-    /// Every range in `memory_ranges` must reference memory allocations from
-    /// this device and satisfy Vulkan flush requirements.
-    #[inline]
-    pub unsafe fn flush_raw_mapped_memory_ranges(
-        &self,
-        memory_ranges: &[vk::MappedMemoryRange<'_>],
-    ) -> Result<(), vk::Result> {
-        // SAFETY: Caller guarantees memory range validity.
-        unsafe { self.handle.flush_mapped_memory_ranges(memory_ranges) }
-    }
-
-    /// # Safety
-    /// `memory` must currently be mapped on this device.
-    #[inline]
-    pub unsafe fn unmap_raw_memory(&self, memory: vk::DeviceMemory) {
-        // SAFETY: Caller guarantees memory is currently mapped.
-        unsafe { self.handle.unmap_memory(memory) };
     }
 }
 
