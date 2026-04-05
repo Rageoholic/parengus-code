@@ -20,7 +20,7 @@ struct MaterialGpu
     uint albedo_idx;
     uint normal_idx;
     uint orm_idx;
-    int  emissive_idx; // negative = no emissive texture
+    int emissive_idx; // negative = no emissive texture
 };
 
 [[vk::binding(1, 1)]]
@@ -71,5 +71,6 @@ float4 frag_main(VertexOutput in_vert) : SV_Target
     // Normal, ORM, and emissive channels are wired up here but shading
     // is deferred to t023 (Blinn-Phong shader path).
     MaterialGpu mat = materials[push.material_idx];
-    return textures[mat.albedo_idx].Sample(in_vert.tex_coord);
+    let sample = textures[mat.albedo_idx].Sample(in_vert.tex_coord);
+    return sample;
 }

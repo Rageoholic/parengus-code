@@ -56,11 +56,10 @@ The vertex/index buffer and texture table are therefore mutable at runtime,
 unlike the mission renderer. The draw list is rebuilt CPU-side each frame based
 on which cache slots are live.
 
-**Vertex/index buffer.** The mission buffer is freed at garage entry
-(see Memory pressure section), and the garage allocates its own
-vertex/index buffer sized to its current streaming cache. This lets the
-garage manage its buffer lifecycle independently — including shrinking
-under memory pressure — without affecting mission data.
+**Vertex/index buffer.** The mission buffer is freed at garage entry,
+and the garage allocates its own vertex/index buffer sized to its
+current streaming cache. This lets the garage manage its buffer
+lifecycle independently without affecting mission data.
 
 **Lighting.** Supports dynamic light changes (e.g. per-part preview lighting
 rigs). The PBR shader is shared with the mission renderer via the common shader
@@ -110,26 +109,26 @@ The active renderer changes at well-defined transition points (mission load,
 garage entry, etc.). The UI system persists across transitions; only the
 rendering mode (offscreen vs. direct) changes.
 
-## Memory pressure (Android)
+## Notes for constrained platforms (not currently targeted)
 
-On Android, `winit` (via `android-activity`) surfaces a `MemoryWarning`
-event. The garage renderer is a separate renderer that owns its own
-vertex/index buffer (allocated fresh at garage entry after the mission
-buffer is freed) and can shrink that allocation dynamically under pressure:
-evict some or all cached parts, free the VkBuffer, and reallocate a smaller
-one. Evicted parts reload on next access. Mission and loading screen
-renderers have no purgeable cache and ignore the warning.
+The following describes design options for memory-constrained targets
+(e.g. Android) that are not implemented and not planned for the near
+term. Preserved for reference if platform targets change.
 
-The mission vertex/index buffer is not a candidate for shrinking under
-memory pressure: the issue is not performance (`vkAllocateMemory` /
-`vkFreeMemory` are cheap one-time operations) but peak usage — resizing
-requires allocating the replacement before freeing the old one, so both
-are live simultaneously at the worst possible moment. The buffer is sized
-to the largest mission loaded in the current session (high-water mark). It
-is freed outright at garage entry; the garage allocates its own independent
-buffer. At the next mission load, the mission buffer is reallocated sized
-to that mission's assets (fine behind a loading screen), so the high-water
-mark can shrink naturally over a session.
+### Dynamic eviction in the garage renderer
+
+On platforms that surface a memory warning event (e.g. Android via
+`winit`/`android-activity` `MemoryWarning`), the garage renderer could
+respond by evicting some or all cached parts: free the VkBuffer and
+reallocate a smaller one. Evicted parts reload on next access. Mission
+and loading screen renderers have no purgeable cache.
+
+The mission vertex/index buffer is not a good candidate for shrinking
+under pressure: resizing requires allocating the replacement before
+freeing the old one, so both are live simultaneously at the worst
+possible moment. The buffer follows a high-water-mark policy — sized
+to the largest mission loaded in the current session, freed at garage
+entry, and reallocated fresh at the next mission load.
 
 If the combined mission buffer + garage working set does not fit on a
 target device, that is a memory budget problem to address at design time.

@@ -1,0 +1,22 @@
+[package]
+name = "parengus-util"
+version = "0.1.0"
+edition = "2024"
+description = "Tiny convenience utilities shared across parengus crates"
+license = "MPL-2.0"
+repository = "https://github.com/Rageoholic/parengus-code"
+
+# Dependency policy: only crates so ubiquitous as to be practically
+# universal (e.g. parking_lot, thiserror). No domain-specific crates
+# (graphics, audio, asset, etc.) belong here.
+[features]
+# Enable nightly-only optimisations (e.g. algebraic float intrinsics).
+# Requires a nightly toolchain.
+nightly = []
+
+[dependencies]
+libm = "0.2"
+num-traits = "0.2"
+
+[dev-dependencies]
+proptest = "1"

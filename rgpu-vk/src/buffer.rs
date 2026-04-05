@@ -19,11 +19,10 @@ use std::sync::Arc;
 
 use ash::vk;
 use bytemuck::Pod;
-use gpu_allocator::{AllocationError, vulkan::Allocation};
 use thiserror::Error;
 
 use crate::command::ResettableCommandBuffer;
-use crate::device::{Device, MemoryUsage};
+use crate::device::{AllocateMemoryError, Allocation, Device, MemoryUsage};
 
 /// Trait for types that expose a raw `VkBuffer` handle.
 ///
@@ -47,14 +46,8 @@ where
 
 #[derive(Debug, Error)]
 pub enum CreateBufferError {
-    #[error("Vulkan error creating buffer: {0}")]
-    CreateBuffer(vk::Result),
-
     #[error("GPU allocator error allocating memory: {0}")]
-    AllocateMemory(AllocationError),
-
-    #[error("Vulkan error binding buffer memory: {0}")]
-    BindMemory(vk::Result),
+    AllocateMemory(AllocateMemoryError),
 }
 
 #[derive(Debug, Error)]
@@ -129,43 +122,15 @@ impl AllocatedBuffer {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         // SAFETY: create_info is fully initialised and has no borrowed data.
-        let handle = unsafe { device.create_raw_buffer(&create_info) }
-            .map_err(CreateBufferError::CreateBuffer)?;
+        let (handle, allocation) = unsafe {
+            device.create_raw_buffer_allocated(&create_info, memory_usage)
+        }
+        .map_err(CreateBufferError::AllocateMemory)?;
 
         // SAFETY: handle is a valid buffer created from device.
         let name_result = unsafe { device.set_object_name_str(handle, name) };
         if let Err(e) = name_result {
             tracing::warn!("Failed to name buffer {:?}: {e}", handle);
-        }
-
-        // SAFETY: handle is a valid buffer created from this device.
-        let reqs = unsafe { device.get_raw_buffer_memory_requirements(handle) };
-        let allocation_name = name.unwrap_or("buffer");
-        let allocation = device
-            .allocate_memory(allocation_name, reqs, memory_usage, true)
-            .map_err(|e| {
-                // SAFETY: handle was created from this device and is not bound
-                // to memory yet.
-                unsafe { device.destroy_raw_buffer(handle) };
-                CreateBufferError::AllocateMemory(e)
-            })?;
-
-        // SAFETY: handle and allocation memory are valid and belong to this
-        // device.
-        let bind_result = unsafe {
-            device.bind_raw_buffer_memory(
-                handle,
-                allocation.memory(),
-                allocation.offset(),
-            )
-        };
-        if let Err(e) = bind_result {
-            let _ = device.free_memory(allocation);
-            // SAFETY: handle is valid and owned by this scope.
-            unsafe {
-                device.destroy_raw_buffer(handle);
-            }
-            return Err(CreateBufferError::BindMemory(e));
         }
 
         Ok(Self {
@@ -209,15 +174,13 @@ impl AllocatedBuffer {
 impl Drop for AllocatedBuffer {
     fn drop(&mut self) {
         tracing::debug!("Dropping buffer {:?}", self.handle);
-        // SAFETY: handle was created from parent and is owned by this wrapper.
-        unsafe {
-            self.parent.destroy_raw_buffer(self.handle);
-        }
-
-        if let Some(allocation) = self.allocation.take()
-            && let Err(e) = self.parent.free_memory(allocation)
-        {
-            tracing::error!("Failed to free GPU allocation: {e}");
+        if let Some(mut allocation) = self.allocation.take() {
+            // SAFETY: buffer and allocation were created together by
+            // create_raw_buffer_allocated and are no longer in use.
+            unsafe {
+                self.parent
+                    .destroy_raw_buffer_allocated(self.handle, &mut allocation);
+            }
         }
     }
 }
@@ -245,14 +208,14 @@ impl HostVisibleBuffer {
             size,
             usage,
             name,
-            MemoryUsage::CpuToGpu,
+            MemoryUsage::Upload,
         )?;
         Ok(Self {
             ptr: inner
                 .allocation
                 .as_ref()
                 .expect("Allocation can only be null during drop")
-                .mapped_ptr()
+                .mapped_ptr(device)
                 .expect(
                     "Allocation was created to be mapped and yet it was not",
                 )
@@ -358,36 +321,16 @@ impl HostVisibleBuffer {
             written += len;
         }
 
-        // Flush non-coherent memory from the start of the dirty range
-        // (aligned down) to the end (aligned up).
-        let is_coherent = allocation
-            .memory_properties()
-            .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
-        if !is_coherent && written > 0 {
-            let atom = self.inner.parent.non_coherent_atom_size();
-            debug_assert_eq!(allocation.offset() % atom, 0);
-            debug_assert_eq!(allocation.size() % atom, 0);
-            // Round the dirty start down and dirty end up to atom
-            // boundaries. allocation.offset() is atom-aligned so
-            // flush_offset is too.
-            let dirty_start = (byte_offset as vk::DeviceSize / atom) * atom;
-            let dirty_end = ((byte_offset + written) as vk::DeviceSize)
-                .div_ceil(atom)
-                * atom;
-            let flush_range = vk::MappedMemoryRange::default()
-                // SAFETY: Allocation is currently live.
-                .memory(unsafe { allocation.memory() })
-                .offset(allocation.offset() + dirty_start)
-                .size(dirty_end - dirty_start);
-            // SAFETY: Allocation is currently live. flush range is
-            // aligned to non_coherent_atom_size (guaranteed above),
-            // and offset + size is within the buffer.
-            unsafe {
-                self.inner.parent.flush_raw_mapped_memory_ranges(
-                    std::slice::from_ref(&flush_range),
+        if written > 0 {
+            // VMA handles non-coherent atom alignment internally.
+            self.inner
+                .parent
+                .flush_allocation(
+                    allocation,
+                    byte_offset as vk::DeviceSize,
+                    written as vk::DeviceSize,
                 )
-            }
-            .map_err(WriteBufferError::FlushMemory)?;
+                .map_err(WriteBufferError::FlushMemory)?;
         }
 
         Ok(())

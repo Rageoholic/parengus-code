@@ -5,6 +5,7 @@ members = [
     "asset-pipeline",
     "asset-shared",
     "parengus-tracing",
+    "parengus-util",
     "phoenix",
     "rgpu-vk",
     "samp-app",

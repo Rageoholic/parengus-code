@@ -14,7 +14,10 @@ parking_lot = "0.12"
 ash = "0.38"
 ash-window = "0.13"
 bytemuck = "1.25.0"
-gpu-allocator = "0.28.0"
 raw-window-handle = { version = "0.6", features = ["std"] }
 thiserror = "2"
 tracing = "0.1"
+vk-mem = "0.5.0"
+
+[dev-dependencies]
+proptest = "1"
