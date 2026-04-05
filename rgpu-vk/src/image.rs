@@ -11,8 +11,11 @@ use ash::vk;
 use thiserror::Error;
 
 use crate::buffer::HostVisibleBuffer;
-use crate::command::ResettableCommandBuffer;
-use crate::device::{AllocateMemoryError, Allocation, Device, MemoryUsage};
+use crate::command::{Recordable, Recorder};
+use crate::device::{
+    AllocateMemoryError, Allocation, Device, MemoryUsage,
+    SupportsTransfer,
+};
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -445,15 +448,15 @@ impl DeviceLocalImage {
     ///   usage.
     /// - The caller must ensure `src` and `self` remain alive until GPU
     ///   execution of the submitted commands has completed.
-    pub(crate) unsafe fn record_upload_from(
+    pub(crate) unsafe fn record_upload_from<Q, B>(
         &self,
-        command_buffer: &mut ResettableCommandBuffer,
+        recorder: &mut Recorder<'_, Q, B>,
         src: &HostVisibleBuffer,
-    ) -> Result<(), RecordCopyFromError> {
-        debug_assert_eq!(
-            command_buffer.state(),
-            crate::command::CommandBufferState::Recording
-        );
+    ) -> Result<(), RecordCopyFromError>
+    where
+        Q: SupportsTransfer,
+        B: Recordable<Q>,
+    {
         let texel_size = format_texel_size(self.inner.format)
             .ok_or(RecordCopyFromError::UnknownFormat(self.inner.format))?;
         let extent = self.inner.extent;
@@ -469,14 +472,9 @@ impl DeviceLocalImage {
             });
         }
 
-        let raw_cmd = command_buffer.raw();
-        let device = &self.inner.parent;
         let image = self.inner.handle;
 
-        // NOTE: layout transitions are performed by the caller; this
-        // function only records the buffer→image copy.
-
-        // Copy buffer → image
+        // NOTE: layout transitions are performed by the caller.
         let subresource_layers = vk::ImageSubresourceLayers::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .mip_level(0)
@@ -489,11 +487,10 @@ impl DeviceLocalImage {
             .image_subresource(subresource_layers)
             .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
             .image_extent(extent);
-        // SAFETY: caller guarantees recording state; src buffer and
-        // image are valid and in the correct layouts.
+        // SAFETY: caller guarantees active recording session; src
+        // buffer and image are valid and in the correct layouts.
         unsafe {
-            device.cmd_copy_buffer_to_image(
-                raw_cmd,
+            recorder.copy_buffer_to_image(
                 src.raw_buffer(),
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -501,41 +498,33 @@ impl DeviceLocalImage {
             )
         };
 
-        // NOTE: caller must perform any required layout transition
-        // after the copy (e.g. TRANSFER_DST_OPTIMAL →
-        // SHADER_READ_ONLY_OPTIMAL).
-
         Ok(())
     }
 
     /// Record a buffer-to-image copy for one mip level.
     ///
-    /// Infallible — no size validation is performed (required because
+    /// Infallible — no size validation (required because
     /// `format_texel_size` returns `None` for block-compressed
     /// formats).
     ///
     /// # Safety
-    /// - `command_buffer` must be in the recording state.
     /// - `src` must be created with `TRANSFER_SRC` usage.
     /// - The image must be in `TRANSFER_DST_OPTIMAL` layout.
     /// - `buffer_offset` + the byte size of `mip_extent` at this
     ///   format must not exceed `src.size()`.
     /// - The caller must ensure `src` and `self` remain alive until
     ///   GPU execution of the submitted commands has completed.
-    pub(crate) unsafe fn record_upload_mip_from(
+    pub(crate) unsafe fn record_upload_mip_from<Q, B>(
         &self,
-        command_buffer: &mut ResettableCommandBuffer,
+        recorder: &mut Recorder<'_, Q, B>,
         src: &HostVisibleBuffer,
         buffer_offset: vk::DeviceSize,
         mip_level: u32,
         mip_extent: vk::Extent3D,
-    ) {
-        debug_assert_eq!(
-            command_buffer.state(),
-            crate::command::CommandBufferState::Recording
-        );
-        let raw_cmd = command_buffer.raw();
-        let device = &self.inner.parent;
+    ) where
+        Q: SupportsTransfer,
+        B: Recordable<Q>,
+    {
         let image = self.inner.handle;
 
         let subresource_layers = vk::ImageSubresourceLayers::default()
@@ -550,11 +539,10 @@ impl DeviceLocalImage {
             .image_subresource(subresource_layers)
             .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
             .image_extent(mip_extent);
-        // SAFETY: caller guarantees recording state; src buffer and
-        // image are valid and in the correct layouts.
+        // SAFETY: caller guarantees active recording session; src
+        // buffer and image are valid and in the correct layouts.
         unsafe {
-            device.cmd_copy_buffer_to_image(
-                raw_cmd,
+            recorder.copy_buffer_to_image(
                 src.raw_buffer(),
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -742,13 +730,17 @@ impl Texture {
     /// - The caller must ensure `src` and `self` remain alive until GPU
     ///   execution of the submitted commands has completed.
     /// - Image must be in the layout TRANSFER_DST_OPTIMAL
-    pub unsafe fn record_copy_from(
+    pub unsafe fn record_copy_from<Q, B>(
         &self,
-        command_buffer: &mut ResettableCommandBuffer,
+        recorder: &mut Recorder<'_, Q, B>,
         src: &HostVisibleBuffer,
-    ) -> Result<(), RecordCopyFromError> {
+    ) -> Result<(), RecordCopyFromError>
+    where
+        Q: SupportsTransfer,
+        B: Recordable<Q>,
+    {
         // SAFETY: caller upholds the same preconditions.
-        unsafe { self.image.record_upload_from(command_buffer, src) }
+        unsafe { self.image.record_upload_from(recorder, src) }
     }
 
     /// Record a buffer-to-image copy for a single mip level.
@@ -761,18 +753,21 @@ impl Texture {
     /// Same as [`record_copy_from`](Self::record_copy_from), except
     /// `buffer_offset`, `mip_level`, and `mip_extent` select which
     /// mip and which region of the staging buffer to use.
-    pub unsafe fn record_copy_mip_from(
+    pub unsafe fn record_copy_mip_from<Q, B>(
         &self,
-        command_buffer: &mut ResettableCommandBuffer,
+        recorder: &mut Recorder<'_, Q, B>,
         src: &HostVisibleBuffer,
         buffer_offset: vk::DeviceSize,
         mip_level: u32,
         mip_extent: vk::Extent3D,
-    ) {
+    ) where
+        Q: SupportsTransfer,
+        B: Recordable<Q>,
+    {
         // SAFETY: caller upholds the same preconditions.
         unsafe {
             self.image.record_upload_mip_from(
-                command_buffer,
+                recorder,
                 src,
                 buffer_offset,
                 mip_level,

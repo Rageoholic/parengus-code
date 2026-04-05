@@ -1,115 +1,94 @@
-# Project Instructions
 
-## Repo Initialization
+# Project CLAUDE
 
-After cloning, activate the project's git hooks:
+Short machine-focused pointers. For concise LLM guidance read the
+per-crate `CLAUDE.md` files in each crate root (one-line summaries
+tailored for tools/LLMs). Do not assume the human-facing README is
+the machine summary.
 
+Per-crate CLAUDE files:
+- [rgpu-vk/CLAUDE.md](rgpu-vk/CLAUDE.md)
+- [phoenix/CLAUDE.md](phoenix/CLAUDE.md)
+- [samp-app/CLAUDE.md](samp-app/CLAUDE.md)
+- [samp-app-noext/CLAUDE.md](samp-app-noext/CLAUDE.md)
+- [parengus-tracing/CLAUDE.md](parengus-tracing/CLAUDE.md)
+- [parengus-util/CLAUDE.md](parengus-util/CLAUDE.md)
+- [asset-compiler/CLAUDE.md](asset-compiler/CLAUDE.md)
+- [asset-loader/CLAUDE.md](asset-loader/CLAUDE.md)
+- [asset-pipeline/CLAUDE.md](asset-pipeline/CLAUDE.md)
+- [asset-shared/CLAUDE.md](asset-shared/CLAUDE.md)
+- [xtask/CLAUDE.md](xtask/CLAUDE.md)
+
+Note: Not every crate is required to include a `CLAUDE.md`. If a crate
+does not include one, that simply means there is no crate-specific
+policy documented yet.
+
+Quick checks (run per-crate before PRs):
+```
+cargo clippy -p <crate> --all-targets -- -D warnings
+cargo check -p <crate>
+```
+
+Repo setup (one-time):
 ```
 git config core.hooksPath .githooks
 ```
 
-## Structure
-- Cargo workspace with `resolver = "3"`, `edition = "2024"`
-- Members: `rgpu-vk` (Vulkan wrapper lib using ash),
-  `samp-app` (sample app using winit),
-  `samp-app-noext` (same scene, VK 1.0 core APIs only)
-- CI: GitHub Actions at `.github/workflows/ci.yml` —
-  per-package clippy + workspace build + tests
-- `private/` — git submodule (`Rageoholic/parengus-private`, private
-  repo) containing the GDD and other private assets. Requires SSH
-  access to clone. Run `git submodule update --init` after cloning.
+Task graph (brief):
+- Tasks live in `.tasks/`. Read [.tasks/index.md](.tasks/index.md)
+    for the current task list and `next_id`.
+- See [.tasks/CONVENTIONS.md](.tasks/CONVENTIONS.md) for task-file
+    format and conventions.
 
-## Sibling Apps: samp-app and samp-app-noext
+AI disclosure (brief):
+- Disclose AI assistance in externally visible artifacts (issues,
+    PRs, release notes, README changes).
+- Keep a short AI attribution note in the crate README when content
+    is AI-assisted; mark AI use in the PR template.
 
-`samp-app` and `samp-app-noext` render the same scene and share the
-same structure; they differ only in which Vulkan APIs they use
-(`samp-app` uses dynamic rendering + sync2; `samp-app-noext` uses
-render passes + VK 1.0 submit). Bugs and structural patterns in one
-very likely apply to the other. When modifying either app, always
-check whether the same change is needed in its sibling.
-
-## Coding Conventions
-- `#![deny(unsafe_op_in_unsafe_fn)]` is set — all unsafe operations
-  inside `unsafe fn` must be wrapped in an explicit `unsafe {}` block.
-- Unsafe methods on wrapper types are prefixed with `raw`
-  (e.g. `create_raw_surface`). Prefer `unsafe fn` wrappers over
-  exposing raw handles directly.
-
-## Architecture
-- `Instance` wraps the ash Vulkan instance.
-- `Surface<T>` holds `Arc<Instance>` and `Arc<T>` for lifetime safety.
-- Device selection uses a priority-based fold over physical devices.
-
-## Verification
-
-Always use `cargo clippy` (not just `cargo check`) to verify code after
-writing it. CI runs clippy with `-D warnings` per package; rust-analyzer
-surfaces clippy diagnostics in the editor but Claude Code cannot observe
-them, so running clippy in the shell is the only reliable check.
-
-## Feature Unification Gotcha
-Workspace feature unification can hide missing features. Always verify
-individual crates with `cargo check -p <crate>` rather than relying on
-a workspace-level check. rust-analyzer checks the whole workspace by
-default and won't catch per-crate feature gaps.
-
-## Line Length
-
-Keep all lines ≤ 80 columns. `rustfmt.toml` enforces this for code via
-`max_width = 80`.
-
-For things rustfmt cannot wrap (comments, string literals, `#[derive(...)]`):
-- **Comments:** Wrap manually at a word boundary before column 80.
-- **String literals:** Use the escaped-newline trick (`\` at end of line
-  strips the newline and leading whitespace on the next line).
-- **Long `#[derive(...)]`:** Stable `rustfmt` does not wrap derive
-  item lists and merges split `#[derive]` attributes back into one.
-  Workaround: place `#[rustfmt::skip]` on the **item** (struct, enum,
-  etc.) — item-level skip is stable and causes rustfmt to leave the
-  entire item, including its attributes, untouched. Split the derive
-  list manually across lines as desired.
-
-Only exceed 80 columns when there is no syntactically valid way to break
-the line (e.g., a single token or URL that is itself longer than 80 chars).
-
-## Contributing
-
-Branch naming, issue templates, and PR format are defined in
-[CONTRIBUTING.md](CONTRIBUTING.md). Follow those rules when creating
-branches or opening issues and PRs on behalf of the user.
-
-## Vulkan Spec Links
-
-Always link to the multi-page Vulkan spec at `docs.vulkan.org`, not
-the single-page version at `registry.khronos.org/vulkan/specs/latest/html/vkspec.html`.
-The single-page version is tens of MB of HTML and is not usable on
-mobile or low-bandwidth connections. Many external sources (including
-LLM training data) link the single-page version — do not follow that
-pattern. Use:
-
+Vulkan spec links (brief):
+- Prefer the multi-page spec at `docs.vulkan.org`.
+- Use this URL form:
 ```
 https://docs.vulkan.org/spec/latest/chapters/<chapter>.html#<anchor>
 ```
 
-## Task Graph
+Branch / PR / Issue templates (brief):
+- Branch naming: `type/short-description` (types: `feat`, `fix`,
+    `docs`, `chore`, `refactor`, `test`). Use 2–4 kebab-case words and
+    branch from `main`.
+- Issue templates: use files under `.github/ISSUE_TEMPLATE/`.
+- PR title: `type: short description` (sentence case). Use the PR
+    template at `.github/pull_request_template.md`.
+- Author checklist (keep short): run `cargo clippy`, run tests,
+    keep lines ≤ 80 columns, avoid new `unsafe` without a safety note.
 
-This project uses a lightweight hierarchical task graph (PTG) stored
-in `.tasks/`. At the start of any planning or feature-work session:
+- **Comments:** Wrap manually at a word boundary before column 80.
 
-1. Read [`.tasks/index.md`](.tasks/index.md) for the current task
-   overview and the next available ID.
-2. Read the relevant task file(s) for context and the current plan.
-3. See [`.tasks/CONVENTIONS.md`](.tasks/CONVENTIONS.md) for the full
-   spec: file format, ID scheme, and AI interaction conventions.
+Adding a policy
+----------------
 
-When creating a new task, read `index.md` first to get `next_id`,
-then create the task file, update any parent's `children` list, and
-regenerate `index.md`.
+When adding a new policy, follow this pattern:
 
-## AI Disclosure
+1. Choose scope: `crate` or `workspace`.
+2. Write a short policy entry (1–4 lines) and a 1–2 line rationale.
+3. If `crate`-scoped: add the policy to the crate `README.md` under a
+    **Policies** or **Development Guidelines** section, and add a one-line
+    summary to the crate's `CLAUDE.md`.
+4. If `workspace`-scoped: add the policy to this file under a
+    `Workspace Policies` heading, and mention any affected crates in their
+    `CLAUDE.md` summaries.
+5. Open a PR that updates the docs and code examples, include the
+    rationale and tests (if applicable), and request review from the
+    maintainers.
 
-For externally visible project artifacts, explicitly disclose AI assistance.
+Policy template (example):
 
-- Keep a clear AI attribution note in `README.md`.
-- When creating or updating standalone publishable text (issue bodies,
-  release notes, long design docs), include an explicit AI-assistance note.
+```
+Title: Short policy title
+Scope: crate|workspace
+Rule: one-line rule statement
+Rationale: 1–2 lines explaining why
+Example: short code snippet or file to change
+```
+

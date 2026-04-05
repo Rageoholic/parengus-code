@@ -471,6 +471,12 @@ impl Instance {
             debug_messenger_create_info
         {
             // Defensive coding stuff
+            // Policy: do not reuse feature structs — use fresh instances for
+            // querying and for pushing into pNext chains. If a struct
+            // intentionally chains further via its own `p_next`, document
+            // the rationale. Freshly-initialised structs have `p_next == null`;
+            // here we explicitly null `p_next` because `debug_messenger_create_info`
+            // may have been constructed or mutated earlier.
             debug_messenger_create_info.p_next = std::ptr::null();
             let debug_utils_instance =
                 ash::ext::debug_utils::Instance::new(&entry, &instance);
@@ -899,6 +905,7 @@ impl Instance {
     /// `physical_device` must be a valid handle derived from this
     /// instance. All structs in the `features` pNext chain must be
     /// valid and properly initialized.
+    /// See: rgpu-vk/README.md#pnext-chain-policy for the crate pNext policy.
     pub unsafe fn get_physical_device_features2(
         &self,
         physical_device: vk::PhysicalDevice,

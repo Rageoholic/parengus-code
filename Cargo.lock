@@ -2259,6 +2259,7 @@ dependencies = [
  "ash",
  "ash-window",
  "bytemuck",
+ "parengus-util",
  "parking_lot",
  "proptest",
  "raw-window-handle",
