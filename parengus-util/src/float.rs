@@ -2357,61 +2357,21 @@ mod tests {
     fn deterministic_f32_extended_unary_methods_match_libm_bits() {
         for_each_f32_sample(|value| {
             let w = DeterministicF32(value);
-            assert_f32_bits_eq(
-                w.trunc().0,
-                libm::truncf(value),
-                "f32 trunc",
-            );
+            assert_f32_bits_eq(w.trunc().0, libm::truncf(value), "f32 trunc");
             assert_f32_bits_eq(
                 w.fract().0,
                 value - libm::truncf(value),
                 "f32 fract",
             );
-            assert_f32_bits_eq(
-                w.cbrt().0,
-                libm::cbrtf(value),
-                "f32 cbrt",
-            );
-            assert_f32_bits_eq(
-                w.exp_m1().0,
-                libm::expm1f(value),
-                "f32 exp_m1",
-            );
-            assert_f32_bits_eq(
-                w.ln_1p().0,
-                libm::log1pf(value),
-                "f32 ln_1p",
-            );
-            assert_f32_bits_eq(
-                w.sinh().0,
-                libm::sinhf(value),
-                "f32 sinh",
-            );
-            assert_f32_bits_eq(
-                w.cosh().0,
-                libm::coshf(value),
-                "f32 cosh",
-            );
-            assert_f32_bits_eq(
-                w.tanh().0,
-                libm::tanhf(value),
-                "f32 tanh",
-            );
-            assert_f32_bits_eq(
-                w.asinh().0,
-                libm::asinhf(value),
-                "f32 asinh",
-            );
-            assert_f32_bits_eq(
-                w.acosh().0,
-                libm::acoshf(value),
-                "f32 acosh",
-            );
-            assert_f32_bits_eq(
-                w.atanh().0,
-                libm::atanhf(value),
-                "f32 atanh",
-            );
+            assert_f32_bits_eq(w.cbrt().0, libm::cbrtf(value), "f32 cbrt");
+            assert_f32_bits_eq(w.exp_m1().0, libm::expm1f(value), "f32 exp_m1");
+            assert_f32_bits_eq(w.ln_1p().0, libm::log1pf(value), "f32 ln_1p");
+            assert_f32_bits_eq(w.sinh().0, libm::sinhf(value), "f32 sinh");
+            assert_f32_bits_eq(w.cosh().0, libm::coshf(value), "f32 cosh");
+            assert_f32_bits_eq(w.tanh().0, libm::tanhf(value), "f32 tanh");
+            assert_f32_bits_eq(w.asinh().0, libm::asinhf(value), "f32 asinh");
+            assert_f32_bits_eq(w.acosh().0, libm::acoshf(value), "f32 acosh");
+            assert_f32_bits_eq(w.atanh().0, libm::atanhf(value), "f32 atanh");
             let (ws, wc) = w.sin_cos();
             let (ls, lc) = libm::sincosf(value);
             assert_f32_bits_eq(ws.0, ls, "f32 sin_cos sin");
@@ -2448,11 +2408,7 @@ mod tests {
 
         for_each_f32_sample(|value| {
             let w = DeterministicF32(value);
-            assert_f32_bits_eq(
-                w.recip().0,
-                1.0 / value,
-                "f32 recip",
-            );
+            assert_f32_bits_eq(w.recip().0, 1.0 / value, "f32 recip");
             assert_f32_bits_eq(
                 w.to_degrees().0,
                 value.to_degrees(),
@@ -2470,61 +2426,21 @@ mod tests {
     fn deterministic_f64_extended_unary_methods_match_libm_bits() {
         for_each_f64_sample(|value| {
             let w = DeterministicF64(value);
-            assert_f64_bits_eq(
-                w.trunc().0,
-                libm::trunc(value),
-                "f64 trunc",
-            );
+            assert_f64_bits_eq(w.trunc().0, libm::trunc(value), "f64 trunc");
             assert_f64_bits_eq(
                 w.fract().0,
                 value - libm::trunc(value),
                 "f64 fract",
             );
-            assert_f64_bits_eq(
-                w.cbrt().0,
-                libm::cbrt(value),
-                "f64 cbrt",
-            );
-            assert_f64_bits_eq(
-                w.exp_m1().0,
-                libm::expm1(value),
-                "f64 exp_m1",
-            );
-            assert_f64_bits_eq(
-                w.ln_1p().0,
-                libm::log1p(value),
-                "f64 ln_1p",
-            );
-            assert_f64_bits_eq(
-                w.sinh().0,
-                libm::sinh(value),
-                "f64 sinh",
-            );
-            assert_f64_bits_eq(
-                w.cosh().0,
-                libm::cosh(value),
-                "f64 cosh",
-            );
-            assert_f64_bits_eq(
-                w.tanh().0,
-                libm::tanh(value),
-                "f64 tanh",
-            );
-            assert_f64_bits_eq(
-                w.asinh().0,
-                libm::asinh(value),
-                "f64 asinh",
-            );
-            assert_f64_bits_eq(
-                w.acosh().0,
-                libm::acosh(value),
-                "f64 acosh",
-            );
-            assert_f64_bits_eq(
-                w.atanh().0,
-                libm::atanh(value),
-                "f64 atanh",
-            );
+            assert_f64_bits_eq(w.cbrt().0, libm::cbrt(value), "f64 cbrt");
+            assert_f64_bits_eq(w.exp_m1().0, libm::expm1(value), "f64 exp_m1");
+            assert_f64_bits_eq(w.ln_1p().0, libm::log1p(value), "f64 ln_1p");
+            assert_f64_bits_eq(w.sinh().0, libm::sinh(value), "f64 sinh");
+            assert_f64_bits_eq(w.cosh().0, libm::cosh(value), "f64 cosh");
+            assert_f64_bits_eq(w.tanh().0, libm::tanh(value), "f64 tanh");
+            assert_f64_bits_eq(w.asinh().0, libm::asinh(value), "f64 asinh");
+            assert_f64_bits_eq(w.acosh().0, libm::acosh(value), "f64 acosh");
+            assert_f64_bits_eq(w.atanh().0, libm::atanh(value), "f64 atanh");
             let (ws, wc) = w.sin_cos();
             let (ls, lc) = libm::sincos(value);
             assert_f64_bits_eq(ws.0, ls, "f64 sin_cos sin");
@@ -2561,11 +2477,7 @@ mod tests {
 
         for_each_f64_sample(|value| {
             let w = DeterministicF64(value);
-            assert_f64_bits_eq(
-                w.recip().0,
-                1.0 / value,
-                "f64 recip",
-            );
+            assert_f64_bits_eq(w.recip().0, 1.0 / value, "f64 recip");
             assert_f64_bits_eq(
                 w.to_degrees().0,
                 value.to_degrees(),

@@ -22,7 +22,7 @@ use bytemuck::Pod;
 use thiserror::Error;
 
 use crate::command::ResettableCommandBuffer;
-use crate::device::{Allocation, AllocateMemoryError, Device, MemoryUsage};
+use crate::device::{AllocateMemoryError, Allocation, Device, MemoryUsage};
 
 /// Trait for types that expose a raw `VkBuffer` handle.
 ///

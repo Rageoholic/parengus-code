@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::buffer::HostVisibleBuffer;
 use crate::command::ResettableCommandBuffer;
-use crate::device::{Allocation, AllocateMemoryError, Device, MemoryUsage};
+use crate::device::{AllocateMemoryError, Allocation, Device, MemoryUsage};
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -291,10 +291,8 @@ impl AllocatedImage {
 
         // SAFETY: create_info is fully initialised and has no borrowed data.
         let (handle, allocation) = unsafe {
-            device.create_raw_image_allocated(
-                &create_info,
-                MemoryUsage::GpuOnly,
-            )
+            device
+                .create_raw_image_allocated(&create_info, MemoryUsage::GpuOnly)
         }
         .map_err(CreateImageError::AllocateMemory)?;
 
