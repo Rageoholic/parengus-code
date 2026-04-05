@@ -45,10 +45,7 @@
 //! a standard pool or recorder is accepted. See `rgpu-vk/README.md` for
 //! the full design policy.
 
-use std::{
-    marker::PhantomData,
-    sync::Arc,
-};
+use std::{marker::PhantomData, sync::Arc};
 
 use ash::vk;
 use thiserror::Error;
@@ -56,8 +53,7 @@ use thiserror::Error;
 use crate::buffer::BufferHandle;
 use crate::descriptor::DescriptorSet;
 use crate::device::{
-    Device, QueueFamily, Submittable, SupportsGraphics,
-    SupportsTransfer,
+    Device, QueueFamily, Submittable, SupportsGraphics, SupportsTransfer,
 };
 use crate::pipeline::PipelineLayout;
 
@@ -947,14 +943,13 @@ impl<Q: QueueFamily> ResettableCommandPool<Q> {
 
         // SAFETY: allocate_info references a valid pool from parent.
         // !Sync prevents concurrent pool access.
-        let handle = unsafe {
-            self.parent.allocate_raw_command_buffers(&allocate_info)
-        }
-        .map(|mut bufs| {
-            debug_assert_eq!(bufs.len(), 1);
-            bufs.remove(0)
-        })
-        .map_err(AllocateCommandBufferError::Vulkan)?;
+        let handle =
+            unsafe { self.parent.allocate_raw_command_buffers(&allocate_info) }
+                .map(|mut bufs| {
+                    debug_assert_eq!(bufs.len(), 1);
+                    bufs.remove(0)
+                })
+                .map_err(AllocateCommandBufferError::Vulkan)?;
 
         Ok(ResettableCommandBuffer {
             parent: Arc::clone(&self.parent),
@@ -1202,14 +1197,13 @@ impl<Q: QueueFamily> TransientCommandPool<Q> {
 
         // SAFETY: allocate_info references a valid pool from parent.
         // !Sync prevents concurrent pool access.
-        let handle = unsafe {
-            self.parent.allocate_raw_command_buffers(&allocate_info)
-        }
-        .map(|mut bufs: Vec<vk::CommandBuffer>| {
-            debug_assert_eq!(bufs.len(), 1);
-            bufs.remove(0)
-        })
-        .map_err(AllocateCommandBufferError::Vulkan)?;
+        let handle =
+            unsafe { self.parent.allocate_raw_command_buffers(&allocate_info) }
+                .map(|mut bufs: Vec<vk::CommandBuffer>| {
+                    debug_assert_eq!(bufs.len(), 1);
+                    bufs.remove(0)
+                })
+                .map_err(AllocateCommandBufferError::Vulkan)?;
 
         Ok(TransientCommandBuffer {
             parent: Arc::clone(&self.parent),

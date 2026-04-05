@@ -17,9 +17,8 @@ use rgpu_vk::{
     ash::vk::{self, BufferImageCopy},
     buffer::{DeviceLocalBuffer, HostVisibleBuffer},
     command::{
-        self, DebugLabel, DebugLabelType, LazyDebugLabelReturn,
-        Recordable, ResettableCommandBuffer, ResettableCommandPool,
-        TransientCommandPool,
+        self, DebugLabel, DebugLabelType, LazyDebugLabelReturn, Recordable,
+        ResettableCommandBuffer, ResettableCommandPool, TransientCommandPool,
     },
     descriptor::{
         DescriptorBindingDesc, DescriptorPool, DescriptorSet,

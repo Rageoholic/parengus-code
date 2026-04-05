@@ -13,8 +13,7 @@ use thiserror::Error;
 use crate::buffer::HostVisibleBuffer;
 use crate::command::{Recordable, Recorder};
 use crate::device::{
-    AllocateMemoryError, Allocation, Device, MemoryUsage,
-    SupportsTransfer,
+    AllocateMemoryError, Allocation, Device, MemoryUsage, SupportsTransfer,
 };
 
 // ---------------------------------------------------------------------------

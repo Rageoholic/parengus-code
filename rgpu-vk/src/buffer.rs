@@ -23,8 +23,7 @@ use thiserror::Error;
 
 use crate::command::{Recordable, Recorder};
 use crate::device::{
-    AllocateMemoryError, Allocation, Device, MemoryUsage,
-    SupportsTransfer,
+    AllocateMemoryError, Allocation, Device, MemoryUsage, SupportsTransfer,
 };
 
 /// Trait for types that expose a raw `VkBuffer` handle.
