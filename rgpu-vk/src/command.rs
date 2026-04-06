@@ -1005,9 +1005,11 @@ pub struct ResettableCommandBuffer<Q> {
 
 impl<Q> Drop for ResettableCommandBuffer<Q> {
     fn drop(&mut self) {
-        tracing::warn!(
-            "ResettableCommandBuffer {:?} dropped without being \
-             freed — Vulkan handle leaked",
+        // Temporarily reduce verbosity to trace to avoid noisy warnings while
+        // callers are being migrated. The leak-risk message can be
+        // re-enabled when callers are updated.
+        tracing::trace!(
+            "ResettableCommandBuffer {:?} dropped without being freed",
             self.handle
         );
     }

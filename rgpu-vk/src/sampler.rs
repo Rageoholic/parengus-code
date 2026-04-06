@@ -70,6 +70,13 @@ impl Sampler {
     pub fn raw_sampler(&self) -> vk::Sampler {
         self.handle
     }
+
+    /// Helper that returns a `vk::DescriptorImageInfo` with this
+    /// sampler populated. Image view and layout are left as defaults.
+    #[inline]
+    pub fn descriptor_image_info(&self) -> vk::DescriptorImageInfo {
+        vk::DescriptorImageInfo::default().sampler(self.handle)
+    }
 }
 
 impl Drop for Sampler {

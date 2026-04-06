@@ -15,7 +15,7 @@ use clap::Parser;
 use parengus_tracing::{TracingLogLevel, init_default};
 use rgpu_vk::{
     ash::vk::{self, BufferImageCopy},
-    buffer::{DeviceLocalBuffer, HostVisibleBuffer},
+    buffer::{BufferHandle, DeviceLocalBuffer, HostVisibleBuffer},
     command::{
         self, DebugLabel, DebugLabelType, LazyDebugLabelReturn, Recordable,
         ResettableCommandBuffer, ResettableCommandPool, TransientCommandPool,
@@ -338,10 +338,10 @@ fn tex_vk_format(fmt: TexFormat, cs: ColorSpace) -> vk::Format {
 }
 
 pub fn main() -> eyre::Result<()> {
-    let app_dirs = directories::ProjectDirs::from("", "parengus", "samp-app")
+    let app_dirs = directories::ProjectDirs::from("", "parengus", "phoenix")
         .ok_or_else(|| {
-        eyre::eyre!("Failed to determine application directories")
-    })?;
+            eyre::eyre!("Failed to determine application directories")
+        })?;
 
     let self_dir = std::env::current_exe()?
         .parent()
@@ -612,8 +612,8 @@ struct RunningState {
     frames: Vec<FrameSync>,
     current_frame: usize,
     debug_counters: DebugCounters,
-    camera_set_layout: Arc<DescriptorSetLayout>,
-    material_set_layout: Arc<DescriptorSetLayout>,
+    per_frame_layout: Arc<DescriptorSetLayout>,
+    static_layout: Arc<DescriptorSetLayout>,
     /// Shared pipeline layout referencing both descriptor set layouts.
     /// Reused when rebuilding the pipeline after a format change.
     pipeline_layout: Arc<PipelineLayout>,
@@ -651,8 +651,8 @@ impl std::fmt::Debug for RunningState {
             .field("frames", &self.frames)
             .field("current_frame", &self.current_frame)
             .field("debug_counters", &self.debug_counters)
-            .field("camera_set_layout", &self.camera_set_layout)
-            .field("material_set_layout", &self.material_set_layout)
+            .field("camera_set_layout", &self.per_frame_layout)
+            .field("material_set_layout", &self.static_layout)
             .field("descriptor_pool", &self.descriptor_pool)
             .finish_non_exhaustive()
     }
@@ -761,8 +761,8 @@ impl ApplicationHandler for AppRunner {
                 frames,
                 current_frame: _,
                 debug_counters,
-                camera_set_layout,
-                material_set_layout,
+                per_frame_layout: camera_set_layout,
+                static_layout: material_set_layout,
                 pipeline_layout,
                 descriptor_pool,
                 ubo_buffers,
@@ -1825,26 +1825,35 @@ impl AppRunner {
             .unwrap_or(vk::Format::B8G8R8A8_SRGB);
 
         // Set 0: camera — UBO with the combined view-projection matrix.
-        let camera_set_layout = Arc::new(DescriptorSetLayout::new(
-            &device,
-            &[DescriptorBindingDesc {
-                binding: 0,
-                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-                count: 1,
-                stage_flags: vk::ShaderStageFlags::VERTEX,
-                binding_flags: vk::DescriptorBindingFlags::empty(),
-            }],
-            Some("camera set layout"),
-        )?);
-        // Set 1: material — bindless texture array (binding 0,
-        // PARTIALLY_BOUND so unused slots need not be written) plus
-        // the material SSBO (binding 1).
-        let material_set_layout = Arc::new(DescriptorSetLayout::new(
+        let per_frame_layout = Arc::new(DescriptorSetLayout::new(
             &device,
             &[
                 DescriptorBindingDesc {
                     binding: 0,
-                    descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                    count: 1,
+                    stage_flags: vk::ShaderStageFlags::VERTEX,
+                    binding_flags: vk::DescriptorBindingFlags::empty(),
+                },
+                DescriptorBindingDesc {
+                    binding: 1,
+                    descriptor_type: vk::DescriptorType::SAMPLER,
+                    count: 15,
+                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                    binding_flags: Default::default(),
+                },
+            ],
+            Some("per frame layout"),
+        )?);
+        // Set 1: material — bindless texture array (binding 0,
+        // PARTIALLY_BOUND so unused slots need not be written) plus
+        // the material SSBO (binding 1).
+        let static_layout = Arc::new(DescriptorSetLayout::new(
+            &device,
+            &[
+                DescriptorBindingDesc {
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                     count: MAX_BINDLESS_TEXTURES as u32,
                     stage_flags: vk::ShaderStageFlags::FRAGMENT,
                     binding_flags: vk::DescriptorBindingFlags::PARTIALLY_BOUND,
@@ -1857,12 +1866,12 @@ impl AppRunner {
                     binding_flags: vk::DescriptorBindingFlags::empty(),
                 },
             ],
-            Some("material set layout"),
+            Some("static layout"),
         )?);
         let pipeline_layout = Arc::new(PipelineLayout::new(
             &device,
             &PipelineLayoutDesc {
-                set_layouts: &[&camera_set_layout, &material_set_layout],
+                set_layouts: &[&per_frame_layout, &static_layout],
                 // One push constant range covering the full
                 // PushConstants struct (model: Mat4 = 64 bytes),
                 // accessible from the vertex stage only.
@@ -1996,27 +2005,23 @@ impl AppRunner {
 
         let camera_layouts: Vec<&DescriptorSetLayout> = (0
             ..MAX_FRAMES_IN_FLIGHT)
-            .map(|_| camera_set_layout.as_ref())
+            .map(|_| per_frame_layout.as_ref())
             .collect();
         // SAFETY: descriptor_pool outlives camera_descriptor_sets and
         // material_descriptor_set (all stored in the same state struct,
         // dropped in declaration order — sets before pool).
         let camera_descriptor_sets =
             unsafe { descriptor_pool.allocate_sets(&camera_layouts) }?;
-        for (i, (set, buf)) in camera_descriptor_sets
+        for (i, (set, _buf)) in camera_descriptor_sets
             .iter()
             .zip(ubo_buffers.iter())
             .enumerate()
         {
             set.set_name(&device, Some(&format!("camera set {i}")));
-            // SAFETY: buf is a valid UNIFORM_BUFFER from device with
-            // size ubo_size; it remains alive for the lifetime of the
-            // descriptor set (both live in RunningState/SuspendedState).
-            unsafe { set.write_uniform_buffer(&device, 0, buf, ubo_size) };
         }
         // SAFETY: same guarantee as camera_descriptor_sets above.
         let mut material_sets = unsafe {
-            descriptor_pool.allocate_sets(&[material_set_layout.as_ref()])
+            descriptor_pool.allocate_sets(&[static_layout.as_ref()])
         }?;
         let material_descriptor_set = material_sets
             .pop()
@@ -2355,24 +2360,63 @@ impl AppRunner {
             Some("albedo sampler"),
         )?;
 
-        // Write only the slots we actually populated into the bindless
-        // descriptor array. PARTIALLY_BOUND means unused slots do not
-        // need to be backed by valid descriptors.
+        // Build a single update that covers camera UBOs, bindless textures,
+        // and the material SSBO, and apply it once.
+        // Reserve space for camera UBOs, per-camera sampler table entry,
+        // bindless textures, and the material SSBO.
+        let mut desc_builder =
+            rgpu_vk::descriptor::DescriptorUpdateBuilder::with_capacity(
+                camera_descriptor_sets.len() * 2 + textures.len() + 1,
+                camera_descriptor_sets.len() * 2 + textures.len() + 1,
+            );
+
+        // Camera UBOs
+        for (set, buf) in camera_descriptor_sets.iter().zip(ubo_buffers.iter())
+        {
+            let info = buf.descriptor_buffer_info(0, ubo_size);
+            desc_builder.push_write_buffer_info(
+                set.raw_descriptor_set(),
+                0,
+                vk::DescriptorType::UNIFORM_BUFFER,
+                0,
+                info,
+            );
+        }
+
+        // Bindless texture array entries — write as SAMPLED_IMAGE (no sampler).
         for (slot, tex) in textures.iter().enumerate() {
-            // SAFETY: tex and sampler live in RunningState /
-            // SuspendedState and outlive any command buffer that
-            // references this descriptor set; images are in
-            // SHADER_READ_ONLY_OPTIMAL after the upload fence wait.
-            unsafe {
-                material_descriptor_set.write_combined_image_sampler(
-                    &device,
-                    0,
-                    slot as u32,
-                    tex.raw_image_view(),
-                    sampler.raw_sampler(),
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                )
-            };
+            let image_info = vk::DescriptorImageInfo::default()
+                .image_view(tex.raw_image_view())
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            desc_builder.push_write_image_info(
+                material_descriptor_set.raw_descriptor_set(),
+                0,
+                vk::DescriptorType::SAMPLED_IMAGE,
+                slot as u32,
+                image_info,
+            );
+        }
+
+        // Sampler table: write the default sampler (Anisotropic + Repeat) into
+        // the sampler table slot expected by the shader's `getSamplerIndex`
+        // mapping. The default index is (FILTER_ANISOTROPIC * 5) + ADDR_REPEAT = 10.
+        const SAMPLER_OOB_COUNT: u32 = 5;
+        const SAMPLER_FILTER_ANISOTROPIC: u32 = 2;
+        const SAMPLER_ADDR_REPEAT: u32 = 0;
+        let default_sampler_index = SAMPLER_FILTER_ANISOTROPIC
+            * SAMPLER_OOB_COUNT
+            + SAMPLER_ADDR_REPEAT;
+
+        for set in camera_descriptor_sets.iter() {
+            let sampler_info = vk::DescriptorImageInfo::default()
+                .sampler(sampler.raw_sampler());
+            desc_builder.push_write_image_info(
+                set.raw_descriptor_set(),
+                1,
+                vk::DescriptorType::SAMPLER,
+                default_sampler_index,
+                sampler_info,
+            );
         }
 
         // Upload the material SSBO (host-visible; written once at load).
@@ -2385,16 +2429,20 @@ impl AppRunner {
             Some("material ssbo"),
         )?;
         material_ssbo.write_pod_iter_exact(material_gpus.into_iter())?;
-        // SAFETY: material_ssbo lives in RunningState/SuspendedState and
-        // outlives any command buffer referencing this descriptor set.
-        unsafe {
-            material_descriptor_set.write_storage_buffer(
-                &device,
-                1,
-                &material_ssbo,
-                material_ssbo_size,
-            )
-        };
+        let buf_info =
+            material_ssbo.descriptor_buffer_info(0, material_ssbo_size);
+        desc_builder.push_write_buffer_info(
+            material_descriptor_set.raw_descriptor_set(),
+            1,
+            vk::DescriptorType::STORAGE_BUFFER,
+            0,
+            buf_info,
+        );
+
+        // SAFETY: caller guarantees resources (buffers, images, samplers)
+        // remain valid for the duration of this update; `desc_builder`
+        // owns the descriptor info arrays while applying.
+        unsafe { desc_builder.apply(&device) };
 
         // SAFETY: guard will call wait_idle in Drop. Must not be forgotten.
         let idle_guard =
@@ -2421,8 +2469,8 @@ impl AppRunner {
             frames,
             current_frame: 0,
             debug_counters,
-            camera_set_layout,
-            material_set_layout,
+            per_frame_layout,
+            static_layout,
             pipeline_layout,
             descriptor_pool,
             ubo_buffers,
@@ -2575,8 +2623,8 @@ impl AppRunner {
             frames: state.frames,
             current_frame: 0,
             debug_counters,
-            camera_set_layout: state.camera_set_layout,
-            material_set_layout: state.material_set_layout,
+            per_frame_layout: state.camera_set_layout,
+            static_layout: state.material_set_layout,
             pipeline_layout: state.pipeline_layout,
             descriptor_pool: state.descriptor_pool,
             ubo_buffers: state.ubo_buffers,
