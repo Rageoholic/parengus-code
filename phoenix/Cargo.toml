@@ -18,3 +18,5 @@ tracing-subscriber = "0.3.22"
 vek = { version = "0.17.2", features = ["bytemuck"] }
 winit = "0.30.13"
 parengus-tracing = { path = "../parengus-tracing" }
+strum_macros = "0.28.0"
+strum = "0.28.0"

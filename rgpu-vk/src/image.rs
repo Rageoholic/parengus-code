@@ -821,6 +821,18 @@ impl Texture {
         self.view.raw_image_view()
     }
 
+    /// Helper that returns a `vk::DescriptorImageInfo` for this
+    /// texture's default view using the provided `image_layout`.
+    #[inline]
+    pub fn descriptor_image_info(
+        &self,
+        image_layout: vk::ImageLayout,
+    ) -> vk::DescriptorImageInfo {
+        vk::DescriptorImageInfo::default()
+            .image_view(self.raw_image_view())
+            .image_layout(image_layout)
+    }
+
     pub fn raw_image(&self) -> vk::Image {
         self.image.raw_image()
     }

@@ -17,6 +17,8 @@ and AI interaction conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 
 - t003 Implement PBR shading [active]
   - t035 Directional lighting [planned]
+- t038 Separate samplers from textures [active]
+- t040 Optional device features [active]
 - t001 Parengus Shader IR (PSIR) [planned, blocked by t033, t035]
 
 ---
@@ -26,6 +28,8 @@ and AI interaction conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 | ID   | Title                                                      | Area     | Notes                                           |
 |------|------------------------------------------------------------|----------|-------------------------------------------------|
 | t003 | Implement PBR shading                                      | phoenix  |                                                 |
+| t038 | Separate samplers from textures (sampler table)            | renderer | cleanup: sampler table and grouping             |
+| t040 | Optional device features (anisotropic optional)            | renderer | cleanup: optional device feature handling       |
 
 ### Planned
 
@@ -57,14 +61,11 @@ and AI interaction conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 | t034 | Error dialog / fatal message display                       | infra    |                                               |
 | t035 | Directional lighting                                       | phoenix  | child of t003                                 |
 | t037 | Harden state machine transitions with replace_with         | infra    |                                               |
-| t038 | Separate samplers from textures (sampler table)            | renderer | cleanup: sampler table and grouping           |
 
 ### Future
 
 | ID   | Title                                                      | Area     | Notes                                           |
 |------|------------------------------------------------------------|----------|-------------------------------------------------|
-| t039 | Per-frame descriptor & command pools                       | renderer | cleanup: per-frame pools for descriptors/commands |
-| t040 | Optional device features (anisotropic optional)            | renderer | cleanup: optional device feature handling       |
 | t041 | Single staging buffer with linear allocator                | phoenix  | staging buffer & upload linear allocator        |
 | t044 | Design granular subfeature exposure in DeviceConfig        | rgpu-vk  | follow-up to query-first feature fix            |
 
@@ -85,11 +86,13 @@ and AI interaction conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 | t042 | Use Debug Utils labels for queues and submissions          | renderer | label queues/submissions for captures         |
 | t043 | Re-enable queue naming and add Phoenix debug-label helpers | renderer | re-enable queue names; add Phoenix helper stubs |
 | t045 | TransientCommandPool and RecordableCommandBuffer trait     | rgpu-vk  |                                                 |
+| t038 | Separate samplers from textures (sampler table)            | renderer | cleanup: sampler table and grouping             |
 
 ### Dropped
 
 | ID   | Title                                                      | Area     | Notes                                         |
 |------|------------------------------------------------------------|----------|-----------------------------------------------|
+| t039 | Per-frame descriptor & command pools                       | renderer | sticking with per-frame cmd bufs from persistent pool |
 | t020 | Generate Slang compiler metadata                           | pipeline |                                               |
 | t022 | Implement LearnOpenGL-style Blinn-Phong renderer           | phoenix  | pivoted to PBR directly                       |
 | t023 | Blinn-Phong shader path                                    | phoenix  | child of t022                                 |

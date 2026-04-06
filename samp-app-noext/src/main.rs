@@ -33,7 +33,7 @@ use clap::Parser;
 use parengus_tracing::{TracingLogLevel, init_default};
 use rgpu_vk::{
     ash::vk::{self, DependencyFlags},
-    buffer::{DeviceLocalBuffer, HostVisibleBuffer},
+    buffer::{BufferHandle, DeviceLocalBuffer, HostVisibleBuffer},
     command::{
         Recordable, ResettableCommandBuffer, ResettableCommandPool,
         TransientCommandPool,
@@ -1485,15 +1485,12 @@ impl AppRunner {
         // dropped in declaration order — sets before pool).
         let camera_descriptor_sets =
             unsafe { descriptor_pool.allocate_sets(&camera_layouts) }?;
-        for (i, (set, buf)) in camera_descriptor_sets
+        for (i, (set, _buf)) in camera_descriptor_sets
             .iter()
             .zip(ubo_buffers.iter())
             .enumerate()
         {
             set.set_name(&device, Some(&format!("camera set {i}")));
-            // SAFETY: buf is a valid UNIFORM_BUFFER that remains alive
-            // for the lifetime of the descriptor set.
-            unsafe { set.write_uniform_buffer(&device, 0, buf, ubo_size) };
         }
         // SAFETY: same guarantee as camera_descriptor_sets above.
         let mut material_sets = unsafe {
@@ -1722,13 +1719,37 @@ impl AppRunner {
             Some("statue-tex sampler"),
         )?;
 
-        // SAFETY: texture and sampler live in RunningState /
-        // SuspendedState and outlive any command buffer referencing
-        // this descriptor set.
-        unsafe {
-            material_descriptor_set
-                .write_texture_sampler(&device, 0, &texture, &sampler)
-        };
+        let mut desc_builder =
+            rgpu_vk::descriptor::DescriptorUpdateBuilder::with_capacity(
+                camera_descriptor_sets.len() + 1,
+                camera_descriptor_sets.len() + 1,
+            );
+        for (set, buf) in camera_descriptor_sets.iter().zip(ubo_buffers.iter())
+        {
+            let info = buf.descriptor_buffer_info(0, ubo_size);
+            desc_builder.push_write_buffer_info(
+                set.raw_descriptor_set(),
+                0,
+                vk::DescriptorType::UNIFORM_BUFFER,
+                0,
+                info,
+            );
+        }
+        let image_info = vk::DescriptorImageInfo::default()
+            .image_view(texture.raw_image_view())
+            .sampler(sampler.raw_sampler())
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        desc_builder.push_write_image_info(
+            material_descriptor_set.raw_descriptor_set(),
+            0,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            0,
+            image_info,
+        );
+
+        // SAFETY: referenced buffers, images and sampler remain valid for
+        // the duration of this update; `desc_builder` owns the info arrays.
+        unsafe { desc_builder.apply(&device) };
 
         // Create the initial swapchain (if the window is non-zero).
         let (swapchain, render_finished_semaphores) = if win_size.width == 0

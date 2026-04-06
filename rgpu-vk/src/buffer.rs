@@ -34,6 +34,22 @@ use crate::device::{
 /// `bind_vertex_buffer`) to be generic over concrete buffer types.
 pub trait BufferHandle {
     fn raw_buffer(&self) -> vk::Buffer;
+
+    /// Helper that builds a `vk::DescriptorBufferInfo` for this buffer.
+    ///
+    /// Default implementation uses `self.raw_buffer()` and the
+    /// provided `offset`/`range`.
+    #[inline]
+    fn descriptor_buffer_info(
+        &self,
+        offset: vk::DeviceSize,
+        range: vk::DeviceSize,
+    ) -> vk::DescriptorBufferInfo {
+        vk::DescriptorBufferInfo::default()
+            .buffer(self.raw_buffer())
+            .offset(offset)
+            .range(range)
+    }
 }
 
 impl<T> BufferHandle for &T

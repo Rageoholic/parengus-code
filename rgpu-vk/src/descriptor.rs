@@ -35,6 +35,289 @@ pub struct DescriptorBindingDesc {
     pub binding_flags: vk::DescriptorBindingFlags,
 }
 
+// ---------------------------------------------------------------------------
+// DescriptorUpdateBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder that accumulates descriptor writes and associated info
+/// vectors so a single `vkUpdateDescriptorSets` call can be made.
+///
+/// Usage model:
+/// 1. Create with `DescriptorUpdateBuilder::with_capacity(expected_writes, expected_total_infos)`.
+/// 2. Call `push_write(...)` to declare a `VkWriteDescriptorSet` and get
+///    back an index.
+/// 3. Call `push_image_info`, `push_buffer_info`, or `push_texel_buffer_view`
+///    to append infos for that write by index.
+/// 4. Call `apply(device)` to perform a single `device.update_raw_descriptor_sets`.
+pub struct DescriptorUpdateBuilder {
+    image_infos: Vec<vk::DescriptorImageInfo>,
+    buffer_infos: Vec<vk::DescriptorBufferInfo>,
+    texel_buffer_views: Vec<vk::BufferView>,
+    pending: Vec<PendingWrite>,
+}
+
+struct PendingWrite {
+    dst_set: vk::DescriptorSet,
+    dst_binding: u32,
+    dst_array_element: u32,
+    descriptor_type: vk::DescriptorType,
+
+    image_start: Option<usize>,
+    image_count: u32,
+
+    buffer_start: Option<usize>,
+    buffer_count: u32,
+
+    texel_view_start: Option<usize>,
+    texel_view_count: u32,
+}
+
+impl DescriptorUpdateBuilder {
+    /// Create a builder with pre-allocated capacity.
+    ///
+    /// `expected_writes` is the anticipated number of `WriteDescriptorSet`
+    /// entries. `expected_total_infos` is a soft hint for the total number
+    /// of `DescriptorImageInfo` / `DescriptorBufferInfo` elements across
+    /// all writes.
+    pub fn with_capacity(
+        expected_writes: usize,
+        expected_total_infos: usize,
+    ) -> Self {
+        Self {
+            image_infos: Vec::with_capacity(expected_total_infos),
+            buffer_infos: Vec::with_capacity(expected_total_infos),
+            texel_buffer_views: Vec::with_capacity(expected_total_infos),
+            pending: Vec::with_capacity(expected_writes),
+        }
+    }
+
+    /// Declare a write descriptor and return its index. Use the index to
+    /// append infos for that write.
+    #[inline]
+    fn push_write(
+        &mut self,
+        dst_set: vk::DescriptorSet,
+        dst_binding: u32,
+        descriptor_type: vk::DescriptorType,
+        dst_array_element: u32,
+    ) -> usize {
+        let pw = PendingWrite {
+            dst_set,
+            dst_binding,
+            dst_array_element,
+            descriptor_type,
+            image_start: None,
+            image_count: 0,
+            buffer_start: None,
+            buffer_count: 0,
+            texel_view_start: None,
+            texel_view_count: 0,
+        };
+        self.pending.push(pw);
+        self.pending.len() - 1
+    }
+
+    /// Append an image info to the write at `write_index`.
+    #[inline]
+    fn push_image_info(
+        &mut self,
+        write_index: usize,
+        info: vk::DescriptorImageInfo,
+    ) {
+        let start = self.image_infos.len();
+        self.image_infos.push(info);
+        let pw = &mut self.pending[write_index];
+        if pw.image_start.is_none() {
+            pw.image_start = Some(start);
+            pw.image_count = 1;
+        } else {
+            pw.image_count += 1;
+        }
+    }
+
+    /// Append a buffer info to the write at `write_index`.
+    #[inline]
+    fn push_buffer_info(
+        &mut self,
+        write_index: usize,
+        info: vk::DescriptorBufferInfo,
+    ) {
+        let start = self.buffer_infos.len();
+        self.buffer_infos.push(info);
+        let pw = &mut self.pending[write_index];
+        if pw.buffer_start.is_none() {
+            pw.buffer_start = Some(start);
+            pw.buffer_count = 1;
+        } else {
+            pw.buffer_count += 1;
+        }
+    }
+
+    /// Append a texel buffer view to the write at `write_index`.
+    #[inline]
+    fn push_texel_buffer_view(
+        &mut self,
+        write_index: usize,
+        view: vk::BufferView,
+    ) {
+        let start = self.texel_buffer_views.len();
+        self.texel_buffer_views.push(view);
+        let pw = &mut self.pending[write_index];
+        if pw.texel_view_start.is_none() {
+            pw.texel_view_start = Some(start);
+            pw.texel_view_count = 1;
+        } else {
+            pw.texel_view_count += 1;
+        }
+    }
+
+    /// Append a `Sampler` as a sampler-only descriptor to the write at
+    /// `write_index`.
+    #[inline]
+    pub fn push_sampler(&mut self, write_index: usize, sampler: &Sampler) {
+        self.push_image_info(write_index, sampler.descriptor_image_info());
+    }
+
+    /// Append a `Texture`'s default view to the write at `write_index` with
+    /// the given `image_layout`.
+    #[inline]
+    pub fn push_texture(
+        &mut self,
+        write_index: usize,
+        texture: &Texture,
+        image_layout: vk::ImageLayout,
+    ) {
+        self.push_image_info(
+            write_index,
+            texture.descriptor_image_info(image_layout),
+        );
+    }
+
+    /// Append a buffer descriptor for `buffer` to the write at `write_index`.
+    #[inline]
+    pub fn push_buffer<B: BufferHandle>(
+        &mut self,
+        write_index: usize,
+        buffer: &B,
+        offset: vk::DeviceSize,
+        range: vk::DeviceSize,
+    ) {
+        let info = buffer.descriptor_buffer_info(offset, range);
+        self.push_buffer_info(write_index, info);
+    }
+
+    /// Declare a write and append the provided image info in one call.
+    #[inline]
+    pub fn push_write_image_info(
+        &mut self,
+        dst_set: vk::DescriptorSet,
+        dst_binding: u32,
+        descriptor_type: vk::DescriptorType,
+        dst_array_element: u32,
+        info: vk::DescriptorImageInfo,
+    ) -> usize {
+        let idx = self.push_write(
+            dst_set,
+            dst_binding,
+            descriptor_type,
+            dst_array_element,
+        );
+        self.push_image_info(idx, info);
+        idx
+    }
+
+    /// Declare a write and append the provided buffer info in one call.
+    #[inline]
+    pub fn push_write_buffer_info(
+        &mut self,
+        dst_set: vk::DescriptorSet,
+        dst_binding: u32,
+        descriptor_type: vk::DescriptorType,
+        dst_array_element: u32,
+        info: vk::DescriptorBufferInfo,
+    ) -> usize {
+        let idx = self.push_write(
+            dst_set,
+            dst_binding,
+            descriptor_type,
+            dst_array_element,
+        );
+        self.push_buffer_info(idx, info);
+        idx
+    }
+
+    /// Declare a write and append the provided texel buffer view in one call.
+    #[inline]
+    pub fn push_write_texel_buffer_view(
+        &mut self,
+        dst_set: vk::DescriptorSet,
+        dst_binding: u32,
+        descriptor_type: vk::DescriptorType,
+        dst_array_element: u32,
+        view: vk::BufferView,
+    ) -> usize {
+        let idx = self.push_write(
+            dst_set,
+            dst_binding,
+            descriptor_type,
+            dst_array_element,
+        );
+        self.push_texel_buffer_view(idx, view);
+        idx
+    }
+
+    /// Apply all accumulated writes as a single `vkUpdateDescriptorSets`
+    /// call against `device`.
+    ///
+    /// # Safety
+    /// All handles and infos must be valid and remain alive for the
+    /// duration described by the Vulkan spec (this mirrors
+    /// `Device::update_raw_descriptor_sets` safety requirements).
+    pub unsafe fn apply(&mut self, device: &Arc<Device>) {
+        // Build the WriteDescriptorSet list referencing the owned info
+        // arrays. Slices borrow from `self` and remain valid for the
+        // duration of this call.
+        let mut writes: Vec<vk::WriteDescriptorSet> =
+            Vec::with_capacity(self.pending.len());
+        for pw in &self.pending {
+            let mut w = vk::WriteDescriptorSet::default()
+                .dst_set(pw.dst_set)
+                .dst_binding(pw.dst_binding)
+                .dst_array_element(pw.dst_array_element)
+                .descriptor_type(pw.descriptor_type);
+
+            if pw.image_count > 0 {
+                let start = pw
+                    .image_start
+                    .expect("image_start set when image_count > 0");
+                let slice =
+                    &self.image_infos[start..start + pw.image_count as usize];
+                w = w.image_info(slice);
+            } else if pw.buffer_count > 0 {
+                let start = pw
+                    .buffer_start
+                    .expect("buffer_start set when buffer_count > 0");
+                let slice =
+                    &self.buffer_infos[start..start + pw.buffer_count as usize];
+                w = w.buffer_info(slice);
+            } else if pw.texel_view_count > 0 {
+                let start = pw
+                    .texel_view_start
+                    .expect("texel_view_start set when texel_view_count > 0");
+                let slice = &self.texel_buffer_views
+                    [start..start + pw.texel_view_count as usize];
+                w = w.texel_buffer_view(slice);
+            }
+
+            writes.push(w);
+        }
+
+        // SAFETY: caller ensures handles and infos remain valid as
+        // required by Vulkan. Forward to device helper.
+        unsafe { device.update_raw_descriptor_sets(&writes, &[]) };
+    }
+}
+
 impl From<DescriptorBindingDesc> for vk::DescriptorSetLayoutBinding<'static> {
     #[inline]
     fn from(b: DescriptorBindingDesc) -> Self {
@@ -266,132 +549,6 @@ impl DescriptorSet {
                 "Failed to name descriptor set {:?}: {e}",
                 self.handle
             );
-        }
-    }
-
-    /// Update this descriptor set's binding with a combined image sampler.
-    ///
-    /// # Safety
-    /// - `image_view` must be a valid `VkImageView` created from `device`.
-    /// - `sampler` must be a valid `VkSampler` created from `device`.
-    /// - `image_layout` must be the layout the image will be in when
-    ///   shaders access it (typically `SHADER_READ_ONLY_OPTIMAL`).
-    /// - Both handles must remain valid for as long as this descriptor
-    ///   set is bound in any submitted command buffer.
-    pub unsafe fn write_combined_image_sampler(
-        &self,
-        device: &Arc<Device>,
-        binding: u32,
-        array_element: u32,
-        image_view: vk::ImageView,
-        sampler: vk::Sampler,
-        image_layout: vk::ImageLayout,
-    ) {
-        let image_info = vk::DescriptorImageInfo::default()
-            .image_view(image_view)
-            .sampler(sampler)
-            .image_layout(image_layout);
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(self.handle)
-            .dst_binding(binding)
-            .dst_array_element(array_element)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(std::slice::from_ref(&image_info));
-        // SAFETY: Caller guarantees device, image_view, sampler, and
-        // image_layout validity.
-        unsafe {
-            device.update_raw_descriptor_sets(std::slice::from_ref(&write), &[])
-        }
-    }
-
-    /// Update this descriptor set's binding with a texture and sampler.
-    ///
-    /// The image layout is assumed to be `SHADER_READ_ONLY_OPTIMAL`,
-    /// which is the layout left by [`Texture::record_copy_from`].
-    ///
-    /// # Safety
-    /// - `texture` and `sampler` must remain alive for as long as this
-    ///   descriptor set is bound in any submitted command buffer.
-    pub unsafe fn write_texture_sampler(
-        &self,
-        device: &Arc<Device>,
-        binding: u32,
-        texture: &Texture,
-        sampler: &Sampler,
-    ) {
-        // SAFETY: caller guarantees texture and sampler outlive the
-        // descriptor set binding.
-        unsafe {
-            self.write_combined_image_sampler(
-                device,
-                binding,
-                0,
-                texture.raw_image_view(),
-                sampler.raw_sampler(),
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            )
-        }
-    }
-
-    /// Update this descriptor set's binding with a storage buffer.
-    ///
-    /// # Safety
-    /// - `buffer` must be a valid buffer created from `device` with
-    ///   `STORAGE_BUFFER` usage.
-    /// - `range` must not exceed the buffer's size.
-    /// - The buffer must remain valid for as long as this descriptor
-    ///   set is bound in any submitted command buffer.
-    pub unsafe fn write_storage_buffer<B: BufferHandle>(
-        &self,
-        device: &Arc<Device>,
-        binding: u32,
-        buffer: &B,
-        range: vk::DeviceSize,
-    ) {
-        let buffer_info = vk::DescriptorBufferInfo::default()
-            .buffer(buffer.raw_buffer())
-            .offset(0)
-            .range(range);
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(self.handle)
-            .dst_binding(binding)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_info));
-        // SAFETY: Caller guarantees device, buffer, and range
-        // validity.
-        unsafe {
-            device.update_raw_descriptor_sets(std::slice::from_ref(&write), &[])
-        }
-    }
-
-    /// Update this descriptor set's binding with a uniform buffer.
-    ///
-    /// # Safety
-    /// - `buffer` must be a valid buffer created from `device` with
-    ///   `UNIFORM_BUFFER` usage.
-    /// - `range` must not exceed the buffer's size.
-    /// - The buffer must remain valid for as long as this descriptor
-    ///   set is bound in any submitted command buffer.
-    pub unsafe fn write_uniform_buffer<B: BufferHandle>(
-        &self,
-        device: &Arc<Device>,
-        binding: u32,
-        buffer: &B,
-        range: vk::DeviceSize,
-    ) {
-        let buffer_info = vk::DescriptorBufferInfo::default()
-            .buffer(buffer.raw_buffer())
-            .offset(0)
-            .range(range);
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(self.handle)
-            .dst_binding(binding)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_info));
-        // SAFETY: Caller guarantees device, buffer, and range
-        // validity.
-        unsafe {
-            device.update_raw_descriptor_sets(std::slice::from_ref(&write), &[])
         }
     }
 }
