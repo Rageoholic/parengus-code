@@ -374,6 +374,18 @@ impl DescriptorSetLayout {
                     .binding_flags(&binding_flags_vec);
             create_info = create_info.push_next(&mut binding_flags_info);
         }
+        // If any binding uses UPDATE_AFTER_BIND, the layout itself must
+        // declare UPDATE_AFTER_BIND_POOL_BIT so the pool can allocate
+        // sets from it (VkDescriptorSetLayoutCreateInfo spec rule).
+        let any_update_after_bind = bindings.iter().any(|b| {
+            b.binding_flags
+                .contains(vk::DescriptorBindingFlags::UPDATE_AFTER_BIND)
+        });
+        if any_update_after_bind {
+            create_info = create_info.flags(
+                vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL,
+            );
+        }
         // SAFETY: create_info references valid binding descriptions
         // for the duration of this call.
         let handle =
@@ -449,12 +461,17 @@ impl DescriptorPool {
         device: &Arc<Device>,
         max_sets: u32,
         pool_sizes: &[vk::DescriptorPoolSize],
+        update_after_bind: bool,
         name: Option<&str>,
     ) -> Result<Self, vk::Result> {
+        let mut pool_flags = vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET;
+        if update_after_bind {
+            pool_flags |= vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND;
+        }
         let create_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(max_sets)
             .pool_sizes(pool_sizes)
-            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
+            .flags(pool_flags);
         // SAFETY: create_info is valid and references only stack data.
         let handle =
             unsafe { device.create_raw_descriptor_pool(&create_info) }?;

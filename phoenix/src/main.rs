@@ -447,7 +447,8 @@ pub fn main() -> eyre::Result<()> {
         queue_config_strict: cli_args.queue_config_strict,
         min_sample_count: cli_args.aa.sample_count(),
         min_sample_count_strict: cli_args.aa_strict,
-        descriptor_indexing: true,
+        resource_indexing: true,
+        sampler_anisotropy: true,
     };
 
     let mut app = AppRunner(Some(App::Initializing(InitializingState {
@@ -630,7 +631,7 @@ struct RunningState {
     start_time: Instant,
     asset_map: AssetMap,
     textures: Vec<Texture>,
-    sampler: Sampler,
+    samplers: Vec<Sampler>,
     /// Host-visible SSBO holding one MaterialGpu per submesh draw.
     material_ssbo: HostVisibleBuffer,
 }
@@ -682,7 +683,7 @@ struct SuspendedState {
     start_time: Instant,
     asset_map: AssetMap,
     textures: Vec<Texture>,
-    sampler: Sampler,
+    samplers: Vec<Sampler>,
     material_ssbo: HostVisibleBuffer,
 }
 #[derive(Debug)]
@@ -771,7 +772,7 @@ impl ApplicationHandler for AppRunner {
                 start_time,
                 asset_map,
                 textures,
-                sampler,
+                samplers,
                 material_ssbo,
             } = running_state;
 
@@ -807,7 +808,7 @@ impl ApplicationHandler for AppRunner {
                 start_time,
                 asset_map,
                 textures,
-                sampler,
+                samplers,
                 material_ssbo,
             });
         }
@@ -1856,7 +1857,8 @@ impl AppRunner {
                     descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                     count: MAX_BINDLESS_TEXTURES as u32,
                     stage_flags: vk::ShaderStageFlags::FRAGMENT,
-                    binding_flags: vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+                    binding_flags: vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
                 },
                 DescriptorBindingDesc {
                     binding: 1,
@@ -1992,7 +1994,11 @@ impl AppRunner {
                     descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
                 },
                 vk::DescriptorPoolSize {
-                    ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    ty: vk::DescriptorType::SAMPLER,
+                    descriptor_count: 15 * MAX_FRAMES_IN_FLIGHT as u32,
+                },
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::SAMPLED_IMAGE,
                     descriptor_count: MAX_BINDLESS_TEXTURES as u32,
                 },
                 vk::DescriptorPoolSize {
@@ -2000,6 +2006,7 @@ impl AppRunner {
                     descriptor_count: 1,
                 },
             ],
+            true,
             Some("descriptor pool"),
         )?;
 
@@ -2351,23 +2358,65 @@ impl AppRunner {
         // a valid fence; call it directly.
         upload_fence.wait(u64::MAX)?;
 
-        let sampler = rgpu_vk::sampler::Sampler::new(
-            &device,
-            vk::Filter::LINEAR,
-            vk::Filter::LINEAR,
-            vk::SamplerAddressMode::CLAMP_TO_EDGE,
-            max_mip_count,
-            Some("albedo sampler"),
-        )?;
+        // Build the full 15-entry sampler table matching the shader's
+        // getSamplerIndex layout: index = filter * OOB_COUNT + addr.
+        // Filters 0=NEAREST, 1=LINEAR, 2=ANISOTROPIC.
+        // Addresses 0=REPEAT, 1=CLAMP_TO_EDGE, 2=MIRROR,
+        //           3=TRANSPARENT_BORDER, 4=CLAMP_TO_BORDER_WHITE.
+        const SAMPLER_TABLE_SIZE: usize = 15;
+        let max_anisotropy = device.properties().limits.max_sampler_anisotropy;
+        // (filter_filter, min_filter, anisotropy, addr_mode, border_color)
+        let addr_modes = [
+            (
+                vk::SamplerAddressMode::REPEAT,
+                vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            ),
+            (
+                vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            ),
+            (
+                vk::SamplerAddressMode::MIRRORED_REPEAT,
+                vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            ),
+            (
+                vk::SamplerAddressMode::CLAMP_TO_BORDER,
+                vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            ),
+            (
+                vk::SamplerAddressMode::CLAMP_TO_BORDER,
+                vk::BorderColor::FLOAT_OPAQUE_WHITE,
+            ),
+        ];
+        let filter_params: [(vk::Filter, Option<f32>); 3] = [
+            (vk::Filter::NEAREST, None),
+            (vk::Filter::LINEAR, None),
+            (vk::Filter::LINEAR, Some(max_anisotropy)),
+        ];
+        let mut samplers: Vec<Sampler> = Vec::with_capacity(SAMPLER_TABLE_SIZE);
+        for (fi, (filter, aniso)) in filter_params.iter().enumerate() {
+            for (ai, (addr, border)) in addr_modes.iter().enumerate() {
+                let label = format!("sampler f{fi} a{ai}");
+                samplers.push(Sampler::new(
+                    &device,
+                    *filter,
+                    *filter,
+                    *addr,
+                    max_mip_count,
+                    *aniso,
+                    *border,
+                    Some(label.as_str()),
+                )?);
+            }
+        }
 
-        // Build a single update that covers camera UBOs, bindless textures,
-        // and the material SSBO, and apply it once.
-        // Reserve space for camera UBOs, per-camera sampler table entry,
-        // bindless textures, and the material SSBO.
+        // Build a single update that covers camera UBOs, bindless
+        // textures, the sampler table, and the material SSBO.
+        let n_cams = camera_descriptor_sets.len();
         let mut desc_builder =
             rgpu_vk::descriptor::DescriptorUpdateBuilder::with_capacity(
-                camera_descriptor_sets.len() * 2 + textures.len() + 1,
-                camera_descriptor_sets.len() * 2 + textures.len() + 1,
+                n_cams * 2 + textures.len() + 1,
+                n_cams * 16 + textures.len() + 1,
             );
 
         // Camera UBOs
@@ -2397,26 +2446,19 @@ impl AppRunner {
             );
         }
 
-        // Sampler table: write the default sampler (Anisotropic + Repeat) into
-        // the sampler table slot expected by the shader's `getSamplerIndex`
-        // mapping. The default index is (FILTER_ANISOTROPIC * 5) + ADDR_REPEAT = 10.
-        const SAMPLER_OOB_COUNT: u32 = 5;
-        const SAMPLER_FILTER_ANISOTROPIC: u32 = 2;
-        const SAMPLER_ADDR_REPEAT: u32 = 0;
-        let default_sampler_index = SAMPLER_FILTER_ANISOTROPIC
-            * SAMPLER_OOB_COUNT
-            + SAMPLER_ADDR_REPEAT;
-
+        // Sampler table — write all 15 entries as one batched write
+        // starting at array element 0 (matches getSamplerIndex layout).
         for set in camera_descriptor_sets.iter() {
-            let sampler_info = vk::DescriptorImageInfo::default()
-                .sampler(sampler.raw_sampler());
-            desc_builder.push_write_image_info(
+            let write_idx = desc_builder.push_write_image_info(
                 set.raw_descriptor_set(),
                 1,
                 vk::DescriptorType::SAMPLER,
-                default_sampler_index,
-                sampler_info,
+                0,
+                samplers[0].descriptor_image_info(),
             );
+            for s in &samplers[1..] {
+                desc_builder.push_sampler(write_idx, s);
+            }
         }
 
         // Upload the material SSBO (host-visible; written once at load).
@@ -2479,7 +2521,7 @@ impl AppRunner {
             start_time: Instant::now(),
             asset_map,
             textures,
-            sampler,
+            samplers,
             material_ssbo,
         })
     }
@@ -2633,7 +2675,7 @@ impl AppRunner {
             start_time: state.start_time,
             asset_map: state.asset_map,
             textures: state.textures,
-            sampler: state.sampler,
+            samplers: state.samplers,
             material_ssbo: state.material_ssbo,
         })
     }
