@@ -39,6 +39,7 @@ use rgpu_vk::{
     swapchain::Swapchain,
     sync::{Fence, Semaphore},
 };
+use tracy_client::Client as TracyClient;
 use vek::{Mat4, Vec2, Vec3};
 use winit::{
     application::ApplicationHandler,
@@ -357,6 +358,10 @@ pub fn main() -> eyre::Result<()> {
         .unwrap_or_else(|| app_dirs.data_dir())
         .to_owned();
 
+    // Start the Tracy client. Degrades gracefully when no profiler is
+    // connected — data is written to a ring buffer and dropped.
+    let _tracy = TracyClient::start();
+
     let cli_args = CliArgs::parse();
 
     let mut targets: std::collections::HashMap<String, TracingLogLevel> =
@@ -447,7 +452,8 @@ pub fn main() -> eyre::Result<()> {
         queue_config_strict: cli_args.queue_config_strict,
         min_sample_count: cli_args.aa.sample_count(),
         min_sample_count_strict: cli_args.aa_strict,
-        descriptor_indexing: true,
+        resource_indexing: true,
+        sampler_anisotropy: true,
     };
 
     let mut app = AppRunner(Some(App::Initializing(InitializingState {
@@ -630,7 +636,7 @@ struct RunningState {
     start_time: Instant,
     asset_map: AssetMap,
     textures: Vec<Texture>,
-    sampler: Sampler,
+    samplers: Vec<Sampler>,
     /// Host-visible SSBO holding one MaterialGpu per submesh draw.
     material_ssbo: HostVisibleBuffer,
 }
@@ -682,7 +688,7 @@ struct SuspendedState {
     start_time: Instant,
     asset_map: AssetMap,
     textures: Vec<Texture>,
-    sampler: Sampler,
+    samplers: Vec<Sampler>,
     material_ssbo: HostVisibleBuffer,
 }
 #[derive(Debug)]
@@ -771,7 +777,7 @@ impl ApplicationHandler for AppRunner {
                 start_time,
                 asset_map,
                 textures,
-                sampler,
+                samplers,
                 material_ssbo,
             } = running_state;
 
@@ -807,7 +813,7 @@ impl ApplicationHandler for AppRunner {
                 start_time,
                 asset_map,
                 textures,
-                sampler,
+                samplers,
                 material_ssbo,
             });
         }
@@ -1484,8 +1490,10 @@ impl AppRunner {
 
         let asset_map_path =
             state.self_dir.join("assets").join("asset_map.toml");
-        let asset_map =
-            AssetMap::load(&asset_map_path).map_err(|e| eyre::eyre!("{e}"))?;
+        let asset_map = {
+            let _span = tracy_client::span!("asset_map_load");
+            AssetMap::load(&asset_map_path).map_err(|e| eyre::eyre!("{e}"))?
+        };
 
         let assets_dir = state.self_dir.join("assets");
 
@@ -1570,6 +1578,7 @@ impl AppRunner {
             let tex_file = asset_map.get(id).ok_or_else(|| {
                 eyre::eyre!("texture '{tex_name}' not in asset map")
             })?;
+            let _tex_span = tracy_client::span!("load_texture");
             let tex_asset = TexAsset::open(&assets_dir.join(tex_file))
                 .map_err(|e| eyre::eyre!("load {tex_name}: {e}"))?;
             let fmt = tex_vk_format(
@@ -1602,6 +1611,7 @@ impl AppRunner {
             Ok(slot)
         };
 
+        let _scene_load_span = tracy_client::span!("scene_load");
         for (model_idx, &mesh_name) in mesh_names.iter().enumerate() {
             let mesh_filename = asset_map
                 .get(mesh_id(mesh_name))
@@ -1704,6 +1714,7 @@ impl AppRunner {
                 });
             }
         }
+        drop(_scene_load_span);
 
         let max_mip_count = tex_load_infos
             .iter()
@@ -1752,10 +1763,6 @@ impl AppRunner {
             &device,
             Some("upload command pool"),
         )?;
-        // SAFETY: this is the first and only allocation from this pool.
-        let mut upload_cmd =
-            unsafe { upload_command_pool.allocate_command_buffer()? };
-        let mut upload_rec = upload_cmd.begin_recording();
 
         let tex_capacity = tex_load_infos.len();
         let mut used_staging_buffers = Vec::with_capacity(tex_capacity + 2);
@@ -1856,7 +1863,8 @@ impl AppRunner {
                     descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                     count: MAX_BINDLESS_TEXTURES as u32,
                     stage_flags: vk::ShaderStageFlags::FRAGMENT,
-                    binding_flags: vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+                    binding_flags: vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
                 },
                 DescriptorBindingDesc {
                     binding: 1,
@@ -1992,7 +2000,11 @@ impl AppRunner {
                     descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
                 },
                 vk::DescriptorPoolSize {
-                    ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    ty: vk::DescriptorType::SAMPLER,
+                    descriptor_count: 15 * MAX_FRAMES_IN_FLIGHT as u32,
+                },
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::SAMPLED_IMAGE,
                     descriptor_count: MAX_BINDLESS_TEXTURES as u32,
                 },
                 vk::DescriptorPoolSize {
@@ -2000,6 +2012,7 @@ impl AppRunner {
                     descriptor_count: 1,
                 },
             ],
+            true,
             Some("descriptor pool"),
         )?;
 
@@ -2028,34 +2041,6 @@ impl AppRunner {
             .expect("allocated exactly one material set");
         material_descriptor_set.set_name(&device, Some("material set"));
 
-        // SAFETY: We are recording
-        unsafe {
-            upload_rec.begin_debug_label(DebugLabel {
-                name: "initial buffer data upload",
-                ty: command::DebugLabelType::BufferUpload,
-            })
-        };
-
-        // Create one staging buffer + Texture per unique albedo, then
-        // record all copies into the shared upload command buffer.
-        //
-        // SAFETY: upload_cmd is in the recording state (begun above);
-        // all staging buffers remain alive until the fence wait below.
-        unsafe {
-            vertex_buffer
-                .record_upload_from(&mut upload_rec, &staging_vertex_buffer)
-        }?;
-        used_staging_buffers.push(staging_vertex_buffer);
-        // SAFETY: same as vertex buffer copy above.
-        unsafe {
-            index_buffer
-                .record_upload_from(&mut upload_rec, &staging_index_buffer)
-        }?;
-        used_staging_buffers.push(staging_index_buffer);
-
-        // SAFETY: We are recording
-        unsafe { upload_rec.end_debug_label() };
-
         struct UploadImageCommand<'a> {
             texture: Texture,
             regions: Vec<BufferImageCopy>,
@@ -2064,6 +2049,7 @@ impl AppRunner {
         }
         let mut image_upload_commands = Vec::with_capacity(tex_capacity);
 
+        let _staging_write_span = tracy_client::span!("staging_buffer_write");
         for tli in &tex_load_infos {
             let name = &tli.name;
 
@@ -2111,6 +2097,7 @@ impl AppRunner {
                 name,
             });
         }
+        drop(_staging_write_span);
 
         let texture_pre_upload_barriers: Vec<_> = image_upload_commands
             .iter()
@@ -2126,6 +2113,39 @@ impl AppRunner {
                     .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             })
             .collect();
+
+        // SAFETY: this is the first and only allocation from this pool.
+        let mut upload_cmd =
+            unsafe { upload_command_pool.allocate_command_buffer()? };
+        let mut upload_rec = upload_cmd.begin_recording();
+
+        // SAFETY: We are recording
+        unsafe {
+            upload_rec.begin_debug_label(DebugLabel {
+                name: "initial buffer data upload",
+                ty: command::DebugLabelType::BufferUpload,
+            })
+        };
+
+        // Create one staging buffer + Texture per unique albedo, then
+        // record all copies into the shared upload command buffer.
+        //
+        // SAFETY: upload_cmd is in the recording state (begun above);
+        // all staging buffers remain alive until the fence wait below.
+        unsafe {
+            vertex_buffer
+                .record_upload_from(&mut upload_rec, &staging_vertex_buffer)
+        }?;
+        used_staging_buffers.push(staging_vertex_buffer);
+        // SAFETY: same as vertex buffer copy above.
+        unsafe {
+            index_buffer
+                .record_upload_from(&mut upload_rec, &staging_index_buffer)
+        }?;
+        used_staging_buffers.push(staging_index_buffer);
+
+        // SAFETY: We are recording
+        unsafe { upload_rec.end_debug_label() };
         // SAFETY: All barriers are valid
         unsafe {
             upload_rec.pipeline_barrier2_by_barriers(
@@ -2187,15 +2207,6 @@ impl AppRunner {
             })
             .collect();
 
-        // Safety: Valid barriers
-        unsafe {
-            upload_rec.pipeline_barrier2_by_barriers(
-                &[],
-                &[],
-                &texture_post_upload_barriers,
-            );
-        }
-
         let mut buffer_barriers = Vec::new();
         if queue_config.dedicated_transfer {
             let vertex_buffer_barrier = vertex_buffer
@@ -2216,6 +2227,16 @@ impl AppRunner {
 
             buffer_barriers = vec![vertex_buffer_barrier, index_buffer_barrier];
         }
+
+        // Safety: Valid barriers
+        unsafe {
+            upload_rec.pipeline_barrier2_by_barriers(
+                &[],
+                &[],
+                &texture_post_upload_barriers,
+            );
+        }
+
         if !buffer_barriers.is_empty() {
             // SAFETY: recording state; buffer handles valid for the
             // duration of this command buffer.
@@ -2349,25 +2370,70 @@ impl AppRunner {
         }
         // `wait` is safe and does not require additional invariants beyond
         // a valid fence; call it directly.
-        upload_fence.wait(u64::MAX)?;
+        {
+            let _span = tracy_client::span!("gpu_upload_fence_wait");
+            upload_fence.wait(u64::MAX)?;
+        }
 
-        let sampler = rgpu_vk::sampler::Sampler::new(
-            &device,
-            vk::Filter::LINEAR,
-            vk::Filter::LINEAR,
-            vk::SamplerAddressMode::CLAMP_TO_EDGE,
-            max_mip_count,
-            Some("albedo sampler"),
-        )?;
+        // Build the full 15-entry sampler table matching the shader's
+        // getSamplerIndex layout: index = filter * OOB_COUNT + addr.
+        // Filters 0=NEAREST, 1=LINEAR, 2=ANISOTROPIC.
+        // Addresses 0=REPEAT, 1=CLAMP_TO_EDGE, 2=MIRROR,
+        //           3=TRANSPARENT_BORDER, 4=CLAMP_TO_BORDER_WHITE.
+        const SAMPLER_TABLE_SIZE: usize = 15;
+        let max_anisotropy = device.properties().limits.max_sampler_anisotropy;
+        // (filter_filter, min_filter, anisotropy, addr_mode, border_color)
+        let addr_modes = [
+            (
+                vk::SamplerAddressMode::REPEAT,
+                vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            ),
+            (
+                vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            ),
+            (
+                vk::SamplerAddressMode::MIRRORED_REPEAT,
+                vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            ),
+            (
+                vk::SamplerAddressMode::CLAMP_TO_BORDER,
+                vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            ),
+            (
+                vk::SamplerAddressMode::CLAMP_TO_BORDER,
+                vk::BorderColor::FLOAT_OPAQUE_WHITE,
+            ),
+        ];
+        let filter_params: [(vk::Filter, Option<f32>); 3] = [
+            (vk::Filter::NEAREST, None),
+            (vk::Filter::LINEAR, None),
+            (vk::Filter::LINEAR, Some(max_anisotropy)),
+        ];
+        let mut samplers: Vec<Sampler> = Vec::with_capacity(SAMPLER_TABLE_SIZE);
+        for (fi, (filter, aniso)) in filter_params.iter().enumerate() {
+            for (ai, (addr, border)) in addr_modes.iter().enumerate() {
+                let label = format!("sampler f{fi} a{ai}");
+                samplers.push(Sampler::new(
+                    &device,
+                    *filter,
+                    *filter,
+                    *addr,
+                    max_mip_count,
+                    *aniso,
+                    *border,
+                    Some(label.as_str()),
+                )?);
+            }
+        }
 
-        // Build a single update that covers camera UBOs, bindless textures,
-        // and the material SSBO, and apply it once.
-        // Reserve space for camera UBOs, per-camera sampler table entry,
-        // bindless textures, and the material SSBO.
+        // Build a single update that covers camera UBOs, bindless
+        // textures, the sampler table, and the material SSBO.
+        let n_cams = camera_descriptor_sets.len();
         let mut desc_builder =
             rgpu_vk::descriptor::DescriptorUpdateBuilder::with_capacity(
-                camera_descriptor_sets.len() * 2 + textures.len() + 1,
-                camera_descriptor_sets.len() * 2 + textures.len() + 1,
+                n_cams * 2 + textures.len() + 1,
+                n_cams * 16 + textures.len() + 1,
             );
 
         // Camera UBOs
@@ -2397,26 +2463,19 @@ impl AppRunner {
             );
         }
 
-        // Sampler table: write the default sampler (Anisotropic + Repeat) into
-        // the sampler table slot expected by the shader's `getSamplerIndex`
-        // mapping. The default index is (FILTER_ANISOTROPIC * 5) + ADDR_REPEAT = 10.
-        const SAMPLER_OOB_COUNT: u32 = 5;
-        const SAMPLER_FILTER_ANISOTROPIC: u32 = 2;
-        const SAMPLER_ADDR_REPEAT: u32 = 0;
-        let default_sampler_index = SAMPLER_FILTER_ANISOTROPIC
-            * SAMPLER_OOB_COUNT
-            + SAMPLER_ADDR_REPEAT;
-
+        // Sampler table — write all 15 entries as one batched write
+        // starting at array element 0 (matches getSamplerIndex layout).
         for set in camera_descriptor_sets.iter() {
-            let sampler_info = vk::DescriptorImageInfo::default()
-                .sampler(sampler.raw_sampler());
-            desc_builder.push_write_image_info(
+            let write_idx = desc_builder.push_write_image_info(
                 set.raw_descriptor_set(),
                 1,
                 vk::DescriptorType::SAMPLER,
-                default_sampler_index,
-                sampler_info,
+                0,
+                samplers[0].descriptor_image_info(),
             );
+            for s in &samplers[1..] {
+                desc_builder.push_sampler(write_idx, s);
+            }
         }
 
         // Upload the material SSBO (host-visible; written once at load).
@@ -2479,7 +2538,7 @@ impl AppRunner {
             start_time: Instant::now(),
             asset_map,
             textures,
-            sampler,
+            samplers,
             material_ssbo,
         })
     }
@@ -2633,7 +2692,7 @@ impl AppRunner {
             start_time: state.start_time,
             asset_map: state.asset_map,
             textures: state.textures,
-            sampler: state.sampler,
+            samplers: state.samplers,
             material_ssbo: state.material_ssbo,
         })
     }

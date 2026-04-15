@@ -456,11 +456,20 @@ pub struct DeviceConfig {
     /// `min_sample_count`. When `false` (the default), unsupported devices are
     /// still considered but score lower.
     pub min_sample_count_strict: bool,
-    /// Enable `VkPhysicalDeviceDescriptorIndexingFeatures` with
-    /// `descriptor_binding_partially_bound`. Core in Vulkan 1.2; on older
-    /// devices requires `VK_EXT_descriptor_indexing` and its dependency
+    /// Enable resource indexing: large partially-bound descriptor arrays
+    /// with non-uniform shader indexing and update-after-bind, for
+    /// sampled images, storage buffers, and storage images.
+    ///
+    /// Requires a subset of `VkPhysicalDeviceDescriptorIndexingFeatures`.
+    /// Input-attachment, texel-buffer, and uniform-buffer subfeatures
+    /// are intentionally excluded — they are unused in this codebase.
+    /// Core in Vulkan 1.2; on older devices requires
+    /// `VK_EXT_descriptor_indexing` and its dependency
     /// `VK_KHR_maintenance3`.
-    pub descriptor_indexing: bool,
+    pub resource_indexing: bool,
+    /// Enable `VkPhysicalDeviceFeatures::samplerAnisotropy`.
+    /// Hard device filter: devices that do not support it are skipped.
+    pub sampler_anisotropy: bool,
 }
 
 /// Returns `true` if the physical device supports all synchronization2
@@ -493,53 +502,52 @@ fn dynamic_rendering_fully_supported(
     dynamic_rendering == vk::TRUE
 }
 
-/// Returns `true` if the physical device supports all descriptor indexing
-/// sub-features. Destructures the struct exhaustively (excluding `s_type`,
-/// `p_next`, and `_marker`) so the compiler catches any future field additions.
-fn descriptor_indexing_fully_supported(
+/// Returns `true` if the physical device supports the minimum set of
+/// descriptor indexing sub-features required for resource indexing.
+/// Destructures the struct exhaustively (excluding `s_type`, `p_next`,
+/// and `_marker`) so the compiler catches any future field additions.
+///
+/// Excluded (prefixed `_`, not required):
+/// - Input-attachment features: subpass-only, incompatible with dynamic
+///   rendering.
+/// - Texel-buffer features: unused in this codebase; 1D sampled images
+///   or SSBOs cover all our needs.
+/// - Uniform-buffer non-uniform / update-after-bind: UBOs are not
+///   accessed through large descriptor arrays.
+fn resource_indexing_supported(
     f: vk::PhysicalDeviceDescriptorIndexingFeatures<'_>,
 ) -> bool {
     let vk::PhysicalDeviceDescriptorIndexingFeatures {
         s_type: _,
         p_next: _,
-        shader_input_attachment_array_dynamic_indexing,
-        shader_uniform_texel_buffer_array_dynamic_indexing,
-        shader_storage_texel_buffer_array_dynamic_indexing,
-        shader_uniform_buffer_array_non_uniform_indexing,
+        shader_input_attachment_array_dynamic_indexing: _,
+        shader_uniform_texel_buffer_array_dynamic_indexing: _,
+        shader_storage_texel_buffer_array_dynamic_indexing: _,
+        shader_uniform_buffer_array_non_uniform_indexing: _,
         shader_sampled_image_array_non_uniform_indexing,
         shader_storage_buffer_array_non_uniform_indexing,
         shader_storage_image_array_non_uniform_indexing,
-        shader_input_attachment_array_non_uniform_indexing,
-        shader_uniform_texel_buffer_array_non_uniform_indexing,
-        shader_storage_texel_buffer_array_non_uniform_indexing,
-        descriptor_binding_uniform_buffer_update_after_bind,
+        shader_input_attachment_array_non_uniform_indexing: _,
+        shader_uniform_texel_buffer_array_non_uniform_indexing: _,
+        shader_storage_texel_buffer_array_non_uniform_indexing: _,
+        descriptor_binding_uniform_buffer_update_after_bind: _,
         descriptor_binding_sampled_image_update_after_bind,
         descriptor_binding_storage_image_update_after_bind,
         descriptor_binding_storage_buffer_update_after_bind,
-        descriptor_binding_uniform_texel_buffer_update_after_bind,
-        descriptor_binding_storage_texel_buffer_update_after_bind,
+        descriptor_binding_uniform_texel_buffer_update_after_bind: _,
+        descriptor_binding_storage_texel_buffer_update_after_bind: _,
         descriptor_binding_update_unused_while_pending,
         descriptor_binding_partially_bound,
         descriptor_binding_variable_descriptor_count,
         runtime_descriptor_array,
         _marker: _,
     } = f;
-    shader_input_attachment_array_dynamic_indexing == vk::TRUE
-        && shader_uniform_texel_buffer_array_dynamic_indexing == vk::TRUE
-        && shader_storage_texel_buffer_array_dynamic_indexing == vk::TRUE
-        && shader_uniform_buffer_array_non_uniform_indexing == vk::TRUE
-        && shader_sampled_image_array_non_uniform_indexing == vk::TRUE
+    shader_sampled_image_array_non_uniform_indexing == vk::TRUE
         && shader_storage_buffer_array_non_uniform_indexing == vk::TRUE
         && shader_storage_image_array_non_uniform_indexing == vk::TRUE
-        && shader_input_attachment_array_non_uniform_indexing == vk::TRUE
-        && shader_uniform_texel_buffer_array_non_uniform_indexing == vk::TRUE
-        && shader_storage_texel_buffer_array_non_uniform_indexing == vk::TRUE
-        && descriptor_binding_uniform_buffer_update_after_bind == vk::TRUE
         && descriptor_binding_sampled_image_update_after_bind == vk::TRUE
         && descriptor_binding_storage_image_update_after_bind == vk::TRUE
         && descriptor_binding_storage_buffer_update_after_bind == vk::TRUE
-        && descriptor_binding_uniform_texel_buffer_update_after_bind == vk::TRUE
-        && descriptor_binding_storage_texel_buffer_update_after_bind == vk::TRUE
         && descriptor_binding_update_unused_while_pending == vk::TRUE
         && descriptor_binding_partially_bound == vk::TRUE
         && descriptor_binding_variable_descriptor_count == vk::TRUE
@@ -573,8 +581,8 @@ impl Device {
             if config.dynamic_rendering {
                 needs_features2.push("dynamic_rendering");
             }
-            if config.descriptor_indexing {
-                needs_features2.push("descriptor_indexing");
+            if config.resource_indexing {
+                needs_features2.push("resource_indexing");
             }
             if !needs_features2.is_empty() {
                 return Err(CreateCompatibleError::PhysDevFeatures2Required(
@@ -619,9 +627,9 @@ impl Device {
             /// True when VK_EXT_memory_budget is supported and should be
             /// enabled.
             enable_memory_budget: bool,
-            /// True when `VK_EXT_descriptor_indexing` must be enabled (pre-1.2
-            /// device).
-            use_descriptor_indexing_ext: bool,
+            /// True when `VK_EXT_descriptor_indexing` must be enabled
+            /// (pre-1.2 device).
+            use_resource_indexing_ext: bool,
         }
 
         //Capacity here is upper bound
@@ -644,16 +652,17 @@ impl Device {
             // created with vk_1_0_strict, treat every device as pre-1.3 and
             // pre-1.1 so that the extension code paths are always exercised.
             let dev_api =
-                crate::instance::VkVersion::from_raw(props.api_version);
+                crate::version::VkVersion::from_raw(props.api_version);
+            let ver = dev_api.version;
             let is_pre_1_3 = instance.strict_1_0()
-                || dev_api.major() < 1
-                || (dev_api.major() == 1 && dev_api.minor() < 3);
+                || ver.major < 1
+                || (ver.major == 1 && ver.minor < 3);
             let is_pre_1_2 = instance.strict_1_0()
-                || dev_api.major() < 1
-                || (dev_api.major() == 1 && dev_api.minor() < 2);
+                || ver.major < 1
+                || (ver.major == 1 && ver.minor < 2);
             let is_pre_1_1 = instance.strict_1_0()
-                || dev_api.major() < 1
-                || (dev_api.major() == 1 && dev_api.minor() < 1);
+                || ver.major < 1
+                || (ver.major == 1 && ver.minor < 1);
 
             // VK_KHR_swapchain is never promoted to core; always check it when
             // requested. Other extensions are only extensions on pre-1.3
@@ -734,8 +743,8 @@ impl Device {
             // VK_EXT_descriptor_indexing: core in 1.2; required extension on
             // older devices when requested — hard filter. Also requires
             // VK_KHR_maintenance3.
-            let use_descriptor_indexing_ext =
-                if config.descriptor_indexing && is_pre_1_2 {
+            let use_resource_indexing_ext =
+                if config.resource_indexing && is_pre_1_2 {
                     if has_ext(ash::khr::maintenance3::NAME)
                         && has_ext(ash::ext::descriptor_indexing::NAME)
                     {
@@ -862,7 +871,8 @@ impl Device {
             // all sub-features rather than checking individually.
             if config.synchronization2
                 || config.dynamic_rendering
-                || config.descriptor_indexing
+                || config.resource_indexing
+                || config.sampler_anisotropy
             {
                 let mut q_sync2 =
                     vk::PhysicalDeviceSynchronization2Features::default();
@@ -877,7 +887,7 @@ impl Device {
                 if config.dynamic_rendering {
                     q = q.push_next(&mut q_dr);
                 }
-                if config.descriptor_indexing {
+                if config.resource_indexing {
                     q = q.push_next(&mut q_di);
                 }
                 // SAFETY: dev was derived from instance; all structs in the
@@ -885,12 +895,17 @@ impl Device {
                 unsafe {
                     instance.get_physical_device_features2(dev, &mut q);
                 }
+                // Copy q.features.sampler_anisotropy before q_sync2/q_dr/q_di
+                // are moved into the support-check functions below.
+                let q_sampler_anisotropy = q.features.sampler_anisotropy;
                 let supported = (!config.synchronization2
                     || sync2_fully_supported(q_sync2))
                     && (!config.dynamic_rendering
                         || dynamic_rendering_fully_supported(q_dr))
-                    && (!config.descriptor_indexing
-                        || descriptor_indexing_fully_supported(q_di));
+                    && (!config.resource_indexing
+                        || resource_indexing_supported(q_di))
+                    && (!config.sampler_anisotropy
+                        || q_sampler_anisotropy == vk::TRUE);
                 if !supported {
                     tracing::debug!(
                         "Skipping {:?}: missing required feature sub-fields",
@@ -918,7 +933,7 @@ impl Device {
                 use_maintenance1_ext,
                 enable_shader_non_semantic,
                 enable_memory_budget,
-                use_descriptor_indexing_ext,
+                use_resource_indexing_ext,
             });
         }
 
@@ -936,7 +951,7 @@ impl Device {
         let use_sync2_ext = best.use_sync2_ext;
         let use_dr_ext = best.use_dr_ext;
         let use_maintenance1_ext = best.use_maintenance1_ext;
-        let use_descriptor_indexing_ext = best.use_descriptor_indexing_ext;
+        let use_resource_indexing_ext = best.use_resource_indexing_ext;
         // SAFETY: physical_device was selected from this instance.
         let memory_properties = unsafe {
             instance.get_raw_physical_device_memory_properties(physical_device)
@@ -1106,7 +1121,7 @@ impl Device {
         if use_maintenance1_ext {
             mandatory_exts.insert(ash::khr::maintenance1::NAME);
         }
-        if use_descriptor_indexing_ext {
+        if use_resource_indexing_ext {
             mandatory_exts.insert(ash::khr::maintenance3::NAME);
             mandatory_exts.insert(ash::ext::descriptor_indexing::NAME);
         }
@@ -1122,12 +1137,12 @@ impl Device {
             vk::PhysicalDeviceSynchronization2Features::default();
         let mut q_dr_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default();
-        let mut q_descriptor_indexing_features =
+        let mut q_resource_indexing_features =
             vk::PhysicalDeviceDescriptorIndexingFeatures::default();
 
         if config.synchronization2
             || config.dynamic_rendering
-            || config.descriptor_indexing
+            || config.resource_indexing
         {
             let mut query = vk::PhysicalDeviceFeatures2::default();
             if config.synchronization2 {
@@ -1136,8 +1151,8 @@ impl Device {
             if config.dynamic_rendering {
                 query = query.push_next(&mut q_dr_features);
             }
-            if config.descriptor_indexing {
-                query = query.push_next(&mut q_descriptor_indexing_features);
+            if config.resource_indexing {
+                query = query.push_next(&mut q_resource_indexing_features);
             }
             // SAFETY: physical_device was selected from this instance; all
             // structs in the pNext chain are valid and properly initialised
@@ -1162,47 +1177,47 @@ impl Device {
             ..Default::default()
         };
 
-        let mut descriptor_indexing_features =
+        let mut resource_indexing_features =
             vk::PhysicalDeviceDescriptorIndexingFeatures {
-                shader_input_attachment_array_dynamic_indexing: q_descriptor_indexing_features
+                shader_input_attachment_array_dynamic_indexing: q_resource_indexing_features
                     .shader_input_attachment_array_dynamic_indexing,
-                shader_uniform_texel_buffer_array_dynamic_indexing: q_descriptor_indexing_features
+                shader_uniform_texel_buffer_array_dynamic_indexing: q_resource_indexing_features
                     .shader_uniform_texel_buffer_array_dynamic_indexing,
-                shader_storage_texel_buffer_array_dynamic_indexing: q_descriptor_indexing_features
+                shader_storage_texel_buffer_array_dynamic_indexing: q_resource_indexing_features
                     .shader_storage_texel_buffer_array_dynamic_indexing,
-                shader_uniform_buffer_array_non_uniform_indexing: q_descriptor_indexing_features
+                shader_uniform_buffer_array_non_uniform_indexing: q_resource_indexing_features
                     .shader_uniform_buffer_array_non_uniform_indexing,
-                shader_sampled_image_array_non_uniform_indexing: q_descriptor_indexing_features
+                shader_sampled_image_array_non_uniform_indexing: q_resource_indexing_features
                     .shader_sampled_image_array_non_uniform_indexing,
-                shader_storage_buffer_array_non_uniform_indexing: q_descriptor_indexing_features
+                shader_storage_buffer_array_non_uniform_indexing: q_resource_indexing_features
                     .shader_storage_buffer_array_non_uniform_indexing,
-                shader_storage_image_array_non_uniform_indexing: q_descriptor_indexing_features
+                shader_storage_image_array_non_uniform_indexing: q_resource_indexing_features
                     .shader_storage_image_array_non_uniform_indexing,
-                shader_input_attachment_array_non_uniform_indexing: q_descriptor_indexing_features
+                shader_input_attachment_array_non_uniform_indexing: q_resource_indexing_features
                     .shader_input_attachment_array_non_uniform_indexing,
-                shader_uniform_texel_buffer_array_non_uniform_indexing: q_descriptor_indexing_features
+                shader_uniform_texel_buffer_array_non_uniform_indexing: q_resource_indexing_features
                     .shader_uniform_texel_buffer_array_non_uniform_indexing,
-                shader_storage_texel_buffer_array_non_uniform_indexing: q_descriptor_indexing_features
+                shader_storage_texel_buffer_array_non_uniform_indexing: q_resource_indexing_features
                     .shader_storage_texel_buffer_array_non_uniform_indexing,
-                descriptor_binding_uniform_buffer_update_after_bind: q_descriptor_indexing_features
+                descriptor_binding_uniform_buffer_update_after_bind: q_resource_indexing_features
                     .descriptor_binding_uniform_buffer_update_after_bind,
-                descriptor_binding_sampled_image_update_after_bind: q_descriptor_indexing_features
+                descriptor_binding_sampled_image_update_after_bind: q_resource_indexing_features
                     .descriptor_binding_sampled_image_update_after_bind,
-                descriptor_binding_storage_image_update_after_bind: q_descriptor_indexing_features
+                descriptor_binding_storage_image_update_after_bind: q_resource_indexing_features
                     .descriptor_binding_storage_image_update_after_bind,
-                descriptor_binding_storage_buffer_update_after_bind: q_descriptor_indexing_features
+                descriptor_binding_storage_buffer_update_after_bind: q_resource_indexing_features
                     .descriptor_binding_storage_buffer_update_after_bind,
-                descriptor_binding_uniform_texel_buffer_update_after_bind: q_descriptor_indexing_features
+                descriptor_binding_uniform_texel_buffer_update_after_bind: q_resource_indexing_features
                     .descriptor_binding_uniform_texel_buffer_update_after_bind,
-                descriptor_binding_storage_texel_buffer_update_after_bind: q_descriptor_indexing_features
+                descriptor_binding_storage_texel_buffer_update_after_bind: q_resource_indexing_features
                     .descriptor_binding_storage_texel_buffer_update_after_bind,
-                descriptor_binding_update_unused_while_pending: q_descriptor_indexing_features
+                descriptor_binding_update_unused_while_pending: q_resource_indexing_features
                     .descriptor_binding_update_unused_while_pending,
-                descriptor_binding_partially_bound: q_descriptor_indexing_features
+                descriptor_binding_partially_bound: q_resource_indexing_features
                     .descriptor_binding_partially_bound,
-                descriptor_binding_variable_descriptor_count: q_descriptor_indexing_features
+                descriptor_binding_variable_descriptor_count: q_resource_indexing_features
                     .descriptor_binding_variable_descriptor_count,
-                runtime_descriptor_array: q_descriptor_indexing_features.runtime_descriptor_array,
+                runtime_descriptor_array: q_resource_indexing_features.runtime_descriptor_array,
                 ..Default::default()
             };
 
@@ -1241,18 +1256,37 @@ impl Device {
             }
         }
 
-        if config.descriptor_indexing {
-            if use_descriptor_indexing_ext {
+        if config.resource_indexing {
+            if use_resource_indexing_ext {
                 features2 =
-                    features2.push_next(&mut descriptor_indexing_features);
+                    features2.push_next(&mut resource_indexing_features);
                 use_features2 = true;
             } else {
                 device_create_info = device_create_info
-                    .push_next(&mut descriptor_indexing_features);
+                    .push_next(&mut resource_indexing_features);
             }
         }
+        // Core Vulkan 1.0 features (VkPhysicalDeviceFeatures).
+        // Declared here so the reference passed to enabled_features()
+        // outlives the create_ash_device call below.
+        let mut core_features = vk::PhysicalDeviceFeatures::default();
+        if config.sampler_anisotropy {
+            core_features.sampler_anisotropy = vk::TRUE;
+        }
+        let need_core_features = config.sampler_anisotropy;
+
         if use_features2 {
+            // When VkPhysicalDeviceFeatures2 goes in the pNext chain,
+            // pEnabledFeatures must be NULL — set core features via
+            // features2.features instead.
+            if need_core_features {
+                features2.features = core_features;
+            }
             device_create_info = device_create_info.push_next(&mut features2);
+        } else if need_core_features {
+            // No features2 pNext chain: use pEnabledFeatures directly.
+            device_create_info =
+                device_create_info.enabled_features(&core_features);
         }
 
         // SAFETY: physical_device was derived from instance; device_create_info

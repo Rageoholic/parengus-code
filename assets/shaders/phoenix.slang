@@ -95,7 +95,8 @@ VertexOutput vert_main(VertexInput input)
 }
 
 [shader("fragment")]
-float4 frag_main(VertexOutput in_vert) : SV_Target
+float4 frag_main(VertexOutput in_vert)
+    : SV_Target
 {
 
     MaterialGpu mat = materials[push.material_idx];

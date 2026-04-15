@@ -28,22 +28,35 @@ impl Sampler {
     ///
     /// `mag_filter` and `min_filter` control the magnification/minification
     /// filters. `address_mode` is applied to all three axes (U/V/W).
-    /// Anisotropy and mip-mapping are disabled.
+    /// Pass `anisotropy: Some(max)` to enable anisotropic filtering at the
+    /// given max ratio (query `device.properties().limits
+    /// .max_sampler_anisotropy` for the hardware cap). `border_color` is
+    /// used when `address_mode` is `CLAMP_TO_BORDER`; pass
+    /// `vk::BorderColor::FLOAT_TRANSPARENT_BLACK` otherwise.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Arc<Device>,
         mag_filter: vk::Filter,
         min_filter: vk::Filter,
         address_mode: vk::SamplerAddressMode,
         mip_levels: u32,
+        anisotropy: Option<f32>,
+        border_color: vk::BorderColor,
         name: Option<&str>,
     ) -> Result<Self, vk::Result> {
+        let (aniso_enable, max_aniso) = match anisotropy {
+            Some(v) => (true, v),
+            None => (false, 1.0),
+        };
         let create_info = vk::SamplerCreateInfo::default()
             .mag_filter(mag_filter)
             .min_filter(min_filter)
             .address_mode_u(address_mode)
             .address_mode_v(address_mode)
             .address_mode_w(address_mode)
-            .anisotropy_enable(false)
+            .anisotropy_enable(aniso_enable)
+            .max_anisotropy(max_aniso)
+            .border_color(border_color)
             .unnormalized_coordinates(false)
             .compare_enable(false)
             .mipmap_mode(vk::SamplerMipmapMode::LINEAR)

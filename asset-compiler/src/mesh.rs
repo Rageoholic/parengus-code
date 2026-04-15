@@ -11,42 +11,7 @@ use asset_shared::{
     texture_id,
 };
 use path_slash::PathExt as _;
-
-// ── Vec3 helpers ──────────────────────────────────────────────────────────────
-
-#[inline]
-fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-#[inline]
-fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-#[inline]
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-#[inline]
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-#[inline]
-fn normalize(a: [f32; 3]) -> [f32; 3] {
-    let l = dot(a, a).sqrt();
-    if l < 1e-10 {
-        [0.0, 0.0, 1.0]
-    } else {
-        [a[0] / l, a[1] / l, a[2] / l]
-    }
-}
+use vek::{Mat4, Vec3};
 
 // ── Coordinate transform ──────────────────────────────────────────────────────
 
@@ -57,20 +22,78 @@ fn yup_to_zup(p: [f32; 3]) -> [f32; 3] {
     [p[0], -p[2], p[1]]
 }
 
+// ── glTF matrix conversion ────────────────────────────────────────────────────
+
+/// Convert a glTF column-major `[[f32; 4]; 4]` matrix to `Mat4<f32>`.
+fn mat4_from_gltf(m: [[f32; 4]; 4]) -> Mat4<f32> {
+    // from_col_array takes a flat [T; 16] in column-major order.
+    let [c0, c1, c2, c3] = m;
+    Mat4::from_col_array([
+        c0[0], c0[1], c0[2], c0[3], c1[0], c1[1], c1[2], c1[3], c2[0], c2[1],
+        c2[2], c2[3], c3[0], c3[1], c3[2], c3[3],
+    ])
+}
+
+// Convert a column-major 3×3 rotation matrix (r[col][row]) to
+// a quaternion [x, y, z, w] using Shepperd's method.
+// (vek 0.17 does not implement Quaternion::from(Mat3))
+fn rot_mat_to_quat(r: [[f32; 3]; 3]) -> [f32; 4] {
+    let (r00, r10, r20) = (r[0][0], r[0][1], r[0][2]);
+    let (r01, r11, r21) = (r[1][0], r[1][1], r[1][2]);
+    let (r02, r12, r22) = (r[2][0], r[2][1], r[2][2]);
+    let trace = r00 + r11 + r22;
+    let (x, y, z, w);
+    if trace > 0.0 {
+        let s = 0.5 / (trace + 1.0).sqrt();
+        w = 0.25 / s;
+        x = (r21 - r12) * s;
+        y = (r02 - r20) * s;
+        z = (r10 - r01) * s;
+    } else if r00 > r11 && r00 > r22 {
+        let s = 2.0 * (1.0 + r00 - r11 - r22).sqrt();
+        w = (r21 - r12) / s;
+        x = 0.25 * s;
+        y = (r01 + r10) / s;
+        z = (r02 + r20) / s;
+    } else if r11 > r22 {
+        let s = 2.0 * (1.0 + r11 - r00 - r22).sqrt();
+        w = (r02 - r20) / s;
+        x = (r01 + r10) / s;
+        y = 0.25 * s;
+        z = (r12 + r21) / s;
+    } else {
+        let s = 2.0 * (1.0 + r22 - r00 - r11).sqrt();
+        w = (r10 - r01) / s;
+        x = (r02 + r20) / s;
+        y = (r12 + r21) / s;
+        z = 0.25 * s;
+    }
+    [x, y, z, w]
+}
+
 // ── Normal generation ─────────────────────────────────────────────────────────
 
 fn gen_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
-    let mut acc = vec![[0.0f32; 3]; positions.len()];
+    let mut acc = vec![Vec3::<f32>::broadcast(0.0); positions.len()];
     for tri in indices.chunks_exact(3) {
         let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
-        let e1 = sub3(positions[i1], positions[i0]);
-        let e2 = sub3(positions[i2], positions[i0]);
-        let n = cross(e1, e2);
-        acc[i0] = add3(acc[i0], n);
-        acc[i1] = add3(acc[i1], n);
-        acc[i2] = add3(acc[i2], n);
+        let e1 = Vec3::from(positions[i1]) - Vec3::from(positions[i0]);
+        let e2 = Vec3::from(positions[i2]) - Vec3::from(positions[i0]);
+        let n = e1.cross(e2);
+        acc[i0] += n;
+        acc[i1] += n;
+        acc[i2] += n;
     }
-    acc.iter().map(|&n| normalize(n)).collect()
+    acc.iter()
+        .map(|&n| {
+            let l = n.magnitude();
+            if l < 1e-10 {
+                [0.0, 0.0, 1.0]
+            } else {
+                [n.x / l, n.y / l, n.z / l]
+            }
+        })
+        .collect()
 }
 
 // ── Tangent generation via bevy_mikktspace ────────────────────────────────────
@@ -231,8 +254,7 @@ fn role_from_str(s: &str) -> Result<TexRole, String> {
 
 // ── Main compile function ─────────────────────────────────────────────────────
 
-// FileHeader: 10 bytes; SectionHeader: 20 bytes
-const FILE_HEADER_SIZE: u32 = 10;
+const FILE_HEADER_SIZE: u32 = FileHeader::SERIALIZED_SIZE;
 const SECTION_HEADER_SIZE: u32 = 20;
 
 pub fn compile(
@@ -291,81 +313,22 @@ pub fn compile(
         }
     };
 
-    // Column-major 4×4 multiply: r[col][row] = Σ_k a[k][row] * b[col][k]
-    fn mat_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
-        let mut r = [[0.0f32; 4]; 4];
-        for col in 0..4 {
-            for row in 0..4 {
-                let mut s = 0.0f32;
-                for k in 0..4 {
-                    s += a[k][row] * b[col][k];
-                }
-                r[col][row] = s;
-            }
-        }
-        r
-    }
-
-    // Length of the 3-component vector in column `col` of a 4×4
-    // column-major matrix.
-    fn col_length(col: &[f32; 4]) -> f32 {
-        (col[0] * col[0] + col[1] * col[1] + col[2] * col[2]).sqrt()
-    }
-
-    // Convert a column-major 3×3 rotation matrix (r[col][row]) to
-    // a quaternion [x, y, z, w] using Shepperd's method.
-    fn rot_mat_to_quat(r: [[f32; 3]; 3]) -> [f32; 4] {
-        let (r00, r10, r20) = (r[0][0], r[0][1], r[0][2]);
-        let (r01, r11, r21) = (r[1][0], r[1][1], r[1][2]);
-        let (r02, r12, r22) = (r[2][0], r[2][1], r[2][2]);
-        let trace = r00 + r11 + r22;
-        let (x, y, z, w);
-        if trace > 0.0 {
-            let s = 0.5 / (trace + 1.0).sqrt();
-            w = 0.25 / s;
-            x = (r21 - r12) * s;
-            y = (r02 - r20) * s;
-            z = (r10 - r01) * s;
-        } else if r00 > r11 && r00 > r22 {
-            let s = 2.0 * (1.0 + r00 - r11 - r22).sqrt();
-            w = (r21 - r12) / s;
-            x = 0.25 * s;
-            y = (r01 + r10) / s;
-            z = (r02 + r20) / s;
-        } else if r11 > r22 {
-            let s = 2.0 * (1.0 + r11 - r00 - r22).sqrt();
-            w = (r02 - r20) / s;
-            x = (r01 + r10) / s;
-            y = 0.25 * s;
-            z = (r12 + r21) / s;
-        } else {
-            let s = 2.0 * (1.0 + r22 - r00 - r11).sqrt();
-            w = (r10 - r01) / s;
-            x = (r02 + r20) / s;
-            y = (r12 + r21) / s;
-            z = 0.25 * s;
-        }
-        [x, y, z, w]
-    }
-
     // Traverse nodes depth-first, composing world matrices and
     // extracting primitives.
     let scene = doc.scenes().next().ok_or("glTF has no scenes")?;
 
     // Stack: (node, world_matrix)
-    let mut stack: Vec<(gltf::Node, [[f32; 4]; 4])> = Vec::new();
+    let mut stack: Vec<(gltf::Node, Mat4<f32>)> = Vec::new();
     for root in scene.nodes() {
-        // root.transform().matrix() is available
-        let m = root.transform().matrix();
+        let m = mat4_from_gltf(root.transform().matrix());
         stack.push((root, m));
     }
 
     while let Some((node, world_m)) = stack.pop() {
         // push children with composed matrix
         for child in node.children() {
-            let cm = child.transform().matrix();
-            let composed = mat_mul(world_m, cm);
-            stack.push((child, composed));
+            let cm = mat4_from_gltf(child.transform().matrix());
+            stack.push((child, world_m * cm));
         }
 
         if let Some(mesh) = node.mesh() {
@@ -443,32 +406,28 @@ pub fn compile(
                     .extend(prim_indices.iter().map(|&i| i + vertex_base));
 
                 // Extract translation from column 3 (column-major).
-                let translation_yup =
-                    [world_m[3][0], world_m[3][1], world_m[3][2]];
-                let translation = yup_to_zup(translation_yup);
+                let col3 = world_m.cols.w;
+                let translation = yup_to_zup([col3.x, col3.y, col3.z]);
 
                 // Scale = length of each upper-3×3 column in Y-up
                 // space. Under Rx(+90°), scale_x stays with col0,
                 // scale_y (Z-up Y) comes from col2, scale_z (Z-up Z)
                 // comes from col1.
-                let sx = col_length(&world_m[0]);
-                let sy = col_length(&world_m[2]);
-                let sz = col_length(&world_m[1]);
+                let col_len =
+                    |c: vek::Vec4<f32>| Vec3::new(c.x, c.y, c.z).magnitude();
+                let sx = col_len(world_m.cols.x);
+                let sy = col_len(world_m.cols.z);
+                let sz = col_len(world_m.cols.y);
 
                 // Build the Z-up column vectors (without scale) and
                 // convert to a rotation quaternion.
                 let safe_div = |v: f32, s: f32| {
                     if s > 1e-10 { v / s } else { 0.0f32 }
                 };
-                let c0 =
-                    yup_to_zup([world_m[0][0], world_m[0][1], world_m[0][2]]);
-                let c1 = yup_to_zup([
-                    -world_m[2][0],
-                    -world_m[2][1],
-                    -world_m[2][2],
-                ]);
-                let c2 =
-                    yup_to_zup([world_m[1][0], world_m[1][1], world_m[1][2]]);
+                let mc = world_m.cols;
+                let c0 = yup_to_zup([mc.x.x, mc.x.y, mc.x.z]);
+                let c1 = yup_to_zup([-mc.z.x, -mc.z.y, -mc.z.z]);
+                let c2 = yup_to_zup([mc.y.x, mc.y.y, mc.y.z]);
                 let r3 = [
                     [
                         safe_div(c0[0], sx),
@@ -688,7 +647,7 @@ pub fn compile_to_writer<W: std::io::Write>(
 ) -> Result<(), String> {
     FileHeader {
         magic: PMESH_MAGIC,
-        version: VERSION,
+        version: VERSION.into(),
         section_count: sections.len() as u32,
     }
     .write_to(w)
@@ -768,7 +727,7 @@ mod tests {
 
         let hdr = FileHeader {
             magic: PMESH_MAGIC,
-            version: VERSION,
+            version: VERSION.into(),
             section_count: 7,
         };
         let mut buf: Vec<u8> = Vec::new();

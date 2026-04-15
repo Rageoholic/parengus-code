@@ -403,7 +403,8 @@ fn main() -> eyre::Result<()> {
         queue_config_strict: cli_args.queue_config_strict,
         min_sample_count: cli_args.aa.sample_count(),
         min_sample_count_strict: cli_args.aa_strict,
-        descriptor_indexing: false,
+        resource_indexing: false,
+        sampler_anisotropy: false,
     };
     let requested_sample_count = cli_args.aa.sample_count();
 
@@ -1473,6 +1474,7 @@ impl AppRunner {
                     descriptor_count: 1,
                 },
             ],
+            false,
             Some("descriptor pool"),
         )?;
 
@@ -1716,6 +1718,8 @@ impl AppRunner {
             vk::Filter::LINEAR,
             vk::SamplerAddressMode::CLAMP_TO_EDGE,
             1,
+            None,
+            vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
             Some("statue-tex sampler"),
         )?;
 

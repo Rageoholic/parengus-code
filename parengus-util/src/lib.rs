@@ -11,3 +11,6 @@
 pub mod float;
 pub mod iter;
 pub mod marker;
+pub mod version;
+
+pub use version::Version;

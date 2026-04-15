@@ -5,13 +5,12 @@
 //! optional surface instance extension loader. It exposes physical device
 //! queries and unsafe constructors for surfaces and logical devices.
 //!
-//! [`VkVersion`] is a thin newtype over the packed Vulkan version word.
-
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
 
 use crate::surface::CreateSurfaceError;
+use crate::version::VkVersion;
 use std::{
     ffi::{CStr, CString},
     fmt::Debug,
@@ -30,62 +29,6 @@ pub enum VulkanLogLevel {
     Info,
     Warning,
     Error,
-}
-
-/// A packed Vulkan API version number.
-///
-/// Wraps the 32-bit encoding used by `VkApplicationInfo` and
-/// `vkEnumerateInstanceVersion`. Construct from components with
-/// [`new`](Self::new), or wrap an already-encoded word with
-/// [`from_raw`](Self::from_raw).
-#[derive(Debug, Clone, Copy)]
-pub struct VkVersion(u32);
-
-impl VkVersion {
-    #[inline]
-    pub fn from_raw(raw: u32) -> Self {
-        Self(raw)
-    }
-
-    #[inline]
-    pub fn new(variant: u32, major: u32, minor: u32, patch: u32) -> Self {
-        Self(vk::make_api_version(variant, major, minor, patch))
-    }
-
-    #[inline]
-    pub fn variant(&self) -> u32 {
-        vk::api_version_variant(self.0)
-    }
-
-    #[inline]
-    pub fn major(&self) -> u32 {
-        vk::api_version_major(self.0)
-    }
-
-    #[inline]
-    pub fn minor(&self) -> u32 {
-        vk::api_version_minor(self.0)
-    }
-
-    #[inline]
-    pub fn patch(&self) -> u32 {
-        vk::api_version_patch(self.0)
-    }
-
-    #[inline]
-    pub fn to_tuple(&self) -> (u32, u32, u32, u32) {
-        (self.variant(), self.major(), self.minor(), self.patch())
-    }
-
-    #[inline]
-    pub fn from_tuple(tuple: (u32, u32, u32, u32)) -> Self {
-        Self::new(tuple.0, tuple.1, tuple.2, tuple.3)
-    }
-
-    #[inline]
-    pub fn to_raw(&self) -> u32 {
-        self.0
-    }
 }
 
 /// Dispatch target for `vkGetPhysicalDeviceFeatures2`.
@@ -680,32 +623,6 @@ impl Instance {
     #[inline]
     pub fn ash_instance(&self) -> &ash::Instance {
         &self.handle
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn vk_version_tuple_roundtrip() {
-        let version = VkVersion::new(1, 2, 3, 4);
-        let tuple = version.to_tuple();
-        let rebuilt = VkVersion::from_tuple(tuple);
-
-        assert_eq!(version.to_raw(), rebuilt.to_raw());
-    }
-
-    #[test]
-    fn vk_version_raw_roundtrip() {
-        let raw = vk::make_api_version(0, 1, 3, 275);
-        let version = VkVersion::from_raw(raw);
-
-        assert_eq!(version.to_raw(), raw);
-        assert_eq!(version.variant(), 0);
-        assert_eq!(version.major(), 1);
-        assert_eq!(version.minor(), 3);
-        assert_eq!(version.patch(), 275);
     }
 }
 
