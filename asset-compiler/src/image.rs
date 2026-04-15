@@ -13,8 +13,7 @@ use basis_universal::{
     CompressorParams, TranscodeParameters, Transcoder, TranscoderTextureFormat,
 };
 
-// FileHeader: 10 bytes; SectionHeader: 20 bytes
-const FILE_HEADER_SIZE: u32 = 10;
+const FILE_HEADER_SIZE: u32 = FileHeader::SERIALIZED_SIZE;
 const SECTION_HEADER_SIZE: u32 = 20;
 
 pub fn compile(
@@ -110,7 +109,7 @@ pub fn compile_to_writer<W: std::io::Write>(
 
     FileHeader {
         magic: PTEX_MAGIC,
-        version: VERSION,
+        version: VERSION.into(),
         section_count,
     }
     .write_to(w)

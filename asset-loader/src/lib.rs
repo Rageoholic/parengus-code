@@ -12,7 +12,8 @@ use std::os::windows::fs::FileExt as OsFileExtWindows;
 
 use asset_shared::{
     AssetId, ColorSpace, Compression, FileHeader, PMESH_MAGIC, PTEX_MAGIC,
-    SectionHeader, SectionKind, TexFormat, TexRole, TextureId, VERSION, fnv1a,
+    SectionHeader, SectionKind, TexFormat, TexRole, TextureId, VERSION,
+    Version, fnv1a,
 };
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -476,11 +477,9 @@ impl MeshAsset {
         if fhdr.magic != PMESH_MAGIC {
             return Err(fmt_err(format!("bad magic: {:#010x}", fhdr.magic)));
         }
-        if fhdr.version != VERSION {
-            return Err(fmt_err(format!(
-                "unsupported version {}",
-                fhdr.version
-            )));
+        let file_ver = Version::from(fhdr.version);
+        if !VERSION.is_compatible_with(file_ver) {
+            return Err(fmt_err(format!("unsupported version {}", file_ver)));
         }
 
         let mut sections = Vec::with_capacity(fhdr.section_count as usize);
@@ -878,11 +877,9 @@ impl TexAsset {
         if fhdr.magic != PTEX_MAGIC {
             return Err(fmt_err(format!("bad magic: {:#010x}", fhdr.magic)));
         }
-        if fhdr.version != VERSION {
-            return Err(fmt_err(format!(
-                "unsupported version {}",
-                fhdr.version
-            )));
+        let file_ver = Version::from(fhdr.version);
+        if !VERSION.is_compatible_with(file_ver) {
+            return Err(fmt_err(format!("unsupported version {}", file_ver)));
         }
 
         let mut sections = Vec::with_capacity(fhdr.section_count as usize);

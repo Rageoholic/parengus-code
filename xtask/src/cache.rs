@@ -6,10 +6,17 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize)]
 struct CacheMeta {
     src_hash: String,
+    asset_version: String,
     format: String,
     color_space: String,
     mips: bool,
     normal_map: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MeshMeta {
+    src_hash: String,
+    asset_version: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +54,22 @@ fn hash_file(path: &Path) -> Option<String> {
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
+pub fn lookup_mesh(name: &str, src: &Path) -> Option<PathBuf> {
+    let meta_p = meta_path(name, "pmesh");
+    let art_p = artifact_path(name, "pmesh");
+    if !meta_p.exists() || !art_p.exists() {
+        return None;
+    }
+    let meta_txt = fs::read_to_string(&meta_p).ok()?;
+    let meta: MeshMeta = toml::from_str(&meta_txt).ok()?;
+    let current_ver = asset_shared::VERSION.to_string();
+    if hash_file(src)? == meta.src_hash && meta.asset_version == current_ver {
+        Some(art_p)
+    } else {
+        None
+    }
+}
+
 pub fn lookup_image(
     name: &str,
     src: &Path,
@@ -62,7 +85,9 @@ pub fn lookup_image(
     }
     let meta_txt = fs::read_to_string(&meta_p).ok()?;
     let meta: CacheMeta = toml::from_str(&meta_txt).ok()?;
+    let current_ver = asset_shared::VERSION.to_string();
     if hash_file(src)? == meta.src_hash
+        && meta.asset_version == current_ver
         && meta.format == format
         && meta.color_space == color_space
         && meta.mips == mips
@@ -94,6 +119,22 @@ pub fn lookup_shader(
     }
 }
 
+/// Write the mesh cache metadata after compiling.
+pub(crate) fn write_mesh_meta(name: &str, src: &Path) -> std::io::Result<()> {
+    let meta_p = meta_path(name, "pmesh");
+    let src_hash = hash_file(src).ok_or_else(|| {
+        std::io::Error::other(format!("failed to hash {}", src.display()))
+    })?;
+    let meta = MeshMeta {
+        src_hash,
+        asset_version: asset_shared::VERSION.to_string(),
+    };
+    let tom = toml::to_string(&meta).unwrap();
+    let mut f = fs::File::create(&meta_p)?;
+    f.write_all(tom.as_bytes())?;
+    Ok(())
+}
+
 /// Write the image cache metadata after compiling directly into the
 /// cache artifact path. Does not copy the artifact.
 pub(crate) fn write_image_meta(
@@ -110,6 +151,7 @@ pub(crate) fn write_image_meta(
     })?;
     let meta = CacheMeta {
         src_hash,
+        asset_version: asset_shared::VERSION.to_string(),
         format: format.to_string(),
         color_space: color_space.to_string(),
         mips,

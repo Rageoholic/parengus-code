@@ -39,6 +39,7 @@ use rgpu_vk::{
     swapchain::Swapchain,
     sync::{Fence, Semaphore},
 };
+use tracy_client::Client as TracyClient;
 use vek::{Mat4, Vec2, Vec3};
 use winit::{
     application::ApplicationHandler,
@@ -356,6 +357,10 @@ pub fn main() -> eyre::Result<()> {
         .runtime_dir()
         .unwrap_or_else(|| app_dirs.data_dir())
         .to_owned();
+
+    // Start the Tracy client. Degrades gracefully when no profiler is
+    // connected — data is written to a ring buffer and dropped.
+    let _tracy = TracyClient::start();
 
     let cli_args = CliArgs::parse();
 
@@ -1485,8 +1490,10 @@ impl AppRunner {
 
         let asset_map_path =
             state.self_dir.join("assets").join("asset_map.toml");
-        let asset_map =
-            AssetMap::load(&asset_map_path).map_err(|e| eyre::eyre!("{e}"))?;
+        let asset_map = {
+            let _span = tracy_client::span!("asset_map_load");
+            AssetMap::load(&asset_map_path).map_err(|e| eyre::eyre!("{e}"))?
+        };
 
         let assets_dir = state.self_dir.join("assets");
 
@@ -1571,6 +1578,7 @@ impl AppRunner {
             let tex_file = asset_map.get(id).ok_or_else(|| {
                 eyre::eyre!("texture '{tex_name}' not in asset map")
             })?;
+            let _tex_span = tracy_client::span!("load_texture");
             let tex_asset = TexAsset::open(&assets_dir.join(tex_file))
                 .map_err(|e| eyre::eyre!("load {tex_name}: {e}"))?;
             let fmt = tex_vk_format(
@@ -1603,6 +1611,7 @@ impl AppRunner {
             Ok(slot)
         };
 
+        let _scene_load_span = tracy_client::span!("scene_load");
         for (model_idx, &mesh_name) in mesh_names.iter().enumerate() {
             let mesh_filename = asset_map
                 .get(mesh_id(mesh_name))
@@ -1705,6 +1714,7 @@ impl AppRunner {
                 });
             }
         }
+        drop(_scene_load_span);
 
         let max_mip_count = tex_load_infos
             .iter()
@@ -1753,10 +1763,6 @@ impl AppRunner {
             &device,
             Some("upload command pool"),
         )?;
-        // SAFETY: this is the first and only allocation from this pool.
-        let mut upload_cmd =
-            unsafe { upload_command_pool.allocate_command_buffer()? };
-        let mut upload_rec = upload_cmd.begin_recording();
 
         let tex_capacity = tex_load_infos.len();
         let mut used_staging_buffers = Vec::with_capacity(tex_capacity + 2);
@@ -2035,34 +2041,6 @@ impl AppRunner {
             .expect("allocated exactly one material set");
         material_descriptor_set.set_name(&device, Some("material set"));
 
-        // SAFETY: We are recording
-        unsafe {
-            upload_rec.begin_debug_label(DebugLabel {
-                name: "initial buffer data upload",
-                ty: command::DebugLabelType::BufferUpload,
-            })
-        };
-
-        // Create one staging buffer + Texture per unique albedo, then
-        // record all copies into the shared upload command buffer.
-        //
-        // SAFETY: upload_cmd is in the recording state (begun above);
-        // all staging buffers remain alive until the fence wait below.
-        unsafe {
-            vertex_buffer
-                .record_upload_from(&mut upload_rec, &staging_vertex_buffer)
-        }?;
-        used_staging_buffers.push(staging_vertex_buffer);
-        // SAFETY: same as vertex buffer copy above.
-        unsafe {
-            index_buffer
-                .record_upload_from(&mut upload_rec, &staging_index_buffer)
-        }?;
-        used_staging_buffers.push(staging_index_buffer);
-
-        // SAFETY: We are recording
-        unsafe { upload_rec.end_debug_label() };
-
         struct UploadImageCommand<'a> {
             texture: Texture,
             regions: Vec<BufferImageCopy>,
@@ -2071,6 +2049,7 @@ impl AppRunner {
         }
         let mut image_upload_commands = Vec::with_capacity(tex_capacity);
 
+        let _staging_write_span = tracy_client::span!("staging_buffer_write");
         for tli in &tex_load_infos {
             let name = &tli.name;
 
@@ -2118,6 +2097,7 @@ impl AppRunner {
                 name,
             });
         }
+        drop(_staging_write_span);
 
         let texture_pre_upload_barriers: Vec<_> = image_upload_commands
             .iter()
@@ -2133,6 +2113,39 @@ impl AppRunner {
                     .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             })
             .collect();
+
+        // SAFETY: this is the first and only allocation from this pool.
+        let mut upload_cmd =
+            unsafe { upload_command_pool.allocate_command_buffer()? };
+        let mut upload_rec = upload_cmd.begin_recording();
+
+        // SAFETY: We are recording
+        unsafe {
+            upload_rec.begin_debug_label(DebugLabel {
+                name: "initial buffer data upload",
+                ty: command::DebugLabelType::BufferUpload,
+            })
+        };
+
+        // Create one staging buffer + Texture per unique albedo, then
+        // record all copies into the shared upload command buffer.
+        //
+        // SAFETY: upload_cmd is in the recording state (begun above);
+        // all staging buffers remain alive until the fence wait below.
+        unsafe {
+            vertex_buffer
+                .record_upload_from(&mut upload_rec, &staging_vertex_buffer)
+        }?;
+        used_staging_buffers.push(staging_vertex_buffer);
+        // SAFETY: same as vertex buffer copy above.
+        unsafe {
+            index_buffer
+                .record_upload_from(&mut upload_rec, &staging_index_buffer)
+        }?;
+        used_staging_buffers.push(staging_index_buffer);
+
+        // SAFETY: We are recording
+        unsafe { upload_rec.end_debug_label() };
         // SAFETY: All barriers are valid
         unsafe {
             upload_rec.pipeline_barrier2_by_barriers(
@@ -2194,15 +2207,6 @@ impl AppRunner {
             })
             .collect();
 
-        // Safety: Valid barriers
-        unsafe {
-            upload_rec.pipeline_barrier2_by_barriers(
-                &[],
-                &[],
-                &texture_post_upload_barriers,
-            );
-        }
-
         let mut buffer_barriers = Vec::new();
         if queue_config.dedicated_transfer {
             let vertex_buffer_barrier = vertex_buffer
@@ -2223,6 +2227,16 @@ impl AppRunner {
 
             buffer_barriers = vec![vertex_buffer_barrier, index_buffer_barrier];
         }
+
+        // Safety: Valid barriers
+        unsafe {
+            upload_rec.pipeline_barrier2_by_barriers(
+                &[],
+                &[],
+                &texture_post_upload_barriers,
+            );
+        }
+
         if !buffer_barriers.is_empty() {
             // SAFETY: recording state; buffer handles valid for the
             // duration of this command buffer.
@@ -2356,7 +2370,10 @@ impl AppRunner {
         }
         // `wait` is safe and does not require additional invariants beyond
         // a valid fence; call it directly.
-        upload_fence.wait(u64::MAX)?;
+        {
+            let _span = tracy_client::span!("gpu_upload_fence_wait");
+            upload_fence.wait(u64::MAX)?;
+        }
 
         // Build the full 15-entry sampler table matching the shader's
         // getSamplerIndex layout: index = filter * OOB_COUNT + addr.

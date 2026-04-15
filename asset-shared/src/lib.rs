@@ -3,9 +3,12 @@ use std::{
     marker::PhantomData,
 };
 
+pub use parengus_util::Version;
+use parengus_util::version::PackedVersion;
+
 pub const PMESH_MAGIC: u32 = u32::from_le_bytes(*b"PMSH");
 pub const PTEX_MAGIC: u32 = u32::from_le_bytes(*b"PTEX");
-pub const VERSION: u16 = 1;
+pub const VERSION: Version = Version::new(0, 2, 0);
 
 // ── AssetId ──────────────────────────────────────────────────────────────────
 
@@ -193,27 +196,33 @@ impl TexRole {
 
 // ── FileHeader ───────────────────────────────────────────────────────────────
 
-/// Serialized size: 10 bytes.
+/// Serialized size: 16 bytes.
 pub struct FileHeader {
     pub magic: u32,
-    pub version: u16,
+    pub version: PackedVersion,
     pub section_count: u32,
 }
 
 impl FileHeader {
+    /// Byte length of the serialized header: 4 (magic) + 8 (version)
+    /// + 4 (section_count).
+    pub const SERIALIZED_SIZE: u32 = 16;
+
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
         w.write_all(&self.magic.to_le_bytes())?;
-        w.write_all(&self.version.to_le_bytes())?;
+        self.version.write_to(w)?;
         w.write_all(&self.section_count.to_le_bytes())?;
         Ok(())
     }
 
     pub fn read_from(r: &mut impl Read) -> io::Result<Self> {
-        let mut buf = [0u8; 10];
-        r.read_exact(&mut buf)?;
-        let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        let version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
-        let section_count = u32::from_le_bytes(buf[6..10].try_into().unwrap());
+        let mut magic_buf = [0u8; 4];
+        r.read_exact(&mut magic_buf)?;
+        let magic = u32::from_le_bytes(magic_buf);
+        let version = PackedVersion::read_from(r)?;
+        let mut sc_buf = [0u8; 4];
+        r.read_exact(&mut sc_buf)?;
+        let section_count = u32::from_le_bytes(sc_buf);
         Ok(Self {
             magic,
             version,

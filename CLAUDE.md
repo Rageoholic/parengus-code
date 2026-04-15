@@ -23,37 +23,37 @@ Note: Not every crate is required to include a `CLAUDE.md`. If a crate
 does not include one, that simply means there is no crate-specific
 policy documented yet.
 
-Quick checks (run per-crate before PRs):
+## Quick checks (run per-crate before PRs):
 ```
 cargo clippy -p <crate> --all-targets -- -D warnings
 cargo check -p <crate>
 ```
 
-Repo setup (one-time):
+## Repo setup (one-time):
 ```
 git config core.hooksPath .githooks
 ```
 
-Task graph (brief):
+## Task graph (brief):
 - Tasks live in `.tasks/`. Read [.tasks/index.md](.tasks/index.md)
     for the current task list and `next_id`.
 - See [.tasks/CONVENTIONS.md](.tasks/CONVENTIONS.md) for task-file
     format and conventions.
 
-AI disclosure (brief):
+## AI disclosure (brief):
 - Disclose AI assistance in externally visible artifacts (issues,
     PRs, release notes, README changes).
 - Keep a short AI attribution note in the crate README when content
     is AI-assisted; mark AI use in the PR template.
 
-Vulkan spec links (brief):
+## Vulkan spec links (brief):
 - Prefer the multi-page spec at `docs.vulkan.org`.
 - Use this URL form:
 ```
 https://docs.vulkan.org/spec/latest/chapters/<chapter>.html#<anchor>
 ```
 
-Branch / PR / Issue templates (brief):
+## Branch / PR / Issue templates (brief):
 - Branch naming: `type/short-description` (types: `feat`, `fix`,
     `docs`, `chore`, `refactor`, `test`). Use 2–4 kebab-case words and
     branch from `main`.
@@ -65,8 +65,7 @@ Branch / PR / Issue templates (brief):
 
 - **Comments:** Wrap manually at a word boundary before column 80.
 
-Adding a policy
-----------------
+## Adding a policy
 
 When adding a new policy, follow this pattern:
 
@@ -92,3 +91,15 @@ Rationale: 1–2 lines explaining why
 Example: short code snippet or file to change
 ```
 
+
+## Command Buffer recording
+Remember to keep command buffers to as tight a scope as possible. Any work that
+can be done before begining to record should be to minimize the time in a
+relatively fragile context where a panic will result in a double panic and an
+abort. Existing code should stay as is, this is for future code
+
+## Versions
+Versions are tracked using a struct in parengus-util, which follows semver.
+Prefer to use this struct when possible, implementing extension traits if
+necessary to convert to structs other traits expect. For disk/wire formats,
+use the Packed variant instead.

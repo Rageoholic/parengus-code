@@ -584,11 +584,11 @@ fn compile_mesh_asset(
     force: bool,
 ) -> Result<()> {
     cache::ensure_cache_dir()?;
-    let dst = cache::artifact_path(name, "pmesh");
-    if !force && is_up_to_date(src, &dst) {
+    if !force && cache::lookup_mesh(name, src).is_some() {
         println!("Up-to-date: mesh {name}");
         return Ok(());
     }
+    let dst = cache::artifact_path(name, "pmesh");
     println!("Compiling mesh {name}");
     let tmp = dst.with_extension("pmesh.tmp");
     mesh::compile(src, &tmp, manifest, name)
@@ -596,6 +596,9 @@ fn compile_mesh_asset(
     if std::fs::rename(&tmp, &dst).is_err() {
         std::fs::copy(&tmp, &dst)?;
         let _ = std::fs::remove_file(&tmp);
+    }
+    if let Err(e) = cache::write_mesh_meta(name, src) {
+        eprintln!("warning: mesh meta for {name}: {e}");
     }
     Ok(())
 }
@@ -634,8 +637,13 @@ fn compile_image_asset(
             return Err(format!("unknown color-space '{other}'").into());
         }
     };
-    image::compile(src, &dst, fmt, cs, mips, normal_map)
+    let tmp = dst.with_extension("ptex.tmp");
+    image::compile(src, &tmp, fmt, cs, mips, normal_map)
         .map_err(|e| format!("image compile '{name}': {e}"))?;
+    if std::fs::rename(&tmp, &dst).is_err() {
+        std::fs::copy(&tmp, &dst)?;
+        let _ = std::fs::remove_file(&tmp);
+    }
     if let Err(e) = cache::write_image_meta(
         name,
         src,

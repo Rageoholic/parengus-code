@@ -652,16 +652,17 @@ impl Device {
             // created with vk_1_0_strict, treat every device as pre-1.3 and
             // pre-1.1 so that the extension code paths are always exercised.
             let dev_api =
-                crate::instance::VkVersion::from_raw(props.api_version);
+                crate::version::VkVersion::from_raw(props.api_version);
+            let ver = dev_api.version;
             let is_pre_1_3 = instance.strict_1_0()
-                || dev_api.major() < 1
-                || (dev_api.major() == 1 && dev_api.minor() < 3);
+                || ver.major < 1
+                || (ver.major == 1 && ver.minor < 3);
             let is_pre_1_2 = instance.strict_1_0()
-                || dev_api.major() < 1
-                || (dev_api.major() == 1 && dev_api.minor() < 2);
+                || ver.major < 1
+                || (ver.major == 1 && ver.minor < 2);
             let is_pre_1_1 = instance.strict_1_0()
-                || dev_api.major() < 1
-                || (dev_api.major() == 1 && dev_api.minor() < 1);
+                || ver.major < 1
+                || (ver.major == 1 && ver.minor < 1);
 
             // VK_KHR_swapchain is never promoted to core; always check it when
             // requested. Other extensions are only extensions on pre-1.3

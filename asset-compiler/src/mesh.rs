@@ -254,8 +254,7 @@ fn role_from_str(s: &str) -> Result<TexRole, String> {
 
 // ── Main compile function ─────────────────────────────────────────────────────
 
-// FileHeader: 10 bytes; SectionHeader: 20 bytes
-const FILE_HEADER_SIZE: u32 = 10;
+const FILE_HEADER_SIZE: u32 = FileHeader::SERIALIZED_SIZE;
 const SECTION_HEADER_SIZE: u32 = 20;
 
 pub fn compile(
@@ -648,7 +647,7 @@ pub fn compile_to_writer<W: std::io::Write>(
 ) -> Result<(), String> {
     FileHeader {
         magic: PMESH_MAGIC,
-        version: VERSION,
+        version: VERSION.into(),
         section_count: sections.len() as u32,
     }
     .write_to(w)
@@ -728,7 +727,7 @@ mod tests {
 
         let hdr = FileHeader {
             magic: PMESH_MAGIC,
-            version: VERSION,
+            version: VERSION.into(),
             section_count: 7,
         };
         let mut buf: Vec<u8> = Vec::new();

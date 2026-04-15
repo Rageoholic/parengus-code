@@ -61,6 +61,7 @@ pub fn init_default(
     no_color: bool,
 ) -> anyhow::Result<()> {
     // If nothing requested and no log file, leave tracing disabled.
+    // (Tracy is handled separately via tracy-client in each binary.)
     if target_levels.is_empty()
         && log_file.is_none()
         && default_level == TracingLogLevel::Off

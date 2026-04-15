@@ -50,6 +50,8 @@ pub mod shader;
 pub mod surface;
 pub mod swapchain;
 pub mod sync;
+pub mod version;
 
 pub use ash;
 pub use raw_window_handle::HandleError as RwhHandleError;
+pub use version::VkVersion;
