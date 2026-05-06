@@ -40,7 +40,7 @@ use rgpu_vk::{
     sync::{Fence, Semaphore},
 };
 use tracy_client::Client as TracyClient;
-use vek::{Mat4, Vec2, Vec3};
+use vek::{Mat4, Rgb, Rgba, Vec2, Vec3, Vec4};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -56,17 +56,143 @@ struct Vertex {
     tex_coord: Vec2<f32>,
 }
 
-/// Camera uniform buffer object — combined view-projection matrix.
-///
-/// view_proj = projection × view; baked on the CPU so the shader
-/// needs only one matrix multiply per vertex. Updated every frame
-/// (aspect ratio can change on resize; view is fixed but cheap to
-/// recompute). Carried in the camera descriptor set (set 0).
+/// PBR vertex — position, normal, tangent (xyz + handedness w),
+/// and UV. 48 bytes, no padding needed.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct Ubo {
-    view_proj: Mat4<f32>,
+struct VertexPbr {
+    position: Vec3<f32>,  // offset  0, 12 B
+    norm: Vec3<f32>,      // offset 12, 12 B
+    tan: Vec4<f32>,       // offset 24, 16 B — w = handedness ±1
+    tex_coord: Vec2<f32>, // offset 40,  8 B
 }
+
+/// Per-frame uniform buffer — view-projection matrix, ambient light,
+/// and active light count. Updated every frame. Carried in the
+/// per-frame descriptor set (set 0, binding 0).
+///
+// TODO (PSIR): temporary scaffold; PSIR will absorb UBOs into a
+// unified constant interface.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct FrameUbo {
+    view_proj: Mat4<f32>,
+    /// rgb = ambient color, a = intensity multiplier.
+    ambient: Vec4<f32>,
+    /// Number of active lights in the lights SSBO this frame.
+    light_count: u32,
+    _pad: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PointLight {
+    pub position: Vec3<f32>,
+    pub color: Rgb<f32>,
+    pub range: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectionalLight {
+    pub direction: Vec3<f32>,
+    pub color: Rgb<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpotLight {
+    pub position: Vec3<f32>,
+    pub direction: Vec3<f32>,
+    pub color: Rgb<f32>,
+    pub range: f32,
+    /// Inner cone half-angle in radians.
+    pub inner: f32,
+    /// Outer cone half-angle in radians.
+    pub outer: f32,
+    /// Oval scale — (1,1) = circular cone.
+    pub angle_scale: Vec2<f32>,
+}
+
+/// CPU-side light. Convert to [`GpuLight`] at the upload boundary.
+#[derive(Debug, Clone, Copy)]
+enum Light {
+    Point(PointLight),
+    Directional(DirectionalLight),
+    Spot(SpotLight),
+}
+
+/// Per-light GPU data in the lights SSBO (Set 0, binding 2).
+///
+/// Each float4 packs a float3 vector with a scalar in the w component
+/// to avoid std430 vec3 alignment issues.
+///
+// TODO (PSIR): temporary scaffold.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct GpuLight {
+    /// xyz = world position, w = light type
+    /// (0 = point, 1 = directional, 2 = spot).
+    position_type: Vec4<f32>,
+    /// xyz = color × intensity, w = falloff range
+    /// (f32::INFINITY = no cutoff).
+    color_range: Rgba<f32>,
+    /// xyz = normalized direction (directional/spot), w = inner cone
+    /// angle in radians (spot). Ignored for point lights.
+    direction_inner: Vec4<f32>,
+    /// x = outer cone angle (radians), yz = oval angle_scale
+    /// ((1,1) = circular cone), w = unused.
+    outer_scale_pad: Vec4<f32>,
+}
+
+/// Light types stored in GpuLight::position_type.w.
+const LIGHT_TYPE_POINT: f32 = 0.0;
+const LIGHT_TYPE_DIRECTIONAL: f32 = 1.0;
+const LIGHT_TYPE_SPOT: f32 = 2.0;
+
+impl From<PointLight> for GpuLight {
+    fn from(l: PointLight) -> Self {
+        GpuLight {
+            position_type: (l.position, LIGHT_TYPE_POINT).into(),
+            color_range: (l.color, l.range).into(),
+            direction_inner: (Vec3::zero(), 0.0).into(),
+            outer_scale_pad: (0.0, 1.0, 1.0, 0.0).into(),
+        }
+    }
+}
+
+impl From<DirectionalLight> for GpuLight {
+    fn from(l: DirectionalLight) -> Self {
+        GpuLight {
+            position_type: (Vec3::zero(), LIGHT_TYPE_DIRECTIONAL).into(),
+            color_range: (l.color, f32::INFINITY).into(),
+            direction_inner: (l.direction, 0.0).into(),
+            outer_scale_pad: (0.0, 1.0, 1.0, 0.0).into(),
+        }
+    }
+}
+
+impl From<SpotLight> for GpuLight {
+    fn from(l: SpotLight) -> Self {
+        GpuLight {
+            position_type: (l.position, LIGHT_TYPE_SPOT).into(),
+            color_range: (l.color, l.range).into(),
+            direction_inner: (l.direction, l.inner).into(),
+            outer_scale_pad: (l.outer, l.angle_scale.x, l.angle_scale.y, 0.0)
+                .into(),
+        }
+    }
+}
+
+impl From<Light> for GpuLight {
+    fn from(light: Light) -> Self {
+        match light {
+            Light::Point(l) => l.into(),
+            Light::Directional(l) => l.into(),
+            Light::Spot(l) => l.into(),
+        }
+    }
+}
+
+/// Maximum lights in the lights SSBO.
+const MAX_LIGHTS: usize = 8;
 
 /// Push-constant block — model matrix + material index.
 ///
@@ -79,19 +205,37 @@ struct PushConstants {
     material_idx: u32,
 }
 
-/// Per-material GPU data stored in the material SSBO.
-///
-/// One entry per submesh draw, indexed via `material_idx` in the
-/// push constants. Indices point into the bindless texture array;
-/// `emissive_idx` is negative when no emissive texture is present.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct MaterialGpu {
-    albedo_idx: u32,
-    normal_idx: u32,
-    orm_idx: u32,
-    emissive_idx: i32,
+// Hot material data — accessed every fragment, stored in Set 1
+// binding 1. 48 bytes (multiple of 16).
+//
+// TODO (PSIR): temporary scaffold.
+// TODO: Each cold property should eventually get its own sparse SSBO
+// (ECS-style) so materials without that property waste no memory.
+// TODO: Investigate sparse storage for material data more broadly.
+rgpu_vk::gpu_ssbo! {
+    MaterialHot {
+        albedo_idx:       u32,
+        normal_idx:       u32,
+        orm_idx:          u32,
+        /// Bitmask of optional cold properties (HAS_EMISSIVE = 0x1).
+        flags:            u32,
+        base_color:       Vec4<f32>,
+        metallic_factor:  f32,
+        roughness_factor: f32,
+        _pad:             [f32; 2],
+    }
 }
+
+// Cold material data — fetched only when the corresponding flag is
+// set in MaterialHot::flags. Set 1, binding 2. 16 bytes.
+rgpu_vk::gpu_ssbo! {
+    MaterialCold {
+        emissive_idx: u32,
+        _pad:         [u32; 3],
+    }
+}
+
+const MAT_HAS_EMISSIVE: u32 = 0x1;
 
 /// Per-submesh draw record built at load time from SubMeshInfo.
 #[derive(Debug)]
@@ -108,6 +252,8 @@ struct SubmeshDraw {
     model_idx: usize,
     /// Pre-baked TRS from the glTF node, in Z-up space.
     sub_trs: Mat4<f32>,
+    /// When true the per-frame rotation is not applied (e.g. the floor).
+    is_static: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +484,64 @@ fn tex_vk_format(fmt: TexFormat, cs: ColorSpace) -> vk::Format {
     }
 }
 
+/// Scene lights for the test scene. Written into each per-frame lights
+/// SSBO every frame. Currently fixed; infrastructure supports dynamic
+/// updates.
+fn build_scene_lights() -> [Light; 6] {
+    fn spot_dir(from: Vec3<f32>, to: Vec3<f32>) -> Vec3<f32> {
+        (to - from).normalized()
+    }
+
+    // Point lights above each model (duck, damaged-helmet,
+    // flight-helmet at X = -3, 0, 3).
+    let point = |x: f32, color: Rgb<f32>, range: f32| {
+        Light::Point(PointLight {
+            position: (x, 0.0, 3.0).into(),
+            color,
+            range,
+        })
+    };
+
+    // Directional flood — broad soft fill from above-front.
+    let directional = Light::Directional(DirectionalLight {
+        direction: Vec3::new(0.5, -0.5, -1.0).normalized(),
+        color: (0.8, 0.85, 1.0).into(),
+    });
+
+    // Oval spotlight — right side, elongated on X.
+    let spot_pos_r: Vec3<f32> = (6.0, -4.0, 5.0).into();
+    let spot_r = Light::Spot(SpotLight {
+        position: spot_pos_r,
+        direction: spot_dir(spot_pos_r, Vec3::unit_z() / 2.0),
+        color: (1.0, 0.9, 0.8).into(),
+        range: 20.0,
+        inner: 0.2,
+        outer: 0.4,
+        angle_scale: (1.0, 0.5).into(),
+    });
+
+    // Oval spotlight — left side, elongated on Y.
+    let spot_pos_l: Vec3<f32> = (-6.0, -4.0, 5.0).into();
+    let spot_l = Light::Spot(SpotLight {
+        position: spot_pos_l,
+        direction: spot_dir(spot_pos_l, Vec3::unit_z() / 2.0),
+        color: (0.8, 0.9, 1.0).into(),
+        range: 20.0,
+        inner: 0.2,
+        outer: 0.4,
+        angle_scale: (0.5, 1.0).into(),
+    });
+
+    [
+        point(-3.0, Rgb::red(), 32.0),
+        point(0.0, Rgb::green(), 32.0),
+        point(3.0, Rgb::blue(), 32.0),
+        directional,
+        spot_r,
+        spot_l,
+    ]
+}
+
 pub fn main() -> eyre::Result<()> {
     let app_dirs = directories::ProjectDirs::from("", "parengus", "phoenix")
         .ok_or_else(|| {
@@ -481,18 +685,30 @@ enum App {
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const MAX_BINDLESS_TEXTURES: usize = 256;
+/// Slot 0: magenta — deliberate "missing texture" signal.
 const DEFAULT_ALBEDO_SLOT: u32 = 0;
 const DEFAULT_NORMAL_SLOT: u32 = 1;
 const DEFAULT_ORM_SLOT: u32 = 2;
+/// Slot 3: neutral white — base for color-factor-only materials.
+const DEFAULT_WHITE_SLOT: u32 = 3;
+/// Slot 4: black — default emissive (no emission).
+const DEFAULT_BLACK_SLOT: u32 = 4;
 /// World-space X offsets so the three models stand side-by-side.
 /// Per-model uniform scale. The three Khronos reference models have
 /// no shared scale convention; these factors compensate. Will be
 /// removed once custom assets with a consistent scale replace them.
-const MODEL_SCALES: [f32; 3] = [1.0, 1.0, 2.0];
+const MODEL_SCALES: [f32; 4] = [1.0, 1.0, 2.0, 1.0];
 /// World-space X offsets placing the three models side-by-side.
+/// Index 3 is reserved for static geometry (floor) with no offset.
 /// Temporary test-scene scaffolding; see MODEL_SCALES.
-const MODEL_OFFSETS: [[f32; 3]; 3] =
-    [[-3.0, 0.0, 0.0], [0.0, 0.0, 0.0], [3.0, 0.0, 0.0]];
+const MODEL_OFFSETS: [[f32; 3]; 4] = [
+    [-3.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [3.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0],
+];
+/// model_idx value for world-static geometry (floor, etc.).
+const MODEL_IDX_STATIC: usize = 3;
 
 /// Depth format candidates tried in preference order.
 const DEPTH_FORMAT_CANDIDATES: &[vk::Format] = &[
@@ -626,9 +842,10 @@ struct RunningState {
     descriptor_pool: DescriptorPool,
     /// One host-visible UBO buffer per frame in flight.
     ubo_buffers: Vec<HostVisibleBuffer>,
-    /// One camera descriptor set per frame in flight, each pointing
-    /// at the matching entry in `ubo_buffers`.
-    camera_descriptor_sets: Vec<DescriptorSet>,
+    /// One host-visible lights SSBO per frame in flight.
+    lights_buffers: Vec<HostVisibleBuffer>,
+    /// One per-frame descriptor set per frame in flight.
+    frame_descriptor_sets: Vec<DescriptorSet>,
     /// Single material descriptor set — texture never changes.
     material_descriptor_set: DescriptorSet,
     /// Wall-clock time at which the app entered the Running state;
@@ -637,8 +854,10 @@ struct RunningState {
     asset_map: AssetMap,
     textures: Vec<Texture>,
     samplers: Vec<Sampler>,
-    /// Host-visible SSBO holding one MaterialGpu per submesh draw.
-    material_ssbo: HostVisibleBuffer,
+    /// Host-visible SSBO holding one MaterialHot per submesh draw.
+    material_hot_ssbo: HostVisibleBuffer,
+    /// Host-visible SSBO holding one MaterialCold per submesh draw.
+    material_cold_ssbo: HostVisibleBuffer,
 }
 
 impl std::fmt::Debug for RunningState {
@@ -657,8 +876,8 @@ impl std::fmt::Debug for RunningState {
             .field("frames", &self.frames)
             .field("current_frame", &self.current_frame)
             .field("debug_counters", &self.debug_counters)
-            .field("camera_set_layout", &self.per_frame_layout)
-            .field("material_set_layout", &self.static_layout)
+            .field("per_frame_layout", &self.per_frame_layout)
+            .field("static_layout", &self.static_layout)
             .field("descriptor_pool", &self.descriptor_pool)
             .finish_non_exhaustive()
     }
@@ -678,18 +897,20 @@ struct SuspendedState {
     command_pool: ResettableCommandPool<Graphics>,
     frames: Vec<FrameSync>,
     debug_counters: DebugCounters,
-    camera_set_layout: Arc<DescriptorSetLayout>,
-    material_set_layout: Arc<DescriptorSetLayout>,
+    per_frame_layout: Arc<DescriptorSetLayout>,
+    static_layout: Arc<DescriptorSetLayout>,
     pipeline_layout: Arc<PipelineLayout>,
     descriptor_pool: DescriptorPool,
     ubo_buffers: Vec<HostVisibleBuffer>,
-    camera_descriptor_sets: Vec<DescriptorSet>,
+    lights_buffers: Vec<HostVisibleBuffer>,
+    frame_descriptor_sets: Vec<DescriptorSet>,
     material_descriptor_set: DescriptorSet,
     start_time: Instant,
     asset_map: AssetMap,
     textures: Vec<Texture>,
     samplers: Vec<Sampler>,
-    material_ssbo: HostVisibleBuffer,
+    material_hot_ssbo: HostVisibleBuffer,
+    material_cold_ssbo: HostVisibleBuffer,
 }
 #[derive(Debug)]
 struct ExitingState {}
@@ -767,18 +988,20 @@ impl ApplicationHandler for AppRunner {
                 frames,
                 current_frame: _,
                 debug_counters,
-                per_frame_layout: camera_set_layout,
-                static_layout: material_set_layout,
+                per_frame_layout,
+                static_layout,
                 pipeline_layout,
                 descriptor_pool,
                 ubo_buffers,
-                camera_descriptor_sets,
+                lights_buffers,
+                frame_descriptor_sets,
                 material_descriptor_set,
                 start_time,
                 asset_map,
                 textures,
                 samplers,
-                material_ssbo,
+                material_hot_ssbo,
+                material_cold_ssbo,
             } = running_state;
 
             if let Err(e) = device.wait_idle() {
@@ -803,18 +1026,20 @@ impl ApplicationHandler for AppRunner {
                 command_pool,
                 frames,
                 debug_counters,
-                camera_set_layout,
-                material_set_layout,
+                per_frame_layout,
+                static_layout,
                 pipeline_layout,
                 descriptor_pool,
                 ubo_buffers,
-                camera_descriptor_sets,
+                lights_buffers,
+                frame_descriptor_sets,
                 material_descriptor_set,
                 start_time,
                 asset_map,
                 textures,
                 samplers,
-                material_ssbo,
+                material_hot_ssbo,
+                material_cold_ssbo,
             });
         }
     }
@@ -1068,13 +1293,16 @@ impl AppRunner {
         let aspect = extent.width as f32 / extent.height as f32;
 
         let view = look_at_rh(
-            Vec3::new(0.0, 10.0, 5.0),
-            Vec3::new(0.0, 0.0, 0.5),
+            (0.0, 10.0, 5.0).into(),
+            (0.0, 0.0, 0.5).into(),
             Vec3::unit_z(),
         );
         let proj = perspective_rh_zo_infinite_rev(PI32 / 3.0, aspect, 0.1);
-        let ubo = Ubo {
+        let ubo = FrameUbo {
             view_proj: proj * view,
+            ambient: (1.0, 1.0, 1.0, 0.03).into(),
+            light_count: build_scene_lights().len() as u32,
+            _pad: [0.0; 3],
         };
         if let Err(e) =
             state.ubo_buffers[frame_idx].write_pod(std::slice::from_ref(&ubo))
@@ -1235,7 +1463,7 @@ impl AppRunner {
                 &state.pipeline_layout,
                 0,
                 &[
-                    &state.camera_descriptor_sets[frame_idx],
+                    &state.frame_descriptor_sets[frame_idx],
                     &state.material_descriptor_set,
                 ],
             )
@@ -1278,10 +1506,13 @@ impl AppRunner {
             let scale = Mat4::<f32>::scaling_3d(Vec3::broadcast(
                 MODEL_SCALES[draw.model_idx],
             ));
-            let placement = Mat4::<f32>::translation_3d(Vec3::new(
-                offset[0], offset[1], offset[2],
-            )) * rotation
-                * scale;
+            let orient = if draw.is_static {
+                Mat4::identity()
+            } else {
+                rotation
+            };
+            let placement =
+                Mat4::<f32>::translation_3d(offset) * orient * scale;
             let push = PushConstants {
                 model: placement * draw.sub_trs,
                 material_idx: draw.material_idx,
@@ -1398,11 +1629,13 @@ fn build_pipeline<F>(
 where
     F: FnOnce() -> String,
 {
-    let vert = shader.entry_point("vert_main", ShaderStage::Vertex)?;
-    let frag = shader.entry_point("frag_main", ShaderStage::Fragment)?;
+    // PBR pipeline — vert_main/frag_main kept in the shader for
+    // reference but not built here.
+    let vert = shader.entry_point("vert_pbr", ShaderStage::Vertex)?;
+    let frag = shader.entry_point("frag_pbr", ShaderStage::Fragment)?;
     let vertex_bindings = [VertexBindingDesc {
         binding: 0,
-        stride: size_of::<Vertex>() as u32,
+        stride: size_of::<VertexPbr>() as u32,
         input_rate: VertexInputRate::VERTEX,
     }];
     let vertex_attributes = [
@@ -1410,13 +1643,25 @@ where
             location: 0,
             binding: 0,
             format: vk::Format::R32G32B32_SFLOAT,
-            offset: std::mem::offset_of!(Vertex, position) as u32,
+            offset: std::mem::offset_of!(VertexPbr, position) as u32,
         },
         VertexAttributeDesc {
             location: 1,
             binding: 0,
             format: vk::Format::R32G32_SFLOAT,
-            offset: std::mem::offset_of!(Vertex, tex_coord) as u32,
+            offset: std::mem::offset_of!(VertexPbr, tex_coord) as u32,
+        },
+        VertexAttributeDesc {
+            location: 2,
+            binding: 0,
+            format: vk::Format::R32G32B32_SFLOAT,
+            offset: std::mem::offset_of!(VertexPbr, norm) as u32,
+        },
+        VertexAttributeDesc {
+            location: 3,
+            binding: 0,
+            format: vk::Format::R32G32B32A32_SFLOAT,
+            offset: std::mem::offset_of!(VertexPbr, tan) as u32,
         },
     ];
     Ok(DynamicPipeline::new(
@@ -1512,13 +1757,14 @@ impl AppRunner {
         }
 
         let mesh_names: [&str; 3] = ["duck", "damaged-helmet", "flight-helmet"];
-        let mut scene_vertices: Vec<Vertex> = Vec::new();
+        let mut scene_vertices: Vec<VertexPbr> = Vec::new();
         let mut scene_indices: Vec<u32> = Vec::new();
         let mut submesh_draws: Vec<SubmeshDraw> = Vec::new();
-        let mut material_gpus: Vec<MaterialGpu> = Vec::new();
+        let mut material_hots: Vec<MaterialHot> = Vec::new();
+        let mut material_colds: Vec<MaterialCold> = Vec::new();
         // Maps TextureId hash → slot index in the bindless array.
         let mut tex_id_to_slot: HashMap<u64, u32> = HashMap::new();
-        let mut tex_load_infos: Vec<TexLoadInfo> = Vec::new();
+        let mut tex_load_infos: Vec<TexLoadInfo> = Vec::with_capacity(128);
 
         // Default textures occupy the first DEFAULT_TEX_COUNT slots.
         // Slot 0: magenta albedo (R8G8B8A8_SRGB)
@@ -1550,6 +1796,29 @@ impl AppRunner {
             mip_count: 1,
             name: "default-orm".to_owned(),
             mip_data: vec![(vec![255u8, 128, 0, 255], 0)],
+            total_bytes: 4,
+        });
+
+        // Slot 3: neutral white (R8G8B8A8_SRGB) — base for
+        // color-factor-only materials (floor, primitives, etc.).
+        tex_load_infos.push(TexLoadInfo {
+            width: 1,
+            height: 1,
+            format: vk::Format::R8G8B8A8_SRGB,
+            mip_count: 1,
+            name: "default-white".to_owned(),
+            mip_data: vec![(vec![255u8, 255, 255, 255], 0)],
+            total_bytes: 4,
+        });
+        // Slot 4: black (R8G8B8A8_SRGB) — default emissive (no
+        // emission).
+        tex_load_infos.push(TexLoadInfo {
+            width: 1,
+            height: 1,
+            format: vk::Format::R8G8B8A8_SRGB,
+            mip_count: 1,
+            name: "default-black".to_owned(),
+            mip_data: vec![(vec![0u8, 0, 0, 255], 0)],
             total_bytes: 4,
         });
 
@@ -1625,12 +1894,22 @@ impl AppRunner {
             let positions = mesh
                 .positions()
                 .map_err(|e| eyre::eyre!("{mesh_name} positions: {e}"))?;
+            let normals = mesh
+                .normals()
+                .map_err(|e| eyre::eyre!("{mesh_name} normals: {e}"))?;
+            let tangents = mesh
+                .tangents()
+                .map_err(|e| eyre::eyre!("{mesh_name} tangents: {e}"))?;
             let tex_coords = mesh
                 .tex_coords0()
                 .map_err(|e| eyre::eyre!("{mesh_name} tex_coords0: {e}"))?;
-            for (pos, tc) in positions.zip(tex_coords) {
-                scene_vertices.push(Vertex {
+            for (((pos, norm), tan), tc) in
+                positions.zip(normals).zip(tangents).zip(tex_coords)
+            {
+                scene_vertices.push(VertexPbr {
                     position: pos.into(),
+                    norm: norm.into(),
+                    tan: tan.into(),
                     tex_coord: tc.into(),
                 });
             }
@@ -1641,6 +1920,7 @@ impl AppRunner {
             scene_indices.extend(indices_iter);
 
             // Resolve global (per-mesh) texture roles once.
+
             let find_global = |role: TexRole| -> TextureId {
                 mesh.tex_refs
                     .iter()
@@ -1668,17 +1948,17 @@ impl AppRunner {
                 &asset_map,
                 &assets_dir,
             )?;
-            let emissive_slot: i32 = if emissive_id.0 != 0 {
-                resolve_tex(
+            let emissive_slot: Option<u32> = if emissive_id.0 != 0 {
+                Some(resolve_tex(
                     emissive_id,
-                    DEFAULT_ALBEDO_SLOT,
+                    DEFAULT_BLACK_SLOT,
                     &mut tex_id_to_slot,
                     &mut tex_load_infos,
                     &asset_map,
                     &assets_dir,
-                )? as i32
+                )?)
             } else {
-                -1
+                None
             };
 
             for (sub_idx, sub) in mesh.sub_meshes.iter().enumerate() {
@@ -1695,12 +1975,40 @@ impl AppRunner {
                     &asset_map,
                     &assets_dir,
                 )?;
-                let material_idx = material_gpus.len() as u32;
-                material_gpus.push(MaterialGpu {
+                // Read scalar PBR factors from compiled material data.
+                let mat_consts = mesh
+                    .material_data
+                    .get(sub_idx)
+                    .copied()
+                    .unwrap_or([0.0f32; 14]);
+                let base_color = [
+                    mat_consts[0],
+                    mat_consts[1],
+                    mat_consts[2],
+                    mat_consts[3],
+                ]
+                .into();
+                let metallic_factor = mat_consts[8];
+                let roughness_factor = mat_consts[9];
+                let flags = if emissive_slot.is_some() {
+                    MAT_HAS_EMISSIVE
+                } else {
+                    0
+                };
+                let material_idx = material_hots.len() as u32;
+                material_hots.push(MaterialHot {
                     albedo_idx: albedo_slot,
                     normal_idx: normal_slot,
                     orm_idx: orm_slot,
-                    emissive_idx: emissive_slot,
+                    flags,
+                    base_color,
+                    metallic_factor,
+                    roughness_factor,
+                    _pad: [0.0; 2],
+                });
+                material_colds.push(MaterialCold {
+                    emissive_idx: emissive_slot.unwrap_or(DEFAULT_BLACK_SLOT),
+                    _pad: [0; 3],
                 });
                 let sub_trs =
                     trs_to_mat4(sub.translation, sub.rotation, sub.scale);
@@ -1711,11 +2019,78 @@ impl AppRunner {
                     material_idx,
                     model_idx,
                     sub_trs,
+                    is_static: false,
                 });
             }
         }
-        drop(_scene_load_span);
 
+        // Floor — 20×20 axis-aligned quad in the XY plane at Z = 0,
+        // slightly below the models' base. Uses default white albedo so
+        // base_color factor alone drives the dark-grey appearance.
+        {
+            let floor_vertex_offset = scene_vertices.len() as i32;
+            let floor_index_offset = scene_indices.len() as u32;
+            let h = 10.0f32; // half-extent
+            // Four corners wound CCW from above (Z-up).
+            let floor_verts = [
+                VertexPbr {
+                    position: (-h, -h, 0.0).into(),
+                    norm: Vec3::unit_z(),
+                    tan: (1.0, 0.0, 0.0, 1.0).into(),
+                    tex_coord: (0.0, 0.0).into(),
+                },
+                VertexPbr {
+                    position: (h, -h, 0.0).into(),
+                    norm: Vec3::unit_z(),
+                    tan: (1.0, 0.0, 0.0, 1.0).into(),
+                    tex_coord: (1.0, 0.0).into(),
+                },
+                VertexPbr {
+                    position: (h, h, 0.0).into(),
+                    norm: Vec3::unit_z(),
+                    tan: (1.0, 0.0, 0.0, 1.0).into(),
+                    tex_coord: (1.0, 1.0).into(),
+                },
+                VertexPbr {
+                    position: (-h, h, 0.0).into(),
+                    norm: Vec3::unit_z(),
+                    tan: (1.0, 0.0, 0.0, 1.0).into(),
+                    tex_coord: (0.0, 1.0).into(),
+                },
+            ];
+            scene_vertices.extend_from_slice(&floor_verts);
+            // Two triangles, CCW from +Z (normals point up). Indices
+            // are 0-based relative to floor_vertex_offset; the draw
+            // call's vertex_offset parameter adds floor_vertex_offset
+            // at draw time.
+            scene_indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            let floor_material_idx = material_hots.len() as u32;
+            material_hots.push(MaterialHot {
+                albedo_idx: DEFAULT_WHITE_SLOT,
+                normal_idx: DEFAULT_NORMAL_SLOT,
+                orm_idx: DEFAULT_ORM_SLOT,
+                flags: 0,
+                base_color: [0.08, 0.08, 0.08, 1.0].into(),
+                metallic_factor: 0.0,
+                roughness_factor: 0.8,
+                _pad: [0.0; 2],
+            });
+            material_colds.push(MaterialCold {
+                emissive_idx: DEFAULT_BLACK_SLOT,
+                _pad: [0; 3],
+            });
+            submesh_draws.push(SubmeshDraw {
+                first_index: floor_index_offset,
+                index_count: 6,
+                vertex_offset: floor_vertex_offset,
+                material_idx: floor_material_idx,
+                model_idx: MODEL_IDX_STATIC,
+                sub_trs: Mat4::identity(),
+                is_static: true,
+            });
+        }
+
+        drop(_scene_load_span);
         let max_mip_count = tex_load_infos
             .iter()
             .map(|t| t.mip_count)
@@ -1723,7 +2098,7 @@ impl AppRunner {
             .unwrap_or(1);
 
         let vertex_buffer_size =
-            (scene_vertices.len() * size_of::<Vertex>()) as vk::DeviceSize;
+            (scene_vertices.len() * size_of::<VertexPbr>()) as vk::DeviceSize;
         let mut staging_vertex_buffer = HostVisibleBuffer::new(
             &device,
             vertex_buffer_size,
@@ -1831,7 +2206,8 @@ impl AppRunner {
             .map(|sc| sc.format())
             .unwrap_or(vk::Format::B8G8R8A8_SRGB);
 
-        // Set 0: camera — UBO with the combined view-projection matrix.
+        // Set 0: per-frame — UBO (view-proj + ambient + light_count),
+        // sampler table, and lights SSBO.
         let per_frame_layout = Arc::new(DescriptorSetLayout::new(
             &device,
             &[
@@ -1839,7 +2215,8 @@ impl AppRunner {
                     binding: 0,
                     descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
                     count: 1,
-                    stage_flags: vk::ShaderStageFlags::VERTEX,
+                    stage_flags: vk::ShaderStageFlags::VERTEX
+                        | vk::ShaderStageFlags::FRAGMENT,
                     binding_flags: vk::DescriptorBindingFlags::empty(),
                 },
                 DescriptorBindingDesc {
@@ -1849,12 +2226,19 @@ impl AppRunner {
                     stage_flags: vk::ShaderStageFlags::FRAGMENT,
                     binding_flags: Default::default(),
                 },
+                DescriptorBindingDesc {
+                    binding: 2,
+                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                    count: 1,
+                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                    binding_flags: vk::DescriptorBindingFlags::empty(),
+                },
             ],
             Some("per frame layout"),
         )?);
         // Set 1: material — bindless texture array (binding 0,
-        // PARTIALLY_BOUND so unused slots need not be written) plus
-        // the material SSBO (binding 1).
+        // PARTIALLY_BOUND), MaterialHot SSBO (binding 1), MaterialCold
+        // SSBO (binding 2).
         let static_layout = Arc::new(DescriptorSetLayout::new(
             &device,
             &[
@@ -1868,6 +2252,13 @@ impl AppRunner {
                 },
                 DescriptorBindingDesc {
                     binding: 1,
+                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                    count: 1,
+                    stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                    binding_flags: vk::DescriptorBindingFlags::empty(),
+                },
+                DescriptorBindingDesc {
+                    binding: 2,
                     descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
                     count: 1,
                     stage_flags: vk::ShaderStageFlags::FRAGMENT,
@@ -1976,7 +2367,7 @@ impl AppRunner {
             .transpose()?
             .unwrap_or_default();
 
-        let ubo_size = size_of::<Ubo>() as vk::DeviceSize;
+        let ubo_size = size_of::<FrameUbo>() as vk::DeviceSize;
         let ubo_buffers = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|i| {
                 HostVisibleBuffer::new(
@@ -1984,6 +2375,19 @@ impl AppRunner {
                     ubo_size,
                     vk::BufferUsageFlags::UNIFORM_BUFFER,
                     Some(&format!("ubo [{i}]")),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let lights_buf_size =
+            (MAX_LIGHTS * size_of::<GpuLight>()) as vk::DeviceSize;
+        let mut lights_buffers = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|i| {
+                HostVisibleBuffer::new(
+                    &device,
+                    lights_buf_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER,
+                    Some(&format!("lights ssbo [{i}]")),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2009,7 +2413,8 @@ impl AppRunner {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
-                    descriptor_count: 1,
+                    // hot SSBO + cold SSBO + lights SSBOs (one per FIF)
+                    descriptor_count: 2 + MAX_FRAMES_IN_FLIGHT as u32,
                 },
             ],
             true,
@@ -2020,19 +2425,19 @@ impl AppRunner {
             ..MAX_FRAMES_IN_FLIGHT)
             .map(|_| per_frame_layout.as_ref())
             .collect();
-        // SAFETY: descriptor_pool outlives camera_descriptor_sets and
+        // SAFETY: descriptor_pool outlives frame_descriptor_sets and
         // material_descriptor_set (all stored in the same state struct,
         // dropped in declaration order — sets before pool).
-        let camera_descriptor_sets =
+        let frame_descriptor_sets =
             unsafe { descriptor_pool.allocate_sets(&camera_layouts) }?;
-        for (i, (set, _buf)) in camera_descriptor_sets
+        for (i, (set, _buf)) in frame_descriptor_sets
             .iter()
             .zip(ubo_buffers.iter())
             .enumerate()
         {
             set.set_name(&device, Some(&format!("camera set {i}")));
         }
-        // SAFETY: same guarantee as camera_descriptor_sets above.
+        // SAFETY: same guarantee as frame_descriptor_sets above.
         let mut material_sets = unsafe {
             descriptor_pool.allocate_sets(&[static_layout.as_ref()])
         }?;
@@ -2429,16 +2834,15 @@ impl AppRunner {
 
         // Build a single update that covers camera UBOs, bindless
         // textures, the sampler table, and the material SSBO.
-        let n_cams = camera_descriptor_sets.len();
+        let n_cams = frame_descriptor_sets.len();
         let mut desc_builder =
             rgpu_vk::descriptor::DescriptorUpdateBuilder::with_capacity(
-                n_cams * 2 + textures.len() + 1,
+                n_cams * 3 + textures.len() + 1,
                 n_cams * 16 + textures.len() + 1,
             );
 
         // Camera UBOs
-        for (set, buf) in camera_descriptor_sets.iter().zip(ubo_buffers.iter())
-        {
+        for (set, buf) in frame_descriptor_sets.iter().zip(ubo_buffers.iter()) {
             let info = buf.descriptor_buffer_info(0, ubo_size);
             desc_builder.push_write_buffer_info(
                 set.raw_descriptor_set(),
@@ -2465,7 +2869,7 @@ impl AppRunner {
 
         // Sampler table — write all 15 entries as one batched write
         // starting at array element 0 (matches getSamplerIndex layout).
-        for set in camera_descriptor_sets.iter() {
+        for set in frame_descriptor_sets.iter() {
             let write_idx = desc_builder.push_write_image_info(
                 set.raw_descriptor_set(),
                 1,
@@ -2478,24 +2882,59 @@ impl AppRunner {
             }
         }
 
-        // Upload the material SSBO (host-visible; written once at load).
-        let material_ssbo_size =
-            (material_gpus.len() * size_of::<MaterialGpu>()) as vk::DeviceSize;
-        let mut material_ssbo = HostVisibleBuffer::new(
+        // Lights SSBOs — one per frame, written here with initial scene
+        // lights; overwritten each frame in the draw loop.
+        let scene_lights = build_scene_lights();
+        for (set, buf) in
+            frame_descriptor_sets.iter().zip(lights_buffers.iter_mut())
+        {
+            buf.write_pod_iter_exact(
+                scene_lights.iter().copied().map(GpuLight::from),
+            )?;
+            let info = buf.descriptor_buffer_info(0, lights_buf_size);
+            desc_builder.push_write_buffer_info(
+                set.raw_descriptor_set(),
+                2,
+                vk::DescriptorType::STORAGE_BUFFER,
+                0,
+                info,
+            );
+        }
+
+        // Upload MaterialHot SSBO (host-visible; written once at load).
+        let mat_hot_size =
+            (material_hots.len() * size_of::<MaterialHot>()) as vk::DeviceSize;
+        let mut material_hot_ssbo = HostVisibleBuffer::new(
             &device,
-            material_ssbo_size,
+            mat_hot_size,
             vk::BufferUsageFlags::STORAGE_BUFFER,
-            Some("material ssbo"),
+            Some("material hot ssbo"),
         )?;
-        material_ssbo.write_pod_iter_exact(material_gpus.into_iter())?;
-        let buf_info =
-            material_ssbo.descriptor_buffer_info(0, material_ssbo_size);
+        material_hot_ssbo.write_pod_iter_exact(material_hots.into_iter())?;
         desc_builder.push_write_buffer_info(
             material_descriptor_set.raw_descriptor_set(),
             1,
             vk::DescriptorType::STORAGE_BUFFER,
             0,
-            buf_info,
+            material_hot_ssbo.descriptor_buffer_info(0, mat_hot_size),
+        );
+
+        // Upload MaterialCold SSBO.
+        let mat_cold_size = (material_colds.len() * size_of::<MaterialCold>())
+            as vk::DeviceSize;
+        let mut material_cold_ssbo = HostVisibleBuffer::new(
+            &device,
+            mat_cold_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            Some("material cold ssbo"),
+        )?;
+        material_cold_ssbo.write_pod_iter_exact(material_colds.into_iter())?;
+        desc_builder.push_write_buffer_info(
+            material_descriptor_set.raw_descriptor_set(),
+            2,
+            vk::DescriptorType::STORAGE_BUFFER,
+            0,
+            material_cold_ssbo.descriptor_buffer_info(0, mat_cold_size),
         );
 
         // SAFETY: caller guarantees resources (buffers, images, samplers)
@@ -2533,13 +2972,15 @@ impl AppRunner {
             pipeline_layout,
             descriptor_pool,
             ubo_buffers,
-            camera_descriptor_sets,
+            lights_buffers,
+            frame_descriptor_sets,
             material_descriptor_set,
             start_time: Instant::now(),
             asset_map,
             textures,
             samplers,
-            material_ssbo,
+            material_hot_ssbo,
+            material_cold_ssbo,
         })
     }
 
@@ -2682,18 +3123,20 @@ impl AppRunner {
             frames: state.frames,
             current_frame: 0,
             debug_counters,
-            per_frame_layout: state.camera_set_layout,
-            static_layout: state.material_set_layout,
+            per_frame_layout: state.per_frame_layout,
+            static_layout: state.static_layout,
             pipeline_layout: state.pipeline_layout,
             descriptor_pool: state.descriptor_pool,
             ubo_buffers: state.ubo_buffers,
-            camera_descriptor_sets: state.camera_descriptor_sets,
+            lights_buffers: state.lights_buffers,
+            frame_descriptor_sets: state.frame_descriptor_sets,
             material_descriptor_set: state.material_descriptor_set,
             start_time: state.start_time,
             asset_map: state.asset_map,
             textures: state.textures,
             samplers: state.samplers,
-            material_ssbo: state.material_ssbo,
+            material_hot_ssbo: state.material_hot_ssbo,
+            material_cold_ssbo: state.material_cold_ssbo,
         })
     }
 

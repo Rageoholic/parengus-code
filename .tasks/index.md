@@ -1,4 +1,4 @@
-next_id: t047
+next_id: t048
 ---
 
 # Task Graph Index
@@ -61,6 +61,7 @@ and AI interaction conventions), see [CONVENTIONS.md](CONVENTIONS.md).
 | t034 | Error dialog / fatal message display                       | infra    |                                               |
 | t035 | Directional lighting                                       | phoenix  | child of t003                                 |
 | t037 | Harden state machine transitions with replace_with         | infra    |                                               |
+| t047 | Mesh format cleanup: strip TRS, add AABB, add origin offset | pipeline |                                              |
 
 ### Future
 

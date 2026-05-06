@@ -39,6 +39,7 @@ pub mod buffer;
 pub mod command;
 pub mod descriptor;
 pub mod device;
+pub mod gpu_struct;
 pub mod image;
 pub mod instance;
 mod marker;
